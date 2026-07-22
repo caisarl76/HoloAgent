@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Restore the approved 21-path semantic-navigation recovery manifest from its pinned Git snapshot and prove, without starting Nav2 or a motion publisher, that one fixed HMSG text query emits a finite `/object_pose`.
+**Goal:** Restore the approved 74-path semantic-navigation build/smoke closure from its pinned Git snapshot and prove, without starting Nav2 or a motion publisher, that one fixed HMSG text query emits a finite `/object_pose`.
 
-**Architecture:** The recovery source is immutable commit `f164095abb0045a69c0b8eb23683063be3deaa38`. Its first-parent diff is the executable manifest. Recovery runs directly in the approved target workspace because the required FSR-VLN datasets are untracked local assets that a clean worktree would omit; existing paths cause a fail-closed stop, and GNU tar's keep-old-files mode prevents a check/write race from overwriting them. Compilation and runtime checks run in the existing bind-mounted HoloAgent container with isolated `/tmp` build outputs and dry-run motion flags.
+**Architecture:** The recovery source is immutable commit `f164095abb0045a69c0b8eb23683063be3deaa38`. The stash's 21-path first-parent diff is not the complete snapshot tree; the executable manifest is the explicitly scoped 74-path build/smoke closure, leaving unrelated pre-release trees excluded. Recovery runs directly in the approved target workspace because the required FSR-VLN datasets are untracked local assets that a clean worktree would omit; unexpected existing paths cause a fail-closed stop, and GNU tar's keep-old-files mode prevents a check/write race from overwriting them. Compilation and runtime checks run in the existing bind-mounted HoloAgent container with isolated `/tmp` build outputs and dry-run motion flags.
 
 **Tech Stack:** Git object database, Bash, GNU tar, Docker, ROS 2 Humble, colcon, Python 3, FSR-VLN/HMSG.
 
@@ -12,7 +12,7 @@
 
 ## File Responsibilities
 
-- Restore: the exact 21 paths listed in `docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md`.
+- Restore: the exact 74 paths listed in `docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md`.
 - Create at runtime: `outputs/mujoco_holoagent/<run-id>/` evidence files; these are generated results, not source changes.
 - Do not modify: existing tracked source outside this plan, local scene graphs/datasets, Nav2 configuration, FastLIVO configuration, or Unitree sources.
 
@@ -58,16 +58,27 @@ test "$(git rev-parse stash-backup-20260722)" = "$stage0_source"
 
 Expected: exit 0 and no output.
 
-- [ ] **Step 3: Derive the manifest from the immutable commit**
+- [ ] **Step 3: Derive the build-driven manifest from explicit snapshot scopes**
 
 Run:
 
 ```bash
-git diff-tree --no-commit-id --name-only -r \
-  "$stage0_source^1" "$stage0_source"
+git ls-tree -r --name-only "$stage0_source" -- \
+  nav_agent/sem_nav_ctr/src \
+  fsr_vln/memory \
+  fsr_vln/perception \
+  fsr_vln/config \
+  fsr_vln/setup.py \
+  fsr_vln/environment.yaml \
+  fsr_vln/checkpoints \
+  nav_agent/README.md \
+  nav_agent/scripts/run_nav.sh \
+  nav_agent/scripts/run_sem_nav.sh \
+  nav_agent/scripts/run_sensors.sh | sort -u
 ```
 
-Expected: the exact 21 paths in the approved design, with no extra path.
+Expected: the exact 74 paths in the approved design, with no path from an
+unrelated pre-release tree.
 
 - [ ] **Step 4: Assert the manifest count and approved roots**
 
@@ -75,10 +86,20 @@ Run:
 
 ```bash
 mapfile -t stage0_paths < <(
-  git diff-tree --no-commit-id --name-only -r \
-    "$stage0_source^1" "$stage0_source"
+  git ls-tree -r --name-only "$stage0_source" -- \
+    nav_agent/sem_nav_ctr/src \
+    fsr_vln/memory \
+    fsr_vln/perception \
+    fsr_vln/config \
+    fsr_vln/setup.py \
+    fsr_vln/environment.yaml \
+    fsr_vln/checkpoints \
+    nav_agent/README.md \
+    nav_agent/scripts/run_nav.sh \
+    nav_agent/scripts/run_sem_nav.sh \
+    nav_agent/scripts/run_sensors.sh | sort -u
 )
-test "${#stage0_paths[@]}" -eq 21
+test "${#stage0_paths[@]}" -eq 74
 for stage0_path in "${stage0_paths[@]}"; do
   case "$stage0_path" in
     fsr_vln/*|nav_agent/README.md|nav_agent/scripts/*|nav_agent/sem_nav_ctr/src/*) ;;
@@ -92,23 +113,40 @@ Expected: exit 0 and no output.
 ### Task 2: Restore Without Overwriting Workspace State
 
 **Files:**
-- Restore: the 21 paths held in `stage0_paths`
+- Preserve and re-verify: the 21 paths restored by the first attempt
+- Restore: the remaining 53 paths held in `stage0_missing_paths`
 - Preserve: every path not held in `stage0_paths`
 
-- [ ] **Step 1: Prove every target is absent immediately before recovery**
+- [ ] **Step 1: Classify exactly 21 verified existing paths and 53 absent paths**
 
 Run:
 
 ```bash
+stage0_existing_paths=()
+stage0_missing_paths=()
 for stage0_path in "${stage0_paths[@]}"; do
   if [[ -e "$stage0_path" || -L "$stage0_path" ]]; then
-    printf 'Refusing to overwrite: %s\n' "$stage0_path" >&2
-    exit 1
+    stage0_existing_paths+=("$stage0_path")
+  else
+    stage0_missing_paths+=("$stage0_path")
   fi
+done
+test "${#stage0_existing_paths[@]}" -eq 21
+test "${#stage0_missing_paths[@]}" -eq 53
+
+for stage0_path in "${stage0_existing_paths[@]}"; do
+  stage0_expected_blob="$(git ls-tree "$stage0_source" -- "$stage0_path" | awk '{print $3}')"
+  if [[ -L "$stage0_path" ]]; then
+    stage0_actual_blob="$(printf '%s' "$(readlink "$stage0_path")" | git hash-object --stdin)"
+  else
+    stage0_actual_blob="$(git hash-object "$stage0_path")"
+  fi
+  test "$stage0_actual_blob" = "$stage0_expected_blob"
 done
 ```
 
-Expected: exit 0 and no output. Any listed path causes a hard stop.
+Expected: exit 0 and no output. A count change or blob mismatch causes a hard
+stop rather than treating an unexpected path as recoverable state.
 
 - [ ] **Step 2: Extract only the approved objects with keep-old-files protection**
 
@@ -116,7 +154,7 @@ Run from `/home/jihun/work/HoloAgent`:
 
 ```bash
 test "$(pwd -P)" = /home/jihun/work/HoloAgent
-git archive --format=tar "$stage0_source" -- "${stage0_paths[@]}" |
+git archive --format=tar "$stage0_source" -- "${stage0_missing_paths[@]}" |
   tar --extract --keep-old-files --directory=/home/jihun/work/HoloAgent
 ```
 
@@ -168,7 +206,7 @@ for stage0_path in "${stage0_paths[@]}"; do
 done
 ```
 
-Expected: all 21 comparisons exit 0.
+Expected: all 74 comparisons exit 0.
 
 - [ ] **Step 2: Verify the recovered checkpoint symlink and model assets**
 
@@ -244,6 +282,11 @@ bash nav_agent/scripts/run_navagent_container_checks.sh
 Expected: all three packages build, imports succeed, executable discovery finds
 `topic_chat_loc_pub`, `goal_pose_publisher`, and `g1_getvel_node`, and
 `g1_pubvel_node` is absent because `BUILD_MODE=dryrun`.
+
+Run the unmodified pinned `chat_loc_python/setup.py` first. If the container
+actually invokes its `/home/unitree/miniconda3/envs/fsrvln/bin/python` setting,
+stop and create a recorded copy under `/tmp`; patch only that overlay and leave
+the restored file blob-identical to the pin.
 
 - [ ] **Step 3: Verify the dry-run install contains no Unitree motion executable**
 
@@ -355,7 +398,7 @@ Expected: exit 0. No broad process-kill command is used.
   "status": "PASS",
   "qualified_pass": "PASS_SEMANTIC_RECOVERY",
   "source_commit": "f164095abb0045a69c0b8eb23683063be3deaa38",
-  "manifest_count": 21,
+  "manifest_count": 74,
   "motion_enabled": false,
   "nav2_started": false,
   "query": "Take me to the counter in the pantry",
@@ -373,7 +416,7 @@ Run:
 
 ```bash
 test "$(git rev-parse stash-backup-20260722)" = "$stage0_source"
-test "${#stage0_paths[@]}" -eq 21
+test "${#stage0_paths[@]}" -eq 74
 if pgrep -af '[g]1_pubvel_node|[g]1_pubmove_node|[g]1_pubcmd_node'; then
   exit 1
 fi

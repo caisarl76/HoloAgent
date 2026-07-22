@@ -22,9 +22,11 @@ binaries must not be started during this simulation phase.
 
 The workstation recovery source originally lived only in mutable `stash@{0}`.
 It is now preserved as branch `stash-backup-20260722`, pinned to commit
-`f164095abb0045a69c0b8eb23683063be3deaa38`. All 21 paths reported by that
-snapshot are absent from the working tree: 10 FSR-VLN paths, `nav_agent/README.md`,
-three launch scripts, and seven semantic-navigation source/config paths.
+`f164095abb0045a69c0b8eb23683063be3deaa38`. The stash diff lists 21 modified
+paths, but the build-and-smoke closure contains 74 paths because stash diff is
+not the same thing as the complete snapshot tree. The other 53 dependencies
+were unchanged relative to the stash parent and therefore absent from
+`git stash show`, even though the release commit removed them.
 
 ## Goals
 
@@ -127,38 +129,104 @@ whose poses are explicitly aligned to `sim_map`; it is outside this milestone.
 
 ### 1. Semantic Source Recovery
 
-Restore the exact 21-path manifest from immutable commit
+Restore the exact 74-path, build-driven manifest from immutable commit
 `f164095abb0045a69c0b8eb23683063be3deaa38`:
 
 ```text
 fsr_vln/checkpoints
+fsr_vln/config/semantic_scene_reconstruction_hm3d.yaml
 fsr_vln/config/semantic_scene_reconstruction_ic3f.yaml
 fsr_vln/config/semantic_scene_reconstruction_ic4f.yaml
 fsr_vln/config/semantic_scene_reconstruction_ic7f.yaml
+fsr_vln/config/semantic_scene_reconstruction_scannet.yaml
+fsr_vln/config/semantic_scene_reconstruction_sh3f.yaml
+fsr_vln/config/visualize_graph.yaml
+fsr_vln/config/visualize_query_graph_icra_hm3d_bench.yaml
+fsr_vln/config/visualize_query_graph_icra_ic3f.yaml
+fsr_vln/config/visualize_query_graph_icra_ic4f.yaml
+fsr_vln/config/visualize_query_graph_icra_ic7f.yaml
+fsr_vln/config/visualize_query_graph_icra_sh3f.yaml
 fsr_vln/environment.yaml
+fsr_vln/memory/hmsg/data/__init__.py
+fsr_vln/memory/hmsg/dataloader/generic.py
+fsr_vln/memory/hmsg/dataloader/hm3dsem.py
+fsr_vln/memory/hmsg/dataloader/horizon.py
+fsr_vln/memory/hmsg/dataloader/__init__.py
+fsr_vln/memory/hmsg/dataloader/iphone.py
+fsr_vln/memory/hmsg/dataloader/replica.py
+fsr_vln/memory/hmsg/dataloader/scannet.py
+fsr_vln/memory/hmsg/eval/hm3dsem_evaluator.py
+fsr_vln/memory/hmsg/eval/__init__.py
+fsr_vln/memory/hmsg/graph/floor.py
 fsr_vln/memory/hmsg/graph/graph.py
+fsr_vln/memory/hmsg/graph/__init__.py
 fsr_vln/memory/hmsg/graph/navigation_graph.py
+fsr_vln/memory/hmsg/graph/object.py
+fsr_vln/memory/hmsg/graph/room.py
+fsr_vln/memory/hmsg/graph/view.py
+fsr_vln/memory/hmsg/__init__.py
+fsr_vln/memory/hmsg/labels/class_id_colors.json
+fsr_vln/memory/hmsg/labels/final_label.csv
+fsr_vln/memory/hmsg/labels/HM3D_CountsOfObjectTypes.csv
+fsr_vln/memory/hmsg/labels/imagenet21k.csv
+fsr_vln/memory/hmsg/labels/__init__.py
+fsr_vln/memory/hmsg/labels/label_constants.py
+fsr_vln/memory/hmsg/labels/scannet200.csv
+fsr_vln/memory/hmsg/labels/scannet20.csv
 fsr_vln/memory/hmsg/utils/clip_utils.py
+fsr_vln/memory/hmsg/utils/constants.py
+fsr_vln/memory/hmsg/utils/eval_utils.py
+fsr_vln/memory/hmsg/utils/graph_utils.py
+fsr_vln/memory/hmsg/utils/__init__.py
+fsr_vln/memory/hmsg/utils/label_feats.py
 fsr_vln/memory/hmsg/utils/llm_utils.py
+fsr_vln/memory/hmsg/utils/long_query_eval_utils.py
+fsr_vln/memory/hmsg/utils/metric.py
+fsr_vln/memory/hmsg/utils/sam_utils.py
+fsr_vln/perception/models/__init__.py
 fsr_vln/perception/models/sam_clip_feats_extractor.py
+fsr_vln/setup.py
 nav_agent/README.md
 nav_agent/scripts/run_nav.sh
 nav_agent/scripts/run_sem_nav.sh
 nav_agent/scripts/run_sensors.sh
+nav_agent/sem_nav_ctr/src/chat_loc_python/chat_loc_python/drobotc_g1.py
+nav_agent/sem_nav_ctr/src/chat_loc_python/chat_loc_python/__init__.py
+nav_agent/sem_nav_ctr/src/chat_loc_python/chat_loc_python/node_chat_loc_class.py
+nav_agent/sem_nav_ctr/src/chat_loc_python/package.xml
 nav_agent/sem_nav_ctr/src/chat_loc_python/setup.cfg
+nav_agent/sem_nav_ctr/src/chat_loc_python/setup.py
 nav_agent/sem_nav_ctr/src/g1_move/CMakeLists.txt
+nav_agent/sem_nav_ctr/src/g1_move/package.xml
 nav_agent/sem_nav_ctr/src/g1_move/src/getvel.cpp
 nav_agent/sem_nav_ctr/src/g1_move/src/pubvel.cpp
+nav_agent/sem_nav_ctr/src/goal_publisher/config/visualize_query_graph_demo.yaml
 nav_agent/sem_nav_ctr/src/goal_publisher/goal_publisher/goal_pose_publisher.py
+nav_agent/sem_nav_ctr/src/goal_publisher/goal_publisher/__init__.py
+nav_agent/sem_nav_ctr/src/goal_publisher/package.xml
+nav_agent/sem_nav_ctr/src/goal_publisher/resource/goal_publisher
 nav_agent/sem_nav_ctr/src/goal_publisher/setup.cfg
 nav_agent/sem_nav_ctr/src/goal_publisher/setup.py
 ```
+
+This is deliberately not a restore of every path missing from the snapshot.
+It contains the ROS semantic workspace plus the FSR-VLN modules/configuration
+required by its build, import smoke test, and fixed query. Pre-release trees
+such as `nav_agent/humble_localization_nav2/` remain excluded. If a build or
+smoke gate identifies another dependency, add only that evidenced dependency
+to this manifest and verify it against the same pin.
 
 Recovery fails rather than overwriting a path that has appeared since review.
 Each restored regular file or symlink must match its pinned Git blob. Rebuild
 into `/tmp/navagent_sem_nav_*`, verify the checkpoint symlink resolves, and
 rerun the container smoke test. Unlisted outputs, generated configs, logs, and
 unrelated dirty-worktree changes remain untouched.
+
+Restored files are never edited to accommodate the workstation. In particular,
+`chat_loc_python/setup.py` contains a robot-specific build-script interpreter.
+If that value becomes active in the container build, generate a documented
+copy under the isolated `/tmp` build overlay, patch only the overlay, record
+its diff, and re-verify the restored working-tree blob after the build.
 
 ### 2. MuJoCo G1 Bridge
 
@@ -304,7 +372,7 @@ timeout.
 ### Stage 0: Software and Semantic Recovery
 
 - The durable recovery branch resolves to the pinned commit.
-- All 21 restored paths match their saved Git blobs.
+- All 74 restored paths match their saved Git blobs.
 - The checkpoint symlink resolves to both required checkpoint files.
 - Skill registry validation passes.
 - Semantic workspace builds cleanly in `/tmp`.
