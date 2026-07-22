@@ -10,7 +10,7 @@ The current workstation already has:
 
 - the HoloAgent repository and `holoagent-navagent:deps` Docker image;
 - FSR-VLN data and an `icra_ic4f` HMSG graph;
-- the Nav2 map that is byte-identical to PC2's active map;
+- the Nav2 map that is byte-identical to PC2's active real-building map;
 - an established G1 MuJoCo runtime at
   `/home/jihun/work/GR00T-WholeBodyControl/.venv_sim`;
 - a working G1 simulation controller in the neighboring GR00T/DualMap
@@ -20,18 +20,23 @@ PC2 already has ROS 2 Humble, the Unitree SDK, live G1 sensor topics, and clean
 ARM64 `g1_move`/`g1_arm` builds under `robots/unitree/install_pc2`. Those
 binaries must not be started during this simulation phase.
 
-The workstation semantic-navigation source tree is incomplete: 19 regular
-source/config files disappeared while build artifacts remained. The exact
-files are preserved in `stash@{0}` and will be restored before simulation.
+The workstation recovery source originally lived only in mutable `stash@{0}`.
+It is now preserved as branch `stash-backup-20260722`, pinned to commit
+`f164095abb0045a69c0b8eb23683063be3deaa38`. All 21 paths reported by that
+snapshot are absent from the working tree: 10 FSR-VLN paths, `nav_agent/README.md`,
+three launch scripts, and seven semantic-navigation source/config paths.
 
 ## Goals
 
 1. Restore and verify the HoloAgent semantic command-to-pose path.
 2. Drive a simulated Unitree G1 with Nav2 `/cmd_vel` commands.
 3. Publish the ROS 2 topics expected by the HoloAgent navigation stack.
-4. Validate semantic navigation, localization, path planning, and velocity
-   generation without contacting G1 PC2.
-5. Produce objective pass/fail evidence before preparing a no-motion PC2
+4. Validate semantic-query and simulator-navigation plumbing in explicitly
+   frame-consistent gates, without claiming that the real-building HMSG is a
+   semantic map of the simulated scene.
+5. Evaluate FastLIVO against MuJoCo ground truth without making full visual
+   convergence a prerequisite for the navigation-loop test.
+6. Produce objective pass/fail evidence before preparing a no-motion PC2
    handoff.
 
 ## Non-Goals
@@ -39,57 +44,121 @@ files are preserved in `stash@{0}` and will be restored before simulation.
 - Sending `LocoClient.Move()` or arm commands to the physical G1.
 - Starting `g1_pubvel_node`, `g1_pubmove_node`, or `g1_pubcmd_node` on PC2.
 - Treating perfect simulator odometry as proof that FastLIVO works.
-- Rebuilding OVO/FSR-VLN maps from a real robot dataset during the first
-  simulator milestone.
+- Treating a simulation-only semantic fixture as proof of FSR-VLN spatial
+  accuracy.
+- Rebuilding OVO/FSR-VLN maps for the simulated scene during this milestone.
 - Copying GR00T controller policies or robot assets into this repository.
 
 ## Selected Architecture
 
 The implementation will use a repository-local HoloAgent adapter with the
-existing GR00T MuJoCo runtime as a configured backend.
+existing GR00T MuJoCo runtime as a configured backend. Every simulation
+process uses all three of these settings:
 
 ```text
-HoloAgent container (ROS_DOMAIN_ID=77)
-  AgentOS / semantic query / Nav2 / FastLIVO
+ROS_DOMAIN_ID=77
+ROS_LOCALHOST_ONLY=1
+use_sim_time=true
+```
+
+The host and container must use the same installed RMW implementation. The
+container must use host networking and host IPC so localhost-only DDS and
+shared-memory transport work across the boundary.
+
+```text
+HoloAgent container (domain 77, localhost-only DDS, simulated time)
+  Stage 0: real FSR-VLN/HMSG query (real-building frame; observed only)
+  Stage 4: sim semantic fixture + Nav2 (sim_map frame)
+  FastLIVO + PointCloud2-to-Livox converter
         |                         ^
         | /cmd_vel                | ROS sensor topics
         v                         |
-Host MuJoCo adapter (ROS_DOMAIN_ID=77)
+Host MuJoCo adapter (domain 77, localhost-only DDS, simulated time)
   GR00T G1 controller + MuJoCo model
         |
         +-- /clock
         +-- /tf, /tf_static
         +-- /robot_odom
         +-- /livox/imu
-        +-- /camera/color/image_raw + camera_info
+        +-- /camera/color/image_raw + /camera/color/camera_info
         +-- /holoagent_sim/lidar_points (PointCloud2)
                                       |
                                       v
 HoloAgent container converter
-  PointCloud2 -> livox_ros_driver2/msg/CustomMsg
-        |
-        +-- /livox/lidar
+  PointCloud2 -> livox_ros_driver2/msg/CustomMsg -> /livox/lidar
 ```
 
 The host adapter uses the existing `.venv_sim`, which can import both MuJoCo
 and the system ROS 2 Python packages. The host does not currently have the
 generated `livox_ros_driver2` Python messages, so a small converter runs in the
-HoloAgent container where those message types are already installed. This
-avoids copying container binaries onto the host or adding MuJoCo to the large
-Docker image.
+HoloAgent container where those message types are installed. This avoids
+copying container binaries onto the host or adding MuJoCo to the large Docker
+image.
 
 The adapter will not import or call `unitree_sdk2`. The physical robot's
-control interface is therefore absent from the simulation data path.
+control interface is absent from the simulation data path.
+
+## Frame and Map Contract
+
+The `icra_ic4f` HMSG graph and the current PC2 Nav2 occupancy map describe a
+real building. The initial MuJoCo scene has different geometry. Their
+coordinates must never be composed.
+
+Stage 0 therefore runs the restored real HMSG query path in observation-only
+mode and records its `/object_pose`; no Nav2 goal subscriber or velocity
+publisher is active. Stage 4 uses a `sim_map` occupancy grid generated from the
+known MuJoCo scene geometry. A simulation-only semantic fixture maps a fixed
+set of test phrases to prevalidated free-space poses in `sim_map`. Its node,
+configuration, and result metadata are named `sim_fixture` so evidence cannot
+be mistaken for real FSR-VLN spatial validation.
+
+This selects the simulator-map-plus-mocked-poses strategy. The occupancy grid
+is derived from known scene geometry rather than Stage 3 estimator output so a
+sensor-estimation failure cannot block the independent navigation-loop test.
+Stage 3 output may be compared with `sim_map`, but it is never substituted
+without an explicit alignment check.
+
+The real-building map is prohibited from the Stage 4 process graph. The
+orchestrator verifies the loaded map path and SHA-256 digest before Nav2
+activation. A future true semantic simulation test would require a new HMSG
+whose poses are explicitly aligned to `sim_map`; it is outside this milestone.
 
 ## Components
 
 ### 1. Semantic Source Recovery
 
-Restore only the missing files under `nav_agent/sem_nav_ctr/src` from
-`stash@{0}`. Existing deployment scripts, generated configs, logs, and later
-changes remain untouched. Verify the restored source against the stash blob
-IDs, rebuild into `/tmp/navagent_sem_nav_*`, and rerun the container smoke
-test.
+Restore the exact 21-path manifest from immutable commit
+`f164095abb0045a69c0b8eb23683063be3deaa38`:
+
+```text
+fsr_vln/checkpoints
+fsr_vln/config/semantic_scene_reconstruction_ic3f.yaml
+fsr_vln/config/semantic_scene_reconstruction_ic4f.yaml
+fsr_vln/config/semantic_scene_reconstruction_ic7f.yaml
+fsr_vln/environment.yaml
+fsr_vln/memory/hmsg/graph/graph.py
+fsr_vln/memory/hmsg/graph/navigation_graph.py
+fsr_vln/memory/hmsg/utils/clip_utils.py
+fsr_vln/memory/hmsg/utils/llm_utils.py
+fsr_vln/perception/models/sam_clip_feats_extractor.py
+nav_agent/README.md
+nav_agent/scripts/run_nav.sh
+nav_agent/scripts/run_sem_nav.sh
+nav_agent/scripts/run_sensors.sh
+nav_agent/sem_nav_ctr/src/chat_loc_python/setup.cfg
+nav_agent/sem_nav_ctr/src/g1_move/CMakeLists.txt
+nav_agent/sem_nav_ctr/src/g1_move/src/getvel.cpp
+nav_agent/sem_nav_ctr/src/g1_move/src/pubvel.cpp
+nav_agent/sem_nav_ctr/src/goal_publisher/goal_publisher/goal_pose_publisher.py
+nav_agent/sem_nav_ctr/src/goal_publisher/setup.cfg
+nav_agent/sem_nav_ctr/src/goal_publisher/setup.py
+```
+
+Recovery fails rather than overwriting a path that has appeared since review.
+Each restored regular file or symlink must match its pinned Git blob. Rebuild
+into `/tmp/navagent_sem_nav_*`, verify the checkpoint symlink resolves, and
+rerun the container smoke test. Unlisted outputs, generated configs, logs, and
+unrelated dirty-worktree changes remain untouched.
 
 ### 2. MuJoCo G1 Bridge
 
@@ -99,7 +168,7 @@ Add a ROS 2 Python package under `nav_agent/mujoco_sim` with:
 - a GR00T G1 controller backend loaded from configurable paths;
 - a `/cmd_vel` subscriber;
 - finite-value validation and conservative command clamps;
-- deterministic stepping and `/clock` publication;
+- deterministic stepping and `/clock` publication from MuJoCo model time;
 - odometry, TF, IMU, camera, and raw simulated lidar publishers;
 - headless operation by default;
 - an optional viewer flag for operator inspection.
@@ -107,14 +176,21 @@ Add a ROS 2 Python package under `nav_agent/mujoco_sim` with:
 Default command limits are:
 
 ```text
-linear x:  +/-0.22 m/s
-linear y:   0.00 m/s (disabled initially)
-yaw rate:  +/-0.30 rad/s
-command timeout: 0.5 s, then force zero
+linear x:       +/-0.22 m/s
+linear y:         0.00 m/s (disabled)
+yaw rate:       +/-0.30 rad/s
+command timeout:   0.50 simulated seconds, then force zero
 ```
 
-The bridge must start with a stationary command and return to zero on timeout,
-shutdown, invalid input, or simulation error.
+The bridge starts stationary and returns to zero on timeout, shutdown, invalid
+input, or simulation error. MuJoCo model time is the only ROS clock authority.
+All consuming nodes, including Nav2 and FastLIVO, must report
+`use_sim_time=true` before activation. The orchestrator records the real-time
+factor so slow policy inference changes wall-clock duration without changing
+controller semantics.
+
+Default publication rates are IMU 200 Hz, odometry 50 Hz, camera 15 Hz, and
+lidar 10 Hz in simulated time.
 
 ### 3. Livox Message Converter
 
@@ -124,14 +200,19 @@ standard `sensor_msgs/msg/PointCloud2` and emits
 
 - a consistent `timebase`;
 - `point_num` matching the actual point array;
-- non-zero, monotonic per-point `offset_time` values;
 - finite XYZ coordinates;
-- configurable reflectivity, line, tag, scan period, noise, and dropout.
+- configurable reflectivity, line, tag, scan period, noise, and dropout;
+- per-point `offset_time` values that reflect actual acquisition time.
+
+Two explicit acquisition modes are supported. `snapshot` ray-casts every
+point at one MuJoCo time and sets every offset to zero. `rolling` advances the
+sampling pose across the configured scan period and emits monotonic offsets
+for those actual sample times. Fabricated non-zero offsets are forbidden.
 
 The first implementation may use deterministic MuJoCo range rays. It must not
 claim sensor fidelity beyond the configured model.
 
-### 4. Test Scene and Configuration
+### 4. Test Scene and Sensor Configuration
 
 Use the existing GR00T G1 model/controller through configuration variables:
 
@@ -144,86 +225,176 @@ Configuration validation fails before ROS startup when a required interpreter,
 controller, model, or policy asset is missing. No workstation-specific path is
 silently substituted.
 
-The initial scene is a small static indoor world. Its purpose is deterministic
-navigation and sensor-contract validation, not photorealistic reconstruction
-of `icra_ic4f`.
+The initial scene is a textured, static indoor world with non-degenerate planar
+and corner geometry. Its purpose is deterministic navigation and sensor-contract
+validation, not photorealistic reconstruction of `icra_ic4f`.
 
-### 5. Orchestration
+A sim-specific FastLIVO YAML is generated from the same scene/sensor mounting
+configuration used by the bridge. It contains the exact lidar-to-IMU transform,
+lidar-to-camera `Rcl`/`Pcl`, camera intrinsics and image dimensions, topic names,
+and simulated sensor rates. Existing real-rig calibration values are forbidden
+in a simulation run. The generated values and their source digest are stored
+with the evidence.
+
+### 5. Simulation Navigation Configuration
+
+Stage 4 loads only the simulator-native occupancy grid and the `sim_fixture`
+phrase-to-pose mapping. Every fixture pose is checked against the occupancy
+grid, inflation radius, and world bounds before Nav2 starts.
+
+The Nav2 controller is configured for non-holonomic motion. Preflight requires
+`min_vel_y=0.0`, `max_vel_y=0.0`, no lateral-velocity samples, and a differential
+or otherwise non-holonomic motion model. A controller configuration capable of
+commanding lateral motion is a hard failure rather than something the adapter
+silently clamps.
+
+### 6. Orchestration and Isolation
 
 Provide scripts that:
 
-1. validate dependencies and safety flags;
-2. start the host bridge headlessly on `ROS_DOMAIN_ID=77`;
-3. start the container-side converter and HoloAgent components on the same
-   domain;
-4. run bounded checks with explicit timeouts;
-5. stop all simulator sessions and publish a final zero velocity.
+1. validate dependencies, safety flags, map/frame contracts, and RMW parity;
+2. export `ROS_DOMAIN_ID=77` and `ROS_LOCALHOST_ONLY=1` for every host and
+   container process;
+3. assert that the container uses host networking and host IPC;
+4. start the host bridge headlessly;
+5. start the container converter and selected HoloAgent components;
+6. verify the discovered ROS graph against a stage-specific allowlist from
+   both host and container before publishing any non-zero command;
+7. run bounded checks with explicit simulated-time and wall-time limits;
+8. stop all simulator sessions and publish a final zero velocity.
 
-The scripts refuse to start when any real-motion flag is enabled or when a
-local process named `g1_pubvel_node`, `g1_pubmove_node`, or `g1_pubcmd_node` is
-running. Simulation orchestration never connects to PC2; PC2 checks are a
-separate, read-only handoff stage.
+The graph check records node names, publishers, subscribers, services, and
+actions. Any unexpected node or motion-command endpoint fails closed. Local
+process-name checks for `g1_pubvel_node`, `g1_pubmove_node`, and
+`g1_pubcmd_node` remain as defense in depth, but they are not the isolation
+boundary.
+
+Simulation configuration contains no PC2 address, physical control interface,
+or Unitree channel. PC2 is not contacted during these stages. Localhost-only
+DDS makes PC2's ROS domain irrelevant even if it also uses domain 77.
+
+## Quantitative Default Gates
+
+Thresholds live in a versioned evaluation YAML and are copied into each run
+directory. Changing one creates a distinct run configuration; it must not be
+edited after a run.
+
+| Gate | Default pass threshold |
+|---|---|
+| Clock | strictly monotonic; at least 50 updates/simulated second |
+| Mean real-time factor | at least 0.25 after a 2 s warm-up |
+| IMU rate | 180-220 Hz over 10 simulated seconds |
+| Odometry rate | 40-60 Hz over 10 simulated seconds |
+| Camera rate | 12-18 Hz over 10 simulated seconds |
+| Lidar rate | 8-12 Hz over 10 simulated seconds |
+| Stationary drift | at most 0.05 m over 5 simulated seconds |
+| Bounded motion | 0.08-0.30 m forward displacement for 0.10 m/s over 2 simulated seconds |
+| Command clamps | `abs(x)<=0.22`, `y==0`, `abs(yaw)<=0.30` |
+| Timeout stop | zero command within 0.60 simulated seconds; speed below 0.03 m/s for the following 1 s |
+| LIO estimate | translation RMSE at most 0.50 m, maximum error at most 1.50 m, yaw RMSE at most 10 degrees over 30 simulated seconds |
+| Nav2 goal | position error at most 0.35 m and yaw error at most 15 degrees within 90 simulated seconds, with no collision |
+
+Each bounded test also has a wall-time limit equal to four times its simulated
+duration plus a 30-second startup allowance. Falling below the real-time-factor
+gate fails with a performance reason rather than appearing as a navigation
+timeout.
 
 ## Evaluation Stages
 
 ### Stage 0: Software and Semantic Recovery
 
-- Restored files match their saved Git blobs.
+- The durable recovery branch resolves to the pinned commit.
+- All 21 restored paths match their saved Git blobs.
+- The checkpoint symlink resolves to both required checkpoint files.
 - Skill registry validation passes.
-- Semantic workspace builds cleanly.
+- Semantic workspace builds cleanly in `/tmp`.
 - Container import/executable smoke checks pass.
-- A text query produces one expected `/object_pose` with no motion publisher.
+- A fixed text-query fixture produces an expected finite `/object_pose` in the
+  real HMSG `map` frame while no Nav2 goal consumer or motion publisher exists.
+
+This validates the FSR-VLN/HMSG query interface only. It does not validate the
+pose against the MuJoCo scene or its occupancy map.
 
 ### Stage 1: MuJoCo Base Contract
 
-- The headless G1 simulation remains stable for a bounded run.
-- `/clock`, TF, `/robot_odom`, IMU, and camera topics have the expected types.
+- The headless G1 simulation passes the clock, real-time-factor, rate,
+  stationary-drift, motion, clamp, and timeout thresholds.
+- `/clock`, TF, `/robot_odom`, IMU, camera, and camera-info topics have the
+  expected types and frames.
+- Every active node reports `use_sim_time=true`.
 - A bounded `/cmd_vel` command moves only the simulated G1.
-- The robot stops within the command-timeout window.
 
-This stage may use perfect `/robot_odom`, but its result is labeled as a Nav2
-integration check rather than a localization check.
+This stage may use perfect `/robot_odom`; its result is labeled
+`PASS_SIM_ODOM`, not a localization pass.
 
 ### Stage 2: Synthetic Livox Contract
 
 - `/livox/lidar` uses `livox_ros_driver2/msg/CustomMsg`.
-- Lidar, IMU, and camera timestamps advance consistently.
-- Lidar points contain valid, non-constant offsets.
-- Topic rate checks pass for a bounded interval.
+- Lidar, IMU, and camera timestamps advance from the same simulated clock.
+- `snapshot` scans contain only zero offsets, or `rolling` scans contain
+  monotonic offsets bounded by the configured scan period.
+- Point counts, finite-coordinate checks, and topic-rate gates pass.
+- The generated sim extrinsics/intrinsics match the bridge configuration.
 
-### Stage 3: FastLIVO Mapping and Relocalization
+### Stage 3: Estimator Evaluation
 
-- FastLIVO consumes synthetic sensors without perfect odometry masking the
-  estimator.
-- Offline mapping produces `mapping.txt`, `cloudGlobal.pcd`, and non-empty
-  `keyframe_cloud/*.pcd`.
-- Finalization produces a valid `keyframe_pose.txt`.
-- Relocalization starts from the generated prior and remains bounded against
-  MuJoCo ground truth.
+Stage 3 is an evaluation branch, not a prerequisite for Stage 4.
 
-### Stage 4: Full HoloAgent Navigation Loop
+The required estimator gate is LIO-only with `common.img_en: 0`, a mode already
+supported by the repository's FastLIVO implementation. It must consume the
+synthetic lidar and IMU without perfect odometry masking the estimator and meet
+the numeric LIO error threshold. If mapping/finalization is exercised, its
+artifacts must include non-empty `mapping.txt`, `cloudGlobal.pcd`,
+`keyframe_cloud/*.pcd`, and `keyframe_pose.txt`.
 
-- A semantic query produces `/object_pose`.
+Full LIVO with `common.img_en: 1` is a promotion test using the textured scene
+and sim-specific camera calibration. If it converges and meets the same error
+gate, record `PASS_FULL_LIVO`. If LIO passes but photometric alignment does not,
+record `PASS_LIO_ONLY` plus the first LIVO failure; this does not block Stage 4.
+If even LIO fails, record `FAIL_ESTIMATOR` and continue only with Stage 4's
+explicit simulator-ground-truth localization path.
+
+### Stage 4: Frame-Consistent HoloAgent Navigation Plumbing
+
+- Nav2 loads the verified simulator-native occupancy map in `sim_map`.
+- The simulation-only semantic fixture converts a fixed text query to a
+  prevalidated free-space `/object_pose` in `sim_map`.
 - Nav2 accepts the goal and produces a path and bounded `/cmd_vel`.
-- The simulated G1 approaches the goal within configured tolerance.
-- Timeout and stop commands halt the simulated robot.
-- Real Unitree motion executables remain absent from the process graph.
+- The simulated G1 meets the numeric goal and collision gates.
+- Timeout and stop commands meet the stop gate.
+- DDS graph evidence contains only allowlisted localhost simulation nodes and
+  endpoints.
+- Real Unitree motion executables and `unitree_sdk2` remain absent from the
+  process/import graph.
+
+The result is labeled `PASS_SIM_SEMANTIC_PLUMBING`. It does not claim that the
+real `icra_ic4f` semantic poses are correct in simulation.
+
+## Stage Dependencies
+
+Stage 0 is required for restored HoloAgent software, Stage 1 for motion, and
+Stage 2 for the Livox contract. Stage 3 evaluates localization independently.
+Stage 4 requires Stages 0-2 but intentionally does not require Stage 3, because
+it may use simulator-ground-truth localization and the simulator-native map.
 
 ## Error Handling and Evidence
 
-Every stage is bounded by a timeout and writes a machine-readable result under
+Every stage is bounded and writes a machine-readable result under
 `outputs/mujoco_holoagent/<run-id>/`. Results include:
 
-- configuration and relevant commit IDs;
-- command and topic contract checks;
-- simulator start/end pose;
-- maximum commanded velocities;
-- estimator error when applicable;
-- pass/fail status and the first failing gate;
+- configuration, map/sensor digests, and relevant commit IDs;
+- isolation environment, RMW implementation, container network/IPC mode, and
+  ROS graph snapshots from host and container;
+- `use_sim_time` values and observed topic rates;
+- simulator start/end pose, real-time factor, and collision count;
+- maximum commanded velocities and stop latency;
+- estimator RMSE and maximum error when applicable;
+- pass/fail status, qualified pass label, and first failing gate;
 - logs needed to reproduce the failure.
 
-A later stage does not run after an earlier required gate fails. Cleanup is
-idempotent and must not use broad process-kill patterns.
+A dependent stage does not run after a required dependency fails. Optional
+promotion failures are recorded without erasing a lower qualified pass.
+Cleanup is idempotent and must not use broad process-kill patterns.
 
 ## PC2 Handoff
 
