@@ -31,7 +31,7 @@
 Run:
 
 ```bash
-test "$(git merge-base HEAD 7692aae)" = 7692aae
+test "$(git merge-base HEAD 7692aae)" = "$(git rev-parse 7692aae)"
 test "$(git rev-parse stash-backup-20260722)" = f164095abb0045a69c0b8eb23683063be3deaa38
 ```
 
