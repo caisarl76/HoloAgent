@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+
+from holoagent_mujoco.config import ConfigError, load_config, load_mapping
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+CHECKED_CONFIG = PACKAGE_ROOT / "config" / "stage1.yaml"
+GR00T_ROOT = Path("/home/jihun/work/GR00T-WholeBodyControl")
+G1_ROOT = GR00T_ROOT / "decoupled_wbc" / "sim2mujoco"
+G1_CONFIG = G1_ROOT / "resources" / "robots" / "g1"
+
+
+def valid_mapping() -> dict:
+    return {
+        "runtime": {
+            "python": str(GR00T_ROOT / ".venv_sim" / "bin" / "python"),
+            "extra_python_paths": [
+                str(
+                    GR00T_ROOT
+                    / ".venv_data_collection"
+                    / "lib"
+                    / "python3.10"
+                    / "site-packages"
+                )
+            ],
+            "directory": "/tmp/holoagent_mujoco_stage1",
+            "ros_domain_id": 77,
+            "ros_localhost_only": True,
+            "rmw_implementation": "rmw_cyclonedds_cpp",
+            "mujoco_gl": "egl",
+        },
+        "backend": {
+            "root": str(G1_ROOT),
+            "runner": str(G1_ROOT / "scripts" / "run_mujoco_gear_wbc.py"),
+            "config_yaml": str(G1_CONFIG / "g1_gear_wbc.yaml"),
+            "xml": str(G1_CONFIG / "g1_gear_wbc.xml"),
+            "balance_policy": str(
+                G1_CONFIG / "policy" / "GR00T-WholeBodyControl-Balance.onnx"
+            ),
+            "walk_policy": str(
+                G1_CONFIG / "policy" / "GR00T-WholeBodyControl-Walk.onnx"
+            ),
+            "onnx_providers": ["CPUExecutionProvider"],
+        },
+        "rates": {"physics_hz": 200, "imu_hz": 200, "odom_hz": 50, "camera_hz": 15},
+        "frames": {
+            "map": "sim_map",
+            "odom": "odom",
+            "base": "base_link",
+            "imu": "imu_link",
+            "camera": "camera_link",
+        },
+        "command": {
+            "max_linear_x": 0.22,
+            "max_linear_y": 0.0,
+            "max_yaw_rate": 0.30,
+            "timeout_sim_sec": 0.50,
+        },
+        "camera": {
+            "name": "head_camera",
+            "width": 320,
+            "height": 240,
+            "fx": 240.0,
+            "fy": 240.0,
+            "cx": 160.0,
+            "cy": 120.0,
+            "mount_pos": [0.18, 0.0, 0.35],
+            "mount_xyaxes": [0.0, -1.0, 0.0, 0.0, 0.0, 1.0],
+        },
+        "scene": {
+            "half_extent": 4.0,
+            "wall_height": 2.5,
+            "wall_thickness": 0.10,
+        },
+        "thresholds": {
+            "warmup_sec": 2.0,
+            "rate_window_sec": 10.0,
+            "clock_min_hz": 50.0,
+            "min_realtime_factor": 0.25,
+            "imu_min_hz": 180.0,
+            "imu_max_hz": 220.0,
+            "odom_min_hz": 40.0,
+            "odom_max_hz": 60.0,
+            "camera_min_hz": 12.0,
+            "camera_max_hz": 18.0,
+            "stationary_duration_sec": 5.0,
+            "max_stationary_drift_m": 0.05,
+            "motion_speed_mps": 0.10,
+            "motion_duration_sec": 2.0,
+            "motion_min_displacement_m": 0.08,
+            "motion_max_displacement_m": 0.30,
+            "timeout_zero_sec": 0.60,
+            "stopped_speed_mps": 0.03,
+            "stopped_hold_sec": 1.0,
+            "wall_time_multiplier": 4.0,
+            "startup_allowance_sec": 30.0,
+        },
+    }
+
+
+def test_checked_in_config_is_stage1_safe():
+    cfg = load_config(CHECKED_CONFIG)
+
+    assert cfg.runtime.ros_domain_id == 77
+    assert cfg.runtime.ros_localhost_only is True
+    assert cfg.runtime.rmw_implementation == "rmw_cyclonedds_cpp"
+    assert cfg.command.max_linear_y == 0.0
+    assert cfg.command.timeout_sim_sec == 0.50
+    assert cfg.rates.physics_hz == 200
+    assert cfg.rates.imu_hz == 200
+    assert cfg.rates.odom_hz == 50
+    assert cfg.rates.camera_hz == 15
+    assert cfg.backend.runner.name == "run_mujoco_gear_wbc.py"
+    assert cfg.backend.balance_policy.is_file()
+    assert cfg.backend.walk_policy.is_file()
+
+
+def test_camera_rate_need_not_divide_physics_rate():
+    cfg = load_mapping(valid_mapping())
+
+    assert cfg.rates.camera_hz == 15
+
+
+def test_relative_runtime_path_is_rejected():
+    raw = valid_mapping()
+    raw["runtime"]["python"] = ".venv_sim/bin/python"
+
+    with pytest.raises(ConfigError, match="runtime.python.*absolute"):
+        load_mapping(raw)
+
+
+def test_missing_policy_fails_before_ros_start(tmp_path):
+    raw = valid_mapping()
+    raw["backend"]["walk_policy"] = str(tmp_path / "missing.onnx")
+
+    with pytest.raises(ConfigError, match="backend.walk_policy.*does not exist"):
+        load_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "message"),
+    [
+        ("rates", "camera_hz", 201, "camera_hz.*physics_hz"),
+        ("rates", "odom_hz", 0, "odom_hz.*positive"),
+        ("command", "max_linear_y", 0.01, "max_linear_y.*zero"),
+        ("command", "max_yaw_rate", float("nan"), "max_yaw_rate.*finite"),
+        ("runtime", "ros_domain_id", 78, "ros_domain_id.*77"),
+        ("runtime", "ros_localhost_only", False, "ros_localhost_only.*true"),
+    ],
+)
+def test_unsafe_numeric_or_isolation_value_is_rejected(section, key, value, message):
+    raw = deepcopy(valid_mapping())
+    raw[section][key] = value
+
+    with pytest.raises(ConfigError, match=message):
+        load_mapping(raw)
+
+
+def test_frames_must_be_nonempty_and_distinct():
+    raw = valid_mapping()
+    raw["frames"]["imu"] = "base_link"
+
+    with pytest.raises(ConfigError, match="frames.*distinct"):
+        load_mapping(raw)
