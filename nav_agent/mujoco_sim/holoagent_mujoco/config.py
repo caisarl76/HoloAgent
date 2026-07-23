@@ -52,6 +52,7 @@ class RateConfig:
     imu_hz: int
     odom_hz: int
     camera_hz: int
+    lidar_hz: int
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class FrameConfig:
     base: str
     imu: str
     camera: str
+    lidar: str = "livox_frame"
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,30 @@ class CameraConfig:
 
 
 @dataclass(frozen=True)
+class LidarConfig:
+    name: str
+    acquisition_mode: str
+    scan_lines: int
+    azimuth_samples: int
+    vertical_fov_deg: tuple[float, float]
+    min_range_m: float
+    max_range_m: float
+    scan_period_sec: float
+    noise_std_m: float
+    dropout_probability: float
+    reflectivity: int
+    tag: int
+    random_seed: int
+    mount_pos: tuple[float, float, float]
+    mount_quat_wxyz: tuple[float, float, float, float]
+    min_finite_points: int
+
+    @property
+    def configured_points(self) -> int:
+        return self.scan_lines * self.azimuth_samples
+
+
+@dataclass(frozen=True)
 class SceneConfig:
     half_extent: float
     wall_height: float
@@ -103,6 +129,8 @@ class ThresholdConfig:
     odom_max_hz: float
     camera_min_hz: float
     camera_max_hz: float
+    lidar_min_hz: float
+    lidar_max_hz: float
     stationary_duration_sec: float
     max_stationary_drift_m: float
     motion_speed_mps: float
@@ -127,6 +155,7 @@ class Stage1Config:
     frames: FrameConfig
     command: CommandConfig
     camera: CameraConfig
+    lidar: LidarConfig
     scene: SceneConfig
     thresholds: ThresholdConfig
     source_path: Path | None = None
@@ -151,13 +180,18 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
     frames_raw = _mapping(raw, "frames")
     command_raw = _mapping(raw, "command")
     camera_raw = _mapping(raw, "camera")
+    lidar_raw = _mapping(raw, "lidar")
     scene_raw = _mapping(raw, "scene")
     threshold_raw = _mapping(raw, "thresholds")
 
     runtime = RuntimeConfig(
-        python=_path(runtime_raw, "python", "runtime.python", file=True, executable=True),
+        python=_path(
+            runtime_raw, "python", "runtime.python", file=True, executable=True
+        ),
         extra_python_paths=tuple(
-            _absolute_path(value, f"runtime.extra_python_paths[{index}]", directory=True)
+            _absolute_path(
+                value, f"runtime.extra_python_paths[{index}]", directory=True
+            )
             for index, value in enumerate(_list(runtime_raw, "extra_python_paths"))
         ),
         directory=_absolute_path(runtime_raw.get("directory"), "runtime.directory"),
@@ -181,7 +215,10 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
     if not isinstance(digest_raw, Mapping):
         raise ConfigError("backend.expected_sha256 must be a mapping")
     expected_sha256 = tuple(
-        sorted((str(key), _sha256_text(value, f"backend.expected_sha256.{key}")) for key, value in digest_raw.items())
+        sorted(
+            (str(key), _sha256_text(value, f"backend.expected_sha256.{key}"))
+            for key, value in digest_raw.items()
+        )
     )
     backend = BackendConfig(
         root=_path(backend_raw, "root", "backend.root", directory=True),
@@ -199,7 +236,9 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
         expected_sha256=expected_sha256,
     )
     if backend.onnx_providers != ("CPUExecutionProvider",):
-        raise ConfigError("backend.onnx_providers must contain only CPUExecutionProvider")
+        raise ConfigError(
+            "backend.onnx_providers must contain only CPUExecutionProvider"
+        )
     _verify_digest_pins(backend)
 
     rates = RateConfig(
@@ -207,23 +246,28 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
         imu_hz=_positive_integer(rates_raw, "imu_hz", "rates.imu_hz"),
         odom_hz=_positive_integer(rates_raw, "odom_hz", "rates.odom_hz"),
         camera_hz=_positive_integer(rates_raw, "camera_hz", "rates.camera_hz"),
+        lidar_hz=_positive_integer(rates_raw, "lidar_hz", "rates.lidar_hz"),
     )
-    for name in ("imu_hz", "odom_hz", "camera_hz"):
+    for name in ("imu_hz", "odom_hz", "camera_hz", "lidar_hz"):
         if getattr(rates, name) > rates.physics_hz:
             raise ConfigError(f"rates.{name} cannot exceed rates.physics_hz")
 
     frame_values = {
         name: _nonempty_string(frames_raw, name, f"frames.{name}")
-        for name in ("map", "odom", "base", "imu", "camera")
+        for name in ("map", "odom", "base", "imu", "camera", "lidar")
     }
     if len(set(frame_values.values())) != len(frame_values):
         raise ConfigError("frames must be distinct")
     frames = FrameConfig(**frame_values)
 
     command = CommandConfig(
-        max_linear_x=_positive_float(command_raw, "max_linear_x", "command.max_linear_x"),
+        max_linear_x=_positive_float(
+            command_raw, "max_linear_x", "command.max_linear_x"
+        ),
         max_linear_y=_finite_float(command_raw, "max_linear_y", "command.max_linear_y"),
-        max_yaw_rate=_positive_float(command_raw, "max_yaw_rate", "command.max_yaw_rate"),
+        max_yaw_rate=_positive_float(
+            command_raw, "max_yaw_rate", "command.max_yaw_rate"
+        ),
         timeout_sim_sec=_positive_float(
             command_raw, "timeout_sim_sec", "command.timeout_sim_sec"
         ),
@@ -245,6 +289,65 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
     if not (0.0 <= camera.cx <= camera.width and 0.0 <= camera.cy <= camera.height):
         raise ConfigError("camera principal point must lie inside the image")
 
+    lidar = LidarConfig(
+        name=_nonempty_string(lidar_raw, "name", "lidar.name"),
+        acquisition_mode=_nonempty_string(
+            lidar_raw, "acquisition_mode", "lidar.acquisition_mode"
+        ),
+        scan_lines=_positive_integer(lidar_raw, "scan_lines", "lidar.scan_lines"),
+        azimuth_samples=_positive_integer(
+            lidar_raw, "azimuth_samples", "lidar.azimuth_samples"
+        ),
+        vertical_fov_deg=_float_tuple(
+            lidar_raw, "vertical_fov_deg", "lidar.vertical_fov_deg", 2
+        ),
+        min_range_m=_positive_float(lidar_raw, "min_range_m", "lidar.min_range_m"),
+        max_range_m=_positive_float(lidar_raw, "max_range_m", "lidar.max_range_m"),
+        scan_period_sec=_positive_float(
+            lidar_raw, "scan_period_sec", "lidar.scan_period_sec"
+        ),
+        noise_std_m=_nonnegative_float(lidar_raw, "noise_std_m", "lidar.noise_std_m"),
+        dropout_probability=_finite_float(
+            lidar_raw, "dropout_probability", "lidar.dropout_probability"
+        ),
+        reflectivity=_integer(lidar_raw, "reflectivity", "lidar.reflectivity"),
+        tag=_integer(lidar_raw, "tag", "lidar.tag"),
+        random_seed=_integer(lidar_raw, "random_seed", "lidar.random_seed"),
+        mount_pos=_float_tuple(lidar_raw, "mount_pos", "lidar.mount_pos", 3),
+        mount_quat_wxyz=_float_tuple(
+            lidar_raw, "mount_quat_wxyz", "lidar.mount_quat_wxyz", 4
+        ),
+        min_finite_points=_positive_integer(
+            lidar_raw, "min_finite_points", "lidar.min_finite_points"
+        ),
+    )
+    if lidar.acquisition_mode not in {"snapshot", "rolling"}:
+        raise ConfigError("lidar.acquisition_mode must be snapshot or rolling")
+    if lidar.scan_lines > 255:
+        raise ConfigError("lidar.scan_lines must be no greater than 255")
+    if not (-90.0 < lidar.vertical_fov_deg[0] < lidar.vertical_fov_deg[1] < 90.0):
+        raise ConfigError("lidar.vertical_fov_deg must be ordered inside (-90, 90)")
+    if lidar.max_range_m <= lidar.min_range_m:
+        raise ConfigError("lidar.max_range_m must be greater than lidar.min_range_m")
+    if not math.isclose(
+        lidar.scan_period_sec, 1.0 / rates.lidar_hz, rel_tol=0.0, abs_tol=1e-9
+    ):
+        raise ConfigError("lidar.scan_period_sec must equal 1 / rates.lidar_hz")
+    if not 0.0 <= lidar.dropout_probability < 1.0:
+        raise ConfigError("lidar.dropout_probability must be in [0, 1)")
+    for label, value in (("reflectivity", lidar.reflectivity), ("tag", lidar.tag)):
+        if not 0 <= value <= 255:
+            raise ConfigError(f"lidar.{label} must be in [0, 255]")
+    quaternion_norm = math.sqrt(sum(value * value for value in lidar.mount_quat_wxyz))
+    if not math.isclose(quaternion_norm, 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise ConfigError("lidar.mount_quat_wxyz must be a unit quaternion")
+    if lidar.min_finite_points < 2500:
+        raise ConfigError("lidar.min_finite_points must be at least 2500")
+    if lidar.min_finite_points > lidar.configured_points:
+        raise ConfigError(
+            "lidar.min_finite_points cannot exceed configured scan point count"
+        )
+
     scene = SceneConfig(
         half_extent=_positive_float(scene_raw, "half_extent", "scene.half_extent"),
         wall_height=_positive_float(scene_raw, "wall_height", "scene.wall_height"),
@@ -264,6 +367,8 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
         "odom_max_hz",
         "camera_min_hz",
         "camera_max_hz",
+        "lidar_min_hz",
+        "lidar_max_hz",
         "stationary_duration_sec",
         "max_stationary_drift_m",
         "motion_speed_mps",
@@ -289,6 +394,7 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
         (thresholds.imu_min_hz, thresholds.imu_max_hz),
         (thresholds.odom_min_hz, thresholds.odom_max_hz),
         (thresholds.camera_min_hz, thresholds.camera_max_hz),
+        (thresholds.lidar_min_hz, thresholds.lidar_max_hz),
         (thresholds.motion_min_displacement_m, thresholds.motion_max_displacement_m),
     ):
         if minimum > maximum:
@@ -301,6 +407,7 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
         frames=frames,
         command=command,
         camera=camera,
+        lidar=lidar,
         scene=scene,
         thresholds=thresholds,
     )
@@ -440,6 +547,13 @@ def _positive_float(parent: Mapping[str, Any], key: str, label: str) -> float:
     return value
 
 
+def _nonnegative_float(parent: Mapping[str, Any], key: str, label: str) -> float:
+    value = _finite_float(parent, key, label)
+    if value < 0.0:
+        raise ConfigError(f"{label} must be non-negative")
+    return value
+
+
 def _float_tuple(
     parent: Mapping[str, Any], key: str, label: str, length: int
 ) -> tuple[float, ...]:
@@ -464,6 +578,8 @@ def _nonempty_value(value: Any, label: str) -> str:
 
 def _sha256_text(value: Any, label: str) -> str:
     text = _nonempty_value(value, label).lower()
-    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+    if len(text) != 64 or any(
+        character not in "0123456789abcdef" for character in text
+    ):
         raise ConfigError(f"{label} must be a SHA-256 hex digest")
     return text

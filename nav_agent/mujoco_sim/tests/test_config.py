@@ -54,13 +54,20 @@ def valid_mapping() -> dict:
                 "walk_policy": "7c82255b6905ffcc4468fa7f8ddcf7b70db168cf1042107ccab887cb6a8e5407",
             },
         },
-        "rates": {"physics_hz": 200, "imu_hz": 200, "odom_hz": 50, "camera_hz": 15},
+        "rates": {
+            "physics_hz": 200,
+            "imu_hz": 200,
+            "odom_hz": 50,
+            "camera_hz": 15,
+            "lidar_hz": 10,
+        },
         "frames": {
             "map": "sim_map",
             "odom": "odom",
             "base": "base_link",
             "imu": "imu_link",
             "camera": "camera_link",
+            "lidar": "livox_frame",
         },
         "command": {
             "max_linear_x": 0.22,
@@ -79,6 +86,24 @@ def valid_mapping() -> dict:
             "mount_pos": [0.18, 0.0, 0.35],
             "mount_xyaxes": [0.0, -1.0, 0.0, 0.0, 0.0, 1.0],
         },
+        "lidar": {
+            "name": "lidar_in_torso",
+            "acquisition_mode": "snapshot",
+            "scan_lines": 6,
+            "azimuth_samples": 512,
+            "vertical_fov_deg": [-15.0, 15.0],
+            "min_range_m": 0.10,
+            "max_range_m": 20.0,
+            "scan_period_sec": 0.10,
+            "noise_std_m": 0.0,
+            "dropout_probability": 0.0,
+            "reflectivity": 100,
+            "tag": 0,
+            "random_seed": 7,
+            "mount_pos": [-0.03959, -0.00224, 0.14792],
+            "mount_quat_wxyz": [1.0, 0.0, 0.0, 0.0],
+            "min_finite_points": 2500,
+        },
         "scene": {
             "half_extent": 4.0,
             "wall_height": 2.5,
@@ -95,6 +120,8 @@ def valid_mapping() -> dict:
             "odom_max_hz": 60.0,
             "camera_min_hz": 12.0,
             "camera_max_hz": 18.0,
+            "lidar_min_hz": 8.0,
+            "lidar_max_hz": 12.0,
             "stationary_duration_sec": 5.0,
             "max_stationary_drift_m": 0.05,
             "motion_speed_mps": 0.10,
@@ -125,6 +152,16 @@ def test_checked_in_config_is_stage1_safe():
     assert cfg.rates.imu_hz == 200
     assert cfg.rates.odom_hz == 50
     assert cfg.rates.camera_hz == 15
+    assert cfg.rates.lidar_hz == 10
+    assert cfg.frames.lidar == "livox_frame"
+    assert cfg.lidar.acquisition_mode == "snapshot"
+    assert cfg.lidar.scan_lines == 6
+    assert cfg.lidar.azimuth_samples == 512
+    assert cfg.lidar.configured_points == 3072
+    assert cfg.lidar.min_finite_points == 2500
+    assert cfg.lidar.scan_period_sec == pytest.approx(0.1)
+    assert cfg.lidar.noise_std_m == 0.0
+    assert cfg.lidar.dropout_probability == 0.0
     assert cfg.backend.runner.name == "run_mujoco_gear_wbc.py"
     assert cfg.backend.balance_policy.is_file()
     assert cfg.backend.walk_policy.is_file()
@@ -200,4 +237,44 @@ def test_frames_must_be_nonempty_and_distinct():
     raw["frames"]["imu"] = "base_link"
 
     with pytest.raises(ConfigError, match="frames.*distinct"):
+        load_mapping(raw)
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("acquisition_mode", "fabricated", "acquisition_mode"),
+        ("scan_lines", 256, "scan_lines"),
+        ("azimuth_samples", 0, "azimuth_samples.*positive"),
+        ("min_range_m", float("nan"), "min_range_m.*finite"),
+        ("max_range_m", 0.1, "max_range_m.*greater"),
+        ("scan_period_sec", 0.2, "scan_period_sec.*lidar_hz"),
+        ("noise_std_m", -0.01, "noise_std_m.*non-negative"),
+        ("dropout_probability", 1.1, "dropout_probability"),
+        ("reflectivity", 256, "reflectivity"),
+        ("tag", -1, "tag"),
+        ("min_finite_points", 3073, "min_finite_points"),
+    ],
+)
+def test_invalid_lidar_contract_is_rejected(key, value, message):
+    raw = valid_mapping()
+    raw["lidar"][key] = value
+
+    with pytest.raises(ConfigError, match=message):
+        load_mapping(raw)
+
+
+def test_lidar_mount_quaternion_must_be_unit_length():
+    raw = valid_mapping()
+    raw["lidar"]["mount_quat_wxyz"] = [2.0, 0.0, 0.0, 0.0]
+
+    with pytest.raises(ConfigError, match="mount_quat_wxyz.*unit"):
+        load_mapping(raw)
+
+
+def test_lidar_density_gate_cannot_be_too_weak():
+    raw = valid_mapping()
+    raw["lidar"]["min_finite_points"] = 2499
+
+    with pytest.raises(ConfigError, match="min_finite_points.*2500"):
         load_mapping(raw)

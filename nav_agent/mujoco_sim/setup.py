@@ -27,6 +27,7 @@ setup(
             "bridge_node = holoagent_mujoco.bridge_node:main",
             "stage1_eval = holoagent_mujoco.stage1_eval:main",
             "preflight = holoagent_mujoco.preflight:main",
+            "generate_calibration = holoagent_mujoco.calibration:main",
         ]
     },
 )

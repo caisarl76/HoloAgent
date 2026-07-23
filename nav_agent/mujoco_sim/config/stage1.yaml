@@ -28,6 +28,7 @@ rates:
   imu_hz: 200
   odom_hz: 50
   camera_hz: 15
+  lidar_hz: 10
 
 frames:
   map: sim_map
@@ -35,6 +36,7 @@ frames:
   base: base_link
   imu: imu_link
   camera: camera_link
+  lidar: livox_frame
 
 command:
   max_linear_x: 0.22
@@ -53,6 +55,24 @@ camera:
   mount_pos: [0.18, 0.0, 0.35]
   mount_xyaxes: [0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
 
+lidar:
+  name: lidar_in_torso
+  acquisition_mode: snapshot
+  scan_lines: 6
+  azimuth_samples: 512
+  vertical_fov_deg: [-15.0, 15.0]
+  min_range_m: 0.10
+  max_range_m: 20.0
+  scan_period_sec: 0.10
+  noise_std_m: 0.0
+  dropout_probability: 0.0
+  reflectivity: 100
+  tag: 0
+  random_seed: 7
+  mount_pos: [-0.03959, -0.00224, 0.14792]
+  mount_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
+  min_finite_points: 2500
+
 scene:
   half_extent: 4.0
   wall_height: 2.5
@@ -69,6 +89,8 @@ thresholds:
   odom_max_hz: 60.0
   camera_min_hz: 12.0
   camera_max_hz: 18.0
+  lidar_min_hz: 8.0
+  lidar_max_hz: 12.0
   stationary_duration_sec: 5.0
   max_stationary_drift_m: 0.05
   motion_speed_mps: 0.10
