@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import collections
 from dataclasses import dataclass
 import hashlib
 import importlib

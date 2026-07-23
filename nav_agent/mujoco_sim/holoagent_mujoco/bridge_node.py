@@ -15,10 +15,11 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from rosgraph_msgs.msg import Clock
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo, Image, Imu
+from std_msgs.msg import UInt32
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from holoagent_mujoco.backend import BackendError, MujocoBackend, create_backend
-from holoagent_mujoco.command import CommandLimits, CommandSafety, VelocityCommand
+from holoagent_mujoco.command import CommandLimits, CommandSafety
 from holoagent_mujoco.config import Stage1Config, load_config
 from holoagent_mujoco.ros_messages import (
     camera_info_message,
@@ -127,6 +128,9 @@ class HoloAgentMujocoBridge(Node):
         self._applied_publisher = self.create_publisher(
             Twist, "/holoagent_sim/applied_cmd_vel", reliable_qos
         )
+        self._contact_publisher = self.create_publisher(
+            UInt32, "/holoagent_sim/contact_count", sensor_qos
+        )
         self._tf_broadcaster = TransformBroadcaster(self)
         self._static_tf_broadcaster = StaticTransformBroadcaster(self)
         self._command_subscription = self.create_subscription(
@@ -147,6 +151,9 @@ class HoloAgentMujocoBridge(Node):
         self._sim_time = snapshot.sim_time
         self._clock_publisher.publish(clock_message(snapshot.sim_time))
         self._applied_publisher.publish(twist_message(snapshot.applied_command))
+        contact_message = UInt32()
+        contact_message.data = snapshot.contact_count
+        self._contact_publisher.publish(contact_message)
 
         due = self.scheduler.tick()
         if "imu" in due:
