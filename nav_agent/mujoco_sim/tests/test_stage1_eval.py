@@ -19,6 +19,9 @@ from holoagent_mujoco.stage1_eval import (
     strictly_monotonic,
     timeout_latency,
 )
+from holoagent_mujoco.stage1_eval import Stage1Evaluator
+from holoagent_mujoco.config import load_config
+from pathlib import Path
 
 
 def test_clock_must_be_strictly_monotonic():
@@ -138,3 +141,35 @@ def test_qualified_pass_result_is_json_serializable():
     assert result["label"] == "PASS_SIM_ODOM"
     assert result["first_failing_gate"] is None
     assert json.loads(json.dumps(result))["metrics"]["rtf"] == 0.8
+
+
+def test_failed_graph_gate_returns_before_any_phase_command():
+    config = load_config(Path(__file__).parents[1] / "config" / "stage1.yaml")
+
+    class FakeEvaluator:
+        def __init__(self):
+            self.config = config
+            self.current_sim_time = 0.0
+            self.graph_evidence = {"nodes": ["/unexpected"]}
+            self.phase_commands = []
+            self.zero_count = 0
+
+        def _wait_for_first_clock(self):
+            pass
+
+        def _wait_for_graph_contract(self):
+            return False, "unexpected node"
+
+        def _wait_sim(self, target, command):
+            self.phase_commands.append(command)
+
+        def publish_zero(self):
+            self.zero_count += 1
+
+    evaluator = FakeEvaluator()
+
+    result = Stage1Evaluator.run(evaluator)
+
+    assert result["first_failing_gate"] == "graph"
+    assert evaluator.phase_commands == []
+    assert evaluator.zero_count == 1

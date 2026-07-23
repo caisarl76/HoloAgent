@@ -273,6 +273,15 @@ class Stage1Evaluator(Node):
         )
         self._wait_for_first_clock()
         graph_ok, graph_reason = self._wait_for_graph_contract()
+        if not graph_ok:
+            self.publish_zero()
+            return build_result(
+                {"graph": False},
+                {
+                    "graph_reason": graph_reason,
+                    "graph": self.graph_evidence,
+                },
+            )
         start = float(self.current_sim_time)
 
         self._wait_sim(start + thresholds.warmup_sec, VelocityCommand.zero())
