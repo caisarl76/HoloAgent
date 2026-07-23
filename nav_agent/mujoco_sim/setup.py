@@ -11,8 +11,9 @@ setup(
     packages=find_packages(exclude=["tests"]),
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
-        (f"share/{package_name}", ["package.xml"]),
+        (f"share/{package_name}", ["package.xml", "README.md"]),
         (f"share/{package_name}/config", glob("config/*.yaml")),
+        (f"share/{package_name}/scripts", glob("scripts/*.sh")),
     ],
     install_requires=["setuptools", "numpy", "PyYAML"],
     zip_safe=True,
@@ -29,4 +30,3 @@ setup(
         ]
     },
 )
-
