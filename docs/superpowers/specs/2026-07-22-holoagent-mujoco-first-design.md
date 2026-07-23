@@ -355,6 +355,7 @@ edited after a run.
 | Odometry rate | 40-60 Hz over 10 simulated seconds |
 | Camera rate | 12-18 Hz over 10 simulated seconds |
 | Lidar rate | 8-12 Hz over 10 simulated seconds |
+| Lidar density | 3,072 configured rays and at least 2,500 finite points in every accepted scan |
 | Stationary drift | at most 0.05 m over 5 simulated seconds |
 | Bounded motion | 0.08-0.30 m forward displacement for 0.10 m/s over 2 simulated seconds |
 | Command clamps | `abs(x)<=0.22`, `y==0`, `abs(yaw)<=0.30` |
@@ -402,6 +403,9 @@ This stage may use perfect `/robot_odom`; its result is labeled
 - `snapshot` scans contain only zero offsets, or `rolling` scans contain
   monotonic offsets bounded by the configured scan period.
 - Point counts, finite-coordinate checks, and topic-rate gates pass.
+- Each accepted scan contains at least 2,500 finite points from the configured
+  3,072-ray pattern; an under-density scan is a hard failure rather than a
+  silently starved FastLIVO input.
 - The generated sim extrinsics/intrinsics match the bridge configuration.
 
 ### Stage 3: Estimator Evaluation
