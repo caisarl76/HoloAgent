@@ -14,19 +14,26 @@ from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rosgraph_msgs.msg import Clock
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import CameraInfo, Image, Imu
+from sensor_msgs.msg import CameraInfo, Image, Imu, PointCloud2
 from std_msgs.msg import UInt32
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
-from holoagent_mujoco.backend import BackendError, MujocoBackend, create_backend
+from holoagent_mujoco.backend import (
+    BackendError,
+    BackendSnapshot,
+    MujocoBackend,
+    create_backend,
+)
 from holoagent_mujoco.command import CommandLimits, CommandSafety
 from holoagent_mujoco.config import Stage1Config, load_config
+from holoagent_mujoco.lidar import LidarPose, PoseHistory, SyntheticLidar
 from holoagent_mujoco.ros_messages import (
     camera_info_message,
     clock_message,
     image_message,
     imu_message,
     odometry_message,
+    pointcloud_message,
     sensor_transforms,
     static_map_transform,
     transform_message,
@@ -91,14 +98,14 @@ class HoloAgentMujocoBridge(Node):
                 config.command.timeout_sim_sec,
             )
         )
-        self.scheduler = SimRateScheduler(
-            config.rates.physics_hz,
-            {
-                "imu": config.rates.imu_hz,
-                "odom": config.rates.odom_hz,
-                "camera": config.rates.camera_hz,
-            },
-        )
+        stream_rates = {
+            "imu": config.rates.imu_hz,
+            "odom": config.rates.odom_hz,
+            "camera": config.rates.camera_hz,
+        }
+        if config.lidar.enabled:
+            stream_rates["lidar"] = config.rates.lidar_hz
+        self.scheduler = SimRateScheduler(config.rates.physics_hz, stream_rates)
         self._sim_time = float(backend.data.time)
         clock_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -130,6 +137,16 @@ class HoloAgentMujocoBridge(Node):
         self._contact_publisher = self.create_publisher(
             UInt32, "/holoagent_sim/contact_count", sensor_qos
         )
+        self._lidar_publisher = None
+        self._lidar_sensor = None
+        self._lidar_history = None
+        if config.lidar.enabled:
+            self._lidar_publisher = self.create_publisher(
+                PointCloud2, "/holoagent_sim/lidar_points", sensor_qos
+            )
+            self._lidar_sensor = SyntheticLidar(config.lidar)
+            self._lidar_history = PoseHistory(config.lidar.scan_period_sec)
+            self._lidar_history.append(_lidar_pose(backend.snapshot()))
         self._tf_broadcaster = TransformBroadcaster(self)
         self._static_tf_broadcaster = StaticTransformBroadcaster(self)
         self._command_subscription = self.create_subscription(
@@ -148,6 +165,8 @@ class HoloAgentMujocoBridge(Node):
         self.backend.set_command(command)
         snapshot = self.backend.step()
         self._sim_time = snapshot.sim_time
+        if self._lidar_history is not None:
+            self._lidar_history.append(_lidar_pose(snapshot))
         self._clock_publisher.publish(clock_message(snapshot.sim_time))
         self._applied_publisher.publish(twist_message(snapshot.applied_command))
         contact_message = UInt32()
@@ -162,7 +181,11 @@ class HoloAgentMujocoBridge(Node):
             self._tf_broadcaster.sendTransform(
                 [
                     transform_message(snapshot, self.config.frames),
-                    *sensor_transforms(snapshot, self.config.frames),
+                    *sensor_transforms(
+                        snapshot,
+                        self.config.frames,
+                        include_lidar=self.config.lidar.enabled,
+                    ),
                 ]
             )
         if "camera" in due:
@@ -179,6 +202,19 @@ class HoloAgentMujocoBridge(Node):
                     snapshot.sim_time, self.config.frames, self.config.camera
                 )
             )
+        if "lidar" in due:
+            if (
+                self._lidar_sensor is None
+                or self._lidar_history is None
+                or self._lidar_publisher is None
+            ):
+                raise BackendError("lidar scheduler fired while lidar is disabled")
+            scan = self._lidar_sensor.acquire(
+                _lidar_pose(snapshot),
+                self._lidar_history,
+                self.backend.raycast_static,
+            )
+            self._lidar_publisher.publish(pointcloud_message(scan, self.config.frames))
 
     def force_zero(self) -> None:
         command = self.safety.shutdown()
@@ -280,6 +316,14 @@ def _default_config_path() -> Path:
         )
     except (ImportError, LookupError):
         return Path(__file__).parents[1] / "config" / "stage1.yaml"
+
+
+def _lidar_pose(snapshot: BackendSnapshot) -> LidarPose:
+    return LidarPose(
+        sim_time=snapshot.sim_time,
+        position_world=snapshot.lidar_position_world,
+        quaternion_world_wxyz=snapshot.lidar_quaternion_world_wxyz,
+    )
 
 
 if __name__ == "__main__":

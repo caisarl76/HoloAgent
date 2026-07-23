@@ -7,11 +7,12 @@ from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
 import numpy as np
 from rosgraph_msgs.msg import Clock
-from sensor_msgs.msg import CameraInfo, Image, Imu
+from sensor_msgs.msg import CameraInfo, Image, Imu, PointCloud2, PointField
 
 from holoagent_mujoco.backend import BackendSnapshot
 from holoagent_mujoco.command import VelocityCommand
 from holoagent_mujoco.config import CameraConfig, FrameConfig
+from holoagent_mujoco.lidar import LidarScan
 
 
 def time_message(sim_time: float) -> Time:
@@ -41,9 +42,7 @@ def odometry_message(snapshot: BackendSnapshot, frames: FrameConfig) -> Odometry
     message.header.frame_id = frames.odom
     message.child_frame_id = frames.base
     _set_xyz(message.pose.pose.position, snapshot.base_position)
-    _set_ros_quaternion(
-        message.pose.pose.orientation, snapshot.base_quaternion_wxyz
-    )
+    _set_ros_quaternion(message.pose.pose.orientation, snapshot.base_quaternion_wxyz)
     _set_xyz(message.twist.twist.linear, snapshot.base_linear_velocity)
     _set_xyz(message.twist.twist.angular, snapshot.base_angular_velocity)
     return message
@@ -57,9 +56,7 @@ def transform_message(
     message.header.frame_id = frames.odom
     message.child_frame_id = frames.base
     _set_xyz(message.transform.translation, snapshot.base_position)
-    _set_ros_quaternion(
-        message.transform.rotation, snapshot.base_quaternion_wxyz
-    )
+    _set_ros_quaternion(message.transform.rotation, snapshot.base_quaternion_wxyz)
     return message
 
 
@@ -130,8 +127,59 @@ def camera_info_message(
     return message
 
 
+def pointcloud_message(scan: LidarScan, frames: FrameConfig) -> PointCloud2:
+    count = len(scan.points)
+    arrays = (scan.reflectivity, scan.tags, scan.lines, scan.offset_time)
+    if scan.points.shape != (count, 3) or any(len(array) != count for array in arrays):
+        raise ValueError("lidar scan arrays must have a consistent point count")
+    if count == 0 or not np.isfinite(scan.points).all():
+        raise ValueError("lidar scan must contain finite points")
+    dtype = np.dtype(
+        [
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+            ("intensity", "u1"),
+            ("tag", "u1"),
+            ("line", "u1"),
+            ("padding", "u1"),
+            ("offset_time", "<u4"),
+        ]
+    )
+    packed = np.empty(count, dtype=dtype)
+    packed["x"] = scan.points[:, 0]
+    packed["y"] = scan.points[:, 1]
+    packed["z"] = scan.points[:, 2]
+    packed["intensity"] = scan.reflectivity
+    packed["tag"] = scan.tags
+    packed["line"] = scan.lines
+    packed["padding"] = 0
+    packed["offset_time"] = scan.offset_time
+
+    message = PointCloud2()
+    message.header.stamp = time_message(scan.timebase)
+    message.header.frame_id = frames.lidar
+    message.height = 1
+    message.width = count
+    message.fields = [
+        _point_field("x", 0, PointField.FLOAT32),
+        _point_field("y", 4, PointField.FLOAT32),
+        _point_field("z", 8, PointField.FLOAT32),
+        _point_field("intensity", 12, PointField.UINT8),
+        _point_field("tag", 13, PointField.UINT8),
+        _point_field("line", 14, PointField.UINT8),
+        _point_field("offset_time", 16, PointField.UINT32),
+    ]
+    message.is_bigendian = False
+    message.point_step = dtype.itemsize
+    message.row_step = count * dtype.itemsize
+    message.data = packed.tobytes()
+    message.is_dense = True
+    return message
+
+
 def sensor_transforms(
-    snapshot: BackendSnapshot, frames: FrameConfig
+    snapshot: BackendSnapshot, frames: FrameConfig, *, include_lidar: bool = True
 ) -> list[TransformStamped]:
     stamp = time_message(snapshot.sim_time)
     imu = TransformStamped()
@@ -139,9 +187,7 @@ def sensor_transforms(
     imu.header.frame_id = frames.base
     imu.child_frame_id = frames.imu
     _set_xyz(imu.transform.translation, snapshot.imu_position_in_base)
-    _set_ros_quaternion(
-        imu.transform.rotation, snapshot.imu_quaternion_in_base_wxyz
-    )
+    _set_ros_quaternion(imu.transform.rotation, snapshot.imu_quaternion_in_base_wxyz)
 
     camera_transform = TransformStamped()
     camera_transform.header.stamp = stamp
@@ -152,7 +198,18 @@ def sensor_transforms(
         camera_transform.transform.rotation,
         snapshot.camera_quaternion_in_base_wxyz,
     )
-    return [imu, camera_transform]
+    transforms = [imu, camera_transform]
+    if include_lidar:
+        lidar = TransformStamped()
+        lidar.header.stamp = stamp
+        lidar.header.frame_id = frames.base
+        lidar.child_frame_id = frames.lidar
+        _set_xyz(lidar.transform.translation, snapshot.lidar_position_in_base)
+        _set_ros_quaternion(
+            lidar.transform.rotation, snapshot.lidar_quaternion_in_base_wxyz
+        )
+        transforms.append(lidar)
+    return transforms
 
 
 def static_map_transform(sim_time: float, frames: FrameConfig) -> TransformStamped:
@@ -178,6 +235,15 @@ def _set_xyz(message, values: tuple[float, float, float]) -> None:
     message.z = float(values[2])
 
 
+def _point_field(name: str, offset: int, datatype: int) -> PointField:
+    field = PointField()
+    field.name = name
+    field.offset = offset
+    field.datatype = datatype
+    field.count = 1
+    return field
+
+
 def _set_ros_quaternion(message, wxyz: tuple[float, float, float, float]) -> None:
     message.w = float(wxyz[0])
     message.x = float(wxyz[1])
@@ -186,7 +252,7 @@ def _set_ros_quaternion(message, wxyz: tuple[float, float, float, float]) -> Non
 
 
 def _quaternion_from_xyaxes(
-    xyaxes: tuple[float, float, float, float, float, float]
+    xyaxes: tuple[float, float, float, float, float, float],
 ) -> tuple[float, float, float, float]:
     x_axis = np.asarray(xyaxes[:3], dtype=np.float64)
     y_axis = np.asarray(xyaxes[3:], dtype=np.float64)

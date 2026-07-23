@@ -10,6 +10,7 @@ from holoagent_mujoco.config import ConfigError, load_config, load_mapping
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 CHECKED_CONFIG = PACKAGE_ROOT / "config" / "stage1.yaml"
+CHECKED_STAGE2_CONFIG = PACKAGE_ROOT / "config" / "stage2.yaml"
 GR00T_ROOT = Path("/home/jihun/work/GR00T-WholeBodyControl")
 G1_ROOT = GR00T_ROOT / "decoupled_wbc" / "sim2mujoco"
 G1_CONFIG = G1_ROOT / "resources" / "robots" / "g1"
@@ -87,6 +88,7 @@ def valid_mapping() -> dict:
             "mount_xyaxes": [0.0, -1.0, 0.0, 0.0, 0.0, 1.0],
         },
         "lidar": {
+            "enabled": True,
             "name": "lidar_in_torso",
             "acquisition_mode": "snapshot",
             "scan_lines": 6,
@@ -155,6 +157,7 @@ def test_checked_in_config_is_stage1_safe():
     assert cfg.rates.lidar_hz == 10
     assert cfg.frames.lidar == "livox_frame"
     assert cfg.lidar.acquisition_mode == "snapshot"
+    assert cfg.lidar.enabled is False
     assert cfg.lidar.scan_lines == 6
     assert cfg.lidar.azimuth_samples == 512
     assert cfg.lidar.configured_points == 3072
@@ -165,6 +168,14 @@ def test_checked_in_config_is_stage1_safe():
     assert cfg.backend.runner.name == "run_mujoco_gear_wbc.py"
     assert cfg.backend.balance_policy.is_file()
     assert cfg.backend.walk_policy.is_file()
+
+
+def test_checked_in_stage2_config_explicitly_enables_lidar():
+    cfg = load_config(CHECKED_STAGE2_CONFIG)
+
+    assert cfg.lidar.enabled is True
+    assert cfg.lidar.configured_points == 3072
+    assert cfg.lidar.min_finite_points == 2500
 
 
 def test_camera_rate_need_not_divide_physics_rate():

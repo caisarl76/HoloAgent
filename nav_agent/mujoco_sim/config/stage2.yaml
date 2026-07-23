@@ -2,7 +2,7 @@ runtime:
   python: /home/jihun/work/GR00T-WholeBodyControl/.venv_sim/bin/python
   extra_python_paths:
     - /home/jihun/work/GR00T-WholeBodyControl/.venv_data_collection/lib/python3.10/site-packages
-  directory: /tmp/holoagent_mujoco_stage1
+  directory: /tmp/holoagent_mujoco_stage2
   ros_domain_id: 77
   ros_localhost_only: true
   rmw_implementation: rmw_cyclonedds_cpp
@@ -56,7 +56,7 @@ camera:
   mount_xyaxes: [0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
 
 lidar:
-  enabled: false
+  enabled: true
   name: lidar_in_torso
   acquisition_mode: snapshot
   scan_lines: 6

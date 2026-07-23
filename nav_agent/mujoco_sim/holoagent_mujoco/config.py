@@ -88,6 +88,7 @@ class CameraConfig:
 
 @dataclass(frozen=True)
 class LidarConfig:
+    enabled: bool
     name: str
     acquisition_mode: str
     scan_lines: int
@@ -290,6 +291,7 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
         raise ConfigError("camera principal point must lie inside the image")
 
     lidar = LidarConfig(
+        enabled=_boolean(lidar_raw, "enabled", "lidar.enabled"),
         name=_nonempty_string(lidar_raw, "name", "lidar.name"),
         acquisition_mode=_nonempty_string(
             lidar_raw, "acquisition_mode", "lidar.acquisition_mode"

@@ -22,6 +22,7 @@ CAMERA = CameraConfig(
     mount_xyaxes=(0.0, -1.0, 0.0, 0.0, 0.0, 1.0),
 )
 LIDAR = LidarConfig(
+    enabled=True,
     name="lidar_in_torso",
     acquisition_mode="snapshot",
     scan_lines=6,

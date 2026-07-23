@@ -12,7 +12,7 @@ from holoagent_mujoco.config import load_config
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = PACKAGE_ROOT / "config" / "stage1.yaml"
+CONFIG_PATH = PACKAGE_ROOT / "config" / "stage2.yaml"
 
 
 def test_generated_fastlivo_config_is_sim_only_and_matches_mounts(tmp_path):

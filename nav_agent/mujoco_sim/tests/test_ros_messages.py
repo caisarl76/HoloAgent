@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import struct
+
 import numpy as np
 import pytest
+from sensor_msgs.msg import PointField
 
 from holoagent_mujoco.backend import BackendSnapshot
 from holoagent_mujoco.command import VelocityCommand
 from holoagent_mujoco.config import CameraConfig, FrameConfig
+from holoagent_mujoco.lidar import LidarScan
 from holoagent_mujoco.ros_messages import (
     camera_info_message,
     clock_message,
     image_message,
     imu_message,
     odometry_message,
+    pointcloud_message,
     sensor_transforms,
     static_map_transform,
     time_message,
@@ -49,6 +54,10 @@ SNAPSHOT = BackendSnapshot(
     camera_quaternion_in_base_wxyz=(0.5, 0.5, -0.5, -0.5),
     applied_command=VelocityCommand(0.1, 0.0, -0.2),
     contact_count=4,
+    lidar_position_in_base=(0.04, 0.0, 0.30),
+    lidar_quaternion_in_base_wxyz=(1.0, 0.0, 0.0, 0.0),
+    lidar_position_world=(1.04, 2.0, 1.1),
+    lidar_quaternion_world_wxyz=(1.0, 0.0, 0.0, 0.0),
 )
 
 
@@ -115,20 +124,69 @@ def test_rgb_image_encoding_stride_and_camera_matrix():
     assert info.header == image.header
     assert list(info.k) == [240.0, 0.0, 1.0, 0.0, 241.0, 0.5, 0.0, 0.0, 1.0]
     assert list(info.p) == [
-        240.0, 0.0, 1.0, 0.0,
-        0.0, 241.0, 0.5, 0.0,
-        0.0, 0.0, 1.0, 0.0,
+        240.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        241.0,
+        0.5,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
     ]
+
+
+def test_lidar_scan_serializes_to_deterministic_little_endian_pointcloud():
+    scan = LidarScan(
+        timebase=1.25,
+        points=np.array([[1.0, 2.0, 3.0], [-1.0, 0.5, 4.0]], dtype=np.float32),
+        reflectivity=np.array([100, 101], dtype=np.uint8),
+        tags=np.array([0, 2], dtype=np.uint8),
+        lines=np.array([1, 5], dtype=np.uint8),
+        offset_time=np.array([0, 99_000_000], dtype=np.uint32),
+        configured_points=3072,
+    )
+
+    message = pointcloud_message(scan, FRAMES)
+
+    assert message.header.stamp.sec == 1
+    assert message.header.stamp.nanosec == 250_000_000
+    assert message.header.frame_id == "livox_frame"
+    assert message.height == 1
+    assert message.width == 2
+    assert message.point_step == 20
+    assert message.row_step == 40
+    assert message.is_bigendian is False
+    assert message.is_dense is True
+    assert [(field.name, field.offset, field.datatype) for field in message.fields] == [
+        ("x", 0, PointField.FLOAT32),
+        ("y", 4, PointField.FLOAT32),
+        ("z", 8, PointField.FLOAT32),
+        ("intensity", 12, PointField.UINT8),
+        ("tag", 13, PointField.UINT8),
+        ("line", 14, PointField.UINT8),
+        ("offset_time", 16, PointField.UINT32),
+    ]
+    assert struct.unpack_from("<fffBBBxI", bytes(message.data), 0) == pytest.approx(
+        (1.0, 2.0, 3.0, 100, 0, 1, 0)
+    )
+    assert struct.unpack_from("<fffBBBxI", bytes(message.data), 20) == pytest.approx(
+        (-1.0, 0.5, 4.0, 101, 2, 5, 99_000_000)
+    )
 
 
 def test_dynamic_sensor_frames_and_static_map_contract():
     transforms = sensor_transforms(SNAPSHOT, FRAMES)
     by_child = {transform.child_frame_id: transform for transform in transforms}
 
-    assert set(by_child) == {"imu_link", "camera_link"}
+    assert set(by_child) == {"imu_link", "camera_link", "livox_frame"}
     assert by_child["imu_link"].header.frame_id == "base_link"
     assert by_child["imu_link"].transform.translation.x == 0.01
     assert by_child["camera_link"].transform.translation.x == 0.18
+    assert by_child["livox_frame"].transform.translation.x == 0.04
     rotation = by_child["camera_link"].transform.rotation
     assert (rotation.x, rotation.y, rotation.z, rotation.w) == pytest.approx(
         (0.5, -0.5, -0.5, 0.5)
