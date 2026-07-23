@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-from holoagent_mujoco.config import CameraConfig, SceneConfig
+from holoagent_mujoco.config import CameraConfig, LidarConfig, SceneConfig
 from holoagent_mujoco.scene import GeneratedSceneError, generate_scene
 
 
@@ -20,6 +20,24 @@ CAMERA = CameraConfig(
     cy=120.0,
     mount_pos=(0.18, 0.0, 0.35),
     mount_xyaxes=(0.0, -1.0, 0.0, 0.0, 0.0, 1.0),
+)
+LIDAR = LidarConfig(
+    name="lidar_in_torso",
+    acquisition_mode="snapshot",
+    scan_lines=6,
+    azimuth_samples=512,
+    vertical_fov_deg=(-15.0, 15.0),
+    min_range_m=0.1,
+    max_range_m=20.0,
+    scan_period_sec=0.1,
+    noise_std_m=0.0,
+    dropout_probability=0.0,
+    reflectivity=100,
+    tag=0,
+    random_seed=7,
+    mount_pos=(-0.03959, -0.00224, 0.14792),
+    mount_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
+    min_finite_points=2500,
 )
 
 
@@ -109,6 +127,32 @@ def test_static_indoor_geometry_has_stable_names_and_bounds(tmp_path):
     assert all(geom.attrib["type"] == "box" for geom in geoms.values())
     # Direct children of worldbody are fixed to the world in MJCF.
     assert all(geom in list(root.find("worldbody")) for geom in geoms.values())
+
+
+def test_generated_scene_adds_exact_lidar_site_and_dedicated_ray_group(tmp_path):
+    generated = generate_scene(
+        _write_base_xml(tmp_path / "source"),
+        tmp_path / "runtime",
+        SCENE,
+        CAMERA,
+        LIDAR,
+    )
+
+    root = ET.parse(generated.path).getroot()
+    site = root.find(".//body[@name='torso_link']/site[@name='lidar_in_torso']")
+    assert site is not None
+    assert site.attrib["pos"] == "-0.03959 -0.00224 0.14792"
+    assert site.attrib["quat"] == "1 0 0 0"
+    generated_geoms = root.findall(".//geom[@group='3']")
+    assert len(generated_geoms) == 6
+    assert {geom.attrib["name"] for geom in generated_geoms} == {
+        "sim_wall_north",
+        "sim_wall_south",
+        "sim_wall_east",
+        "sim_wall_west",
+        "sim_corner_northwest",
+        "sim_corner_southeast",
+    }
 
 
 def test_generated_scene_contains_no_external_include_plugin_or_unitree_sdk(tmp_path):

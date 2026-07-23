@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-from holoagent_mujoco.config import CameraConfig, SceneConfig, file_sha256
+from holoagent_mujoco.config import CameraConfig, LidarConfig, SceneConfig, file_sha256
 
 
 GENERATED_MARKER = "holoagent_mujoco_generated_v1"
@@ -27,6 +27,7 @@ def generate_scene(
     runtime_dir: Path,
     scene: SceneConfig,
     camera: CameraConfig,
+    lidar: LidarConfig | None = None,
 ) -> GeneratedScene:
     """Generate the bounded Stage 1 scene without modifying the pinned model."""
     source = Path(base_xml).expanduser().resolve()
@@ -36,7 +37,9 @@ def generate_scene(
     if not source.is_file():
         raise GeneratedSceneError(f"base XML does not exist: {source}")
     if destination.exists() and not _is_generated(destination):
-        raise GeneratedSceneError(f"refusing to overwrite non-generated file: {destination}")
+        raise GeneratedSceneError(
+            f"refusing to overwrite non-generated file: {destination}"
+        )
 
     try:
         tree = ET.parse(source)
@@ -71,6 +74,19 @@ def generate_scene(
             "fovy": _number(fovy_degrees),
         },
     )
+    if lidar is not None:
+        if root.find(f".//site[@name='{lidar.name}']") is not None:
+            raise GeneratedSceneError(f"base XML already has site named {lidar.name}")
+        ET.SubElement(
+            torso,
+            "site",
+            {
+                "name": lidar.name,
+                "size": "0.01",
+                "pos": _numbers(lidar.mount_pos),
+                "quat": _numbers(lidar.mount_quat_wxyz),
+            },
+        )
 
     worldbody = root.find("worldbody")
     if worldbody is None:
@@ -110,6 +126,7 @@ def _add_indoor_geometry(worldbody: ET.Element, scene: SceneConfig) -> None:
     wall_center = half + half_thickness
     attributes = {
         "type": "box",
+        "group": "3",
         "rgba": "0.62 0.67 0.72 1",
         "friction": "0.8 0.1 0.1",
     }

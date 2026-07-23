@@ -44,7 +44,9 @@ class _TransportImportBlocker(importlib.abc.MetaPathFinder):
 def _block_transport_imports():
     existing = _forbidden_transport_modules(set(sys.modules))
     if existing:
-        raise BackendError(f"forbidden transport modules are already loaded: {existing}")
+        raise BackendError(
+            f"forbidden transport modules are already loaded: {existing}"
+        )
     blocker = _TransportImportBlocker()
     sys.meta_path.insert(0, blocker)
     try:
@@ -57,9 +59,7 @@ def _block_transport_imports():
             sys.modules.pop(name, None)
         violations = sorted(set(inserted) | blocker.blocked)
         if violations:
-            raise BackendError(
-                f"forbidden transport import blocked: {violations}"
-            )
+            raise BackendError(f"forbidden transport import blocked: {violations}")
 
 
 @dataclass(frozen=True)
@@ -78,6 +78,20 @@ class BackendSnapshot:
     camera_quaternion_in_base_wxyz: tuple[float, float, float, float]
     applied_command: VelocityCommand
     contact_count: int
+    lidar_position_in_base: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    lidar_quaternion_in_base_wxyz: tuple[float, float, float, float] = (
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+    )
+    lidar_position_world: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    lidar_quaternion_world_wxyz: tuple[float, float, float, float] = (
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+    )
 
 
 def load_runner_module(path: Path) -> ModuleType:
@@ -96,9 +110,7 @@ def load_runner_module(path: Path) -> ModuleType:
     keyboard_module.Listener = _DisabledListener
     input_module = ModuleType("pynput")
     input_module.keyboard = keyboard_module
-    saved_modules = {
-        key: sys.modules.get(key) for key in ("pynput", "pynput.keyboard")
-    }
+    saved_modules = {key: sys.modules.get(key) for key in ("pynput", "pynput.keyboard")}
     sys.modules["pynput"] = input_module
     sys.modules["pynput.keyboard"] = keyboard_module
     sys.modules[name] = module
@@ -129,9 +141,7 @@ def load_runner_module(path: Path) -> ModuleType:
             if forbidden_name not in modules_before:
                 sys.modules.pop(forbidden_name, None)
         sys.modules.pop(name, None)
-        raise BackendError(
-            f"runner imported forbidden transport modules: {forbidden}"
-        )
+        raise BackendError(f"runner imported forbidden transport modules: {forbidden}")
 
     if not hasattr(module, "GearWbcController"):
         raise BackendError("runner has no GearWbcController")
@@ -229,13 +239,18 @@ def create_backend(config: Stage1Config, scene_xml: Path) -> MujocoBackend:
         raise BackendError(
             f"controller timestep {actual_timestep} does not match {expected_timestep}"
         )
-    return MujocoBackend(controller, mujoco_module)
+    return MujocoBackend(controller, mujoco_module, lidar_name=config.lidar.name)
 
 
 class MujocoBackend:
     """Deterministic single-step adapter around the direct GR00T controller."""
 
-    def __init__(self, controller: Any, mujoco_module: Any) -> None:
+    def __init__(
+        self,
+        controller: Any,
+        mujoco_module: Any,
+        lidar_name: str = "lidar_in_torso",
+    ) -> None:
         self.controller = controller
         self.model = controller.model
         self.data = controller.data
@@ -244,14 +259,15 @@ class MujocoBackend:
         self._closed = False
         self._renderer = None
         self._last_time = float(self.data.time)
-        self._base_body_id = self._object_id(
-            self._mujoco.mjtObj.mjOBJ_BODY, "pelvis"
-        )
+        self._base_body_id = self._object_id(self._mujoco.mjtObj.mjOBJ_BODY, "pelvis")
         self._imu_site_id = self._object_id(
             self._mujoco.mjtObj.mjOBJ_SITE, "imu_in_torso"
         )
         self._camera_id = self._object_id(
             self._mujoco.mjtObj.mjOBJ_CAMERA, "head_camera"
+        )
+        self._lidar_site_id = self._object_id(
+            self._mujoco.mjtObj.mjOBJ_SITE, lidar_name
         )
         self._validate_dimensions()
 
@@ -288,16 +304,18 @@ class MujocoBackend:
     def snapshot(self) -> BackendSnapshot:
         try:
             base_position = np.asarray(self.data.xpos[self._base_body_id])
-            base_rotation = np.asarray(
-                self.data.xmat[self._base_body_id]
-            ).reshape(3, 3)
+            base_rotation = np.asarray(self.data.xmat[self._base_body_id]).reshape(3, 3)
             imu_position = np.asarray(self.data.site_xpos[self._imu_site_id])
-            imu_rotation = np.asarray(
-                self.data.site_xmat[self._imu_site_id]
-            ).reshape(3, 3)
+            imu_rotation = np.asarray(self.data.site_xmat[self._imu_site_id]).reshape(
+                3, 3
+            )
             camera_position = np.asarray(self.data.cam_xpos[self._camera_id])
-            camera_rotation = np.asarray(
-                self.data.cam_xmat[self._camera_id]
+            camera_rotation = np.asarray(self.data.cam_xmat[self._camera_id]).reshape(
+                3, 3
+            )
+            lidar_position = np.asarray(self.data.site_xpos[self._lidar_site_id])
+            lidar_rotation = np.asarray(
+                self.data.site_xmat[self._lidar_site_id]
             ).reshape(3, 3)
             camera_optical_rotation = camera_rotation @ np.diag([1.0, -1.0, -1.0])
             imu_relative_position, imu_relative_rotation = _relative_pose(
@@ -311,6 +329,12 @@ class MujocoBackend:
                 base_rotation,
                 camera_position,
                 camera_optical_rotation,
+            )
+            lidar_relative_position, lidar_relative_rotation = _relative_pose(
+                base_position,
+                base_rotation,
+                lidar_position,
+                lidar_rotation,
             )
             snapshot = BackendSnapshot(
                 sim_time=float(self.data.time),
@@ -336,9 +360,7 @@ class MujocoBackend:
                 imu_position_in_base=_finite_tuple(
                     imu_relative_position, 3, "IMU position in base"
                 ),
-                imu_quaternion_in_base_wxyz=_matrix_to_wxyz(
-                    imu_relative_rotation
-                ),
+                imu_quaternion_in_base_wxyz=_matrix_to_wxyz(imu_relative_rotation),
                 camera_position_in_base=_finite_tuple(
                     camera_relative_position, 3, "camera position in base"
                 ),
@@ -347,12 +369,55 @@ class MujocoBackend:
                 ),
                 applied_command=self._read_command(),
                 contact_count=int(self.data.ncon),
+                lidar_position_in_base=_finite_tuple(
+                    lidar_relative_position, 3, "lidar position in base"
+                ),
+                lidar_quaternion_in_base_wxyz=_matrix_to_wxyz(lidar_relative_rotation),
+                lidar_position_world=_finite_tuple(
+                    lidar_position, 3, "lidar position in world"
+                ),
+                lidar_quaternion_world_wxyz=_matrix_to_wxyz(lidar_rotation),
             )
         except (IndexError, TypeError, ValueError) as exc:
             raise BackendError("invalid backend snapshot") from exc
         if not math.isfinite(snapshot.sim_time):
             raise BackendError("snapshot time must be finite")
         return snapshot
+
+    def raycast_static(
+        self, origins_world: np.ndarray, directions_world: np.ndarray
+    ) -> np.ndarray:
+        origins = np.asarray(origins_world, dtype=np.float64)
+        directions = np.asarray(directions_world, dtype=np.float64)
+        if origins.ndim != 2 or origins.shape[1:] != (3,):
+            raise BackendError("ray origins must have shape (N, 3)")
+        if directions.shape != origins.shape:
+            raise BackendError("ray directions must match ray origins")
+        if not np.isfinite(origins).all() or not np.isfinite(directions).all():
+            raise BackendError("ray origins and directions must be finite")
+        norms = np.linalg.norm(directions, axis=1)
+        if np.any(norms <= 0.0):
+            raise BackendError("ray directions must be nonzero")
+        directions = directions / norms[:, None]
+        groups = np.array([0, 0, 0, 1, 0, 0], dtype=np.uint8)
+        distances = np.empty(len(origins), dtype=np.float64)
+        geom_id = np.empty(1, dtype=np.int32)
+        try:
+            for index, (origin, direction) in enumerate(zip(origins, directions)):
+                distances[index] = self._mujoco.mj_ray(
+                    self.model,
+                    self.data,
+                    origin,
+                    direction,
+                    groups,
+                    1,
+                    -1,
+                    geom_id,
+                )
+        except Exception as exc:
+            self._zero_outputs()
+            raise BackendError("static lidar ray cast failed") from exc
+        return distances
 
     def render_rgb(self, *, camera: str, width: int, height: int) -> np.ndarray:
         if self._closed:
@@ -559,9 +624,9 @@ def _matrix_to_wxyz(matrix: np.ndarray) -> tuple[float, float, float, float]:
         diagonal = np.diag(rotation)
         index = int(np.argmax(diagonal))
         if index == 0:
-            scale = math.sqrt(
-                1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]
-            ) * 2.0
+            scale = (
+                math.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
+            )
             quaternion = np.array(
                 [
                     (rotation[2, 1] - rotation[1, 2]) / scale,
@@ -571,9 +636,9 @@ def _matrix_to_wxyz(matrix: np.ndarray) -> tuple[float, float, float, float]:
                 ]
             )
         elif index == 1:
-            scale = math.sqrt(
-                1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]
-            ) * 2.0
+            scale = (
+                math.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
+            )
             quaternion = np.array(
                 [
                     (rotation[0, 2] - rotation[2, 0]) / scale,
@@ -583,9 +648,9 @@ def _matrix_to_wxyz(matrix: np.ndarray) -> tuple[float, float, float, float]:
                 ]
             )
         else:
-            scale = math.sqrt(
-                1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]
-            ) * 2.0
+            scale = (
+                math.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
+            )
             quaternion = np.array(
                 [
                     (rotation[1, 0] - rotation[0, 1]) / scale,

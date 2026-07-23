@@ -50,12 +50,8 @@ class FakeData:
         self.sensordata = np.array([0.1, 0.2, 0.3, 0.0, 0.0, 9.81])
         self.ncon = 2
         identity = np.eye(3).reshape(9)
-        yaw_90 = np.array(
-            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
-        )
-        camera_axes = np.array(
-            [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
-        )
+        yaw_90 = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        camera_axes = np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
         self.xpos = np.array([[0.0, 0.0, 0.8]])
         self.xmat = np.array([identity])
         self.site_xpos = np.array([[0.1, 0.2, 1.1]])
@@ -75,6 +71,7 @@ class FakeMujoco:
         return {
             (1, "pelvis"): 0,
             (2, "imu_in_torso"): 0,
+            (2, "lidar_in_torso"): 0,
             (3, "head_camera"): 0,
         }.get((object_type, name), -1)
 
@@ -111,9 +108,7 @@ class FakeController:
         self.action = np.zeros(2, dtype=np.float32)
         self.target_dof_pos = self.config["default_angles"].copy()
         self.single_obs_dim = 4
-        self.obs_history = collections.deque(
-            [np.zeros(4), np.zeros(4)], maxlen=2
-        )
+        self.obs_history = collections.deque([np.zeros(4), np.zeros(4)], maxlen=2)
         self.obs = np.zeros(8, dtype=np.float32)
         self.balance_calls = 0
         self.walk_calls = 0
@@ -242,9 +237,10 @@ def test_controller_adapter_overrides_paths_keyboard_and_cpu_provider(tmp_path):
     assert controller.config["xml_path"] == str(generated_xml)
     assert controller.config["policy_path"] == str(cfg.backend.balance_policy)
     assert controller.config["walk_policy_path"] == str(cfg.backend.walk_policy)
-    assert all(isinstance(controller.config[key], np.ndarray) for key in (
-        "kps", "kds", "default_angles", "cmd_scale", "cmd_init"
-    ))
+    assert all(
+        isinstance(controller.config[key], np.ndarray)
+        for key in ("kps", "kds", "default_angles", "cmd_scale", "cmd_init")
+    )
     assert FakeSession.calls == [
         (str(cfg.backend.balance_policy), ("CPUExecutionProvider",)),
         (str(cfg.backend.walk_policy), ("CPUExecutionProvider",)),
@@ -288,17 +284,66 @@ def test_step_clips_pd_torque_advances_time_and_returns_finite_snapshot():
         (2**-0.5, 0.0, 0.0, 2**-0.5)
     )
     assert first.camera_position_in_base == pytest.approx((0.4, -0.1, 0.5))
-    assert first.camera_quaternion_in_base_wxyz == pytest.approx(
-        (-0.5, 0.5, -0.5, 0.5)
-    )
+    assert first.camera_quaternion_in_base_wxyz == pytest.approx((-0.5, 0.5, -0.5, 0.5))
+    assert first.lidar_position_world == pytest.approx((0.1, 0.2, 1.1))
+    assert first.lidar_position_in_base == pytest.approx((0.1, 0.2, 0.3))
     assert first.contact_count == 2
+
+
+def test_static_raycast_uses_only_generated_geometry_group():
+    class RayMujoco(FakeMujoco):
+        calls = []
+
+        @staticmethod
+        def mj_ray(
+            model,
+            data,
+            origin,
+            direction,
+            groups,
+            include_static,
+            bodyexclude,
+            geomid,
+        ):
+            RayMujoco.calls.append(
+                (
+                    origin.copy(),
+                    direction.copy(),
+                    groups.copy(),
+                    include_static,
+                    bodyexclude,
+                )
+            )
+            geomid[0] = 12
+            return 3.5
+
+    backend = MujocoBackend(FakeController(), RayMujoco)
+    origins = np.array([[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]])
+    directions = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+    distances = backend.raycast_static(origins, directions)
+
+    assert distances.tolist() == [3.5, 3.5]
+    assert len(RayMujoco.calls) == 2
+    assert RayMujoco.calls[0][2].tolist() == [0, 0, 0, 1, 0, 0]
+    assert RayMujoco.calls[0][3:] == (1, -1)
+
+
+def test_static_raycast_rejects_nonfinite_or_mismatched_inputs():
+    backend = MujocoBackend(FakeController(), FakeMujoco)
+
+    with pytest.raises(BackendError, match="ray origins"):
+        backend.raycast_static(np.zeros((2, 2)), np.zeros((2, 3)))
+    with pytest.raises(BackendError, match="finite"):
+        backend.raycast_static(
+            np.array([[float("nan"), 0.0, 0.0]]),
+            np.array([[1.0, 0.0, 0.0]]),
+        )
 
 
 def test_snapshot_rotates_global_linear_velocity_into_base_frame():
     controller = FakeController()
-    yaw_90 = np.array(
-        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
-    )
+    yaw_90 = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
     controller.data.xmat[0] = yaw_90.reshape(9)
     controller.data.qvel[:6] = [1.0, 0.0, 0.0, 0.1, 0.2, 0.3]
     backend = MujocoBackend(controller, FakeMujoco)

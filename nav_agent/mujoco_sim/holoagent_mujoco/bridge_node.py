@@ -76,9 +76,7 @@ class HoloAgentMujocoBridge(Node):
     def __init__(self, config: Stage1Config, backend: MujocoBackend) -> None:
         super().__init__(
             "holoagent_mujoco_bridge",
-            parameter_overrides=[
-                Parameter("use_sim_time", Parameter.Type.BOOL, True)
-            ],
+            parameter_overrides=[Parameter("use_sim_time", Parameter.Type.BOOL, True)],
             automatically_declare_parameters_from_overrides=True,
         )
         if not self.get_parameter("use_sim_time").value:
@@ -160,9 +158,7 @@ class HoloAgentMujocoBridge(Node):
         if "imu" in due:
             self._imu_publisher.publish(imu_message(snapshot, self.config.frames))
         if "odom" in due:
-            self._odom_publisher.publish(
-                odometry_message(snapshot, self.config.frames)
-            )
+            self._odom_publisher.publish(odometry_message(snapshot, self.config.frames))
             self._tf_broadcaster.sendTransform(
                 [
                     transform_message(snapshot, self.config.frames),
@@ -228,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
             config.runtime.directory,
             config.scene,
             config.camera,
+            config.lidar,
         )
         backend = create_backend(config, scene.path)
         rclpy.init(args=ros_arguments)
@@ -276,7 +273,11 @@ def _default_config_path() -> Path:
     try:
         from ament_index_python.packages import get_package_share_directory
 
-        return Path(get_package_share_directory("holoagent_mujoco")) / "config" / "stage1.yaml"
+        return (
+            Path(get_package_share_directory("holoagent_mujoco"))
+            / "config"
+            / "stage1.yaml"
+        )
     except (ImportError, LookupError):
         return Path(__file__).parents[1] / "config" / "stage1.yaml"
 
