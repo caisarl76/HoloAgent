@@ -118,6 +118,8 @@ def test_static_indoor_geometry_has_stable_names_and_bounds(tmp_path):
         "sim_wall_west",
         "sim_corner_northwest",
         "sim_corner_southeast",
+        "sim_lidar_floor",
+        "sim_lidar_ceiling",
     }
     geoms = {
         geom.attrib["name"]: geom
@@ -145,7 +147,7 @@ def test_generated_scene_adds_exact_lidar_site_and_dedicated_ray_group(tmp_path)
     assert site.attrib["pos"] == "-0.03959 -0.00224 0.14792"
     assert site.attrib["quat"] == "1 0 0 0"
     generated_geoms = root.findall(".//geom[@group='3']")
-    assert len(generated_geoms) == 6
+    assert len(generated_geoms) == 8
     assert {geom.attrib["name"] for geom in generated_geoms} == {
         "sim_wall_north",
         "sim_wall_south",
@@ -153,7 +155,16 @@ def test_generated_scene_adds_exact_lidar_site_and_dedicated_ray_group(tmp_path)
         "sim_wall_west",
         "sim_corner_northwest",
         "sim_corner_southeast",
+        "sim_lidar_floor",
+        "sim_lidar_ceiling",
     }
+    ray_surfaces = {
+        geom.attrib["name"]: geom
+        for geom in generated_geoms
+        if geom.attrib["name"].startswith("sim_lidar_")
+    }
+    assert all(geom.attrib["contype"] == "0" for geom in ray_surfaces.values())
+    assert all(geom.attrib["conaffinity"] == "0" for geom in ray_surfaces.values())
 
 
 def test_generated_scene_contains_no_external_include_plugin_or_unitree_sdk(tmp_path):

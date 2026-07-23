@@ -175,6 +175,33 @@ def _add_indoor_geometry(worldbody: ET.Element, scene: SceneConfig) -> None:
                 "size": _numbers(size),
             },
         )
+    ray_surfaces = (
+        (
+            "sim_lidar_floor",
+            (0.0, 0.0, -half_thickness),
+            (half, half, half_thickness),
+        ),
+        (
+            "sim_lidar_ceiling",
+            (0.0, 0.0, scene.wall_height + half_thickness),
+            (half, half, half_thickness),
+        ),
+    )
+    for name, position, size in ray_surfaces:
+        if worldbody.find(f"geom[@name='{name}']") is not None:
+            raise GeneratedSceneError(f"base XML already has generated geom: {name}")
+        ET.SubElement(
+            worldbody,
+            "geom",
+            {
+                **attributes,
+                "name": name,
+                "pos": _numbers(position),
+                "size": _numbers(size),
+                "contype": "0",
+                "conaffinity": "0",
+            },
+        )
 
 
 def _numbers(values: tuple[float, ...]) -> str:

@@ -176,7 +176,7 @@ docker exec \
     source /opt/ros/humble/setup.bash
     source /livox/livox_ws/install/setup.bash
     source ${build_root}/install/setup.bash
-    export PYTHONPATH=${container_root}/nav_agent/mujoco_sim:${container_root}/nav_agent/sem_nav_ctr/src/holoagent_livox_converter
+    export PYTHONPATH=${container_root}/nav_agent/mujoco_sim:${container_root}/nav_agent/sem_nav_ctr/src/holoagent_livox_converter:\${PYTHONPATH:-}
     printf '%s\\n' \"\$\$\" >${container_run_dir}/converter.container.pid
     exec ros2 run holoagent_livox_converter livox_converter --ros-args \\
       -p use_sim_time:=true \\
@@ -198,7 +198,7 @@ docker exec \
     source /opt/ros/humble/setup.bash
     source /livox/livox_ws/install/setup.bash
     source ${build_root}/install/setup.bash
-    export PYTHONPATH=${container_root}/nav_agent/mujoco_sim:${container_root}/nav_agent/sem_nav_ctr/src/holoagent_livox_converter
+    export PYTHONPATH=${container_root}/nav_agent/mujoco_sim:${container_root}/nav_agent/sem_nav_ctr/src/holoagent_livox_converter:\${PYTHONPATH:-}
     printf '%s\\n' \"\$\$\" >${container_run_dir}/evaluator.container.pid
     exec ros2 run holoagent_livox_converter stage2_eval \\
       --config ${container_root}/nav_agent/mujoco_sim/config/stage2.yaml \\
