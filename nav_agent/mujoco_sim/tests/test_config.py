@@ -46,6 +46,13 @@ def valid_mapping() -> dict:
                 G1_CONFIG / "policy" / "GR00T-WholeBodyControl-Walk.onnx"
             ),
             "onnx_providers": ["CPUExecutionProvider"],
+            "expected_sha256": {
+                "runner": "b78dfb546ee250116b3853f96a12f82174aca248808da33caf199ec8e42f82fd",
+                "config_yaml": "31226a224ca8450e89d9ce17d5cb31c052192a9cbfedc8d145f1cb95627ac7a2",
+                "xml": "3b0b5a1c8299fda85cf328cc2a8df53ccc765ce37f20030175295049947b1a19",
+                "balance_policy": "f645da599d4ca3d29ed273c8f4712620bb680d34977469ca3aeabe5bb9631c18",
+                "walk_policy": "7c82255b6905ffcc4468fa7f8ddcf7b70db168cf1042107ccab887cb6a8e5407",
+            },
         },
         "rates": {"physics_hz": 200, "imu_hz": 200, "odom_hz": 50, "camera_hz": 15},
         "frames": {
@@ -94,6 +101,8 @@ def valid_mapping() -> dict:
             "motion_duration_sec": 2.0,
             "motion_min_displacement_m": 0.08,
             "motion_max_displacement_m": 0.30,
+            "motion_max_lateral_m": 0.05,
+            "motion_max_yaw_error_deg": 10.0,
             "timeout_zero_sec": 0.60,
             "stopped_speed_mps": 0.03,
             "stopped_hold_sec": 1.0,
@@ -139,6 +148,22 @@ def test_missing_policy_fails_before_ros_start(tmp_path):
     raw["backend"]["walk_policy"] = str(tmp_path / "missing.onnx")
 
     with pytest.raises(ConfigError, match="backend.walk_policy.*does not exist"):
+        load_mapping(raw)
+
+
+def test_backend_digest_manifest_must_be_complete():
+    raw = valid_mapping()
+    del raw["backend"]["expected_sha256"]["runner"]
+
+    with pytest.raises(ConfigError, match="exactly.*runner"):
+        load_mapping(raw)
+
+
+def test_backend_digest_manifest_rejects_unknown_keys():
+    raw = valid_mapping()
+    raw["backend"]["expected_sha256"]["other"] = "0" * 64
+
+    with pytest.raises(ConfigError, match="exactly.*other"):
         load_mapping(raw)
 
 

@@ -29,7 +29,10 @@ def test_cleanup_targets_only_recorded_bridge_pid():
     text = SCRIPT.read_text(encoding="utf-8")
 
     assert "bridge_pid=$!" in text
-    assert 'kill -INT "${bridge_pid}"' in text
+    assert "evaluator_pid=$!" in text
+    assert 'stop_recorded_pid "${bridge_pid}"' in text
+    assert 'stop_recorded_pid "${evaluator_pid}"' in text
+    assert 'kill -INT "${pid}"' in text
     assert "pkill" not in text
     assert "killall" not in text
     assert "jobs -p" not in text
@@ -37,10 +40,21 @@ def test_cleanup_targets_only_recorded_bridge_pid():
 
 def test_launcher_gates_graph_before_evaluator_can_publish_motion():
     lines = SCRIPT.read_text(encoding="utf-8").splitlines()
+    ready_line = next(index for index, line in enumerate(lines) if "ready_file=" in line)
     graph_line = next(index for index, line in enumerate(lines) if "--graph-only" in line)
-    evaluator_line = next(index for index, line in enumerate(lines) if "stage1_eval" in line)
+    approval_line = next(
+        index for index, line in enumerate(lines) if '"${ready_digest}" >' in line
+    )
 
-    assert graph_line < evaluator_line
+    assert ready_line < graph_line < approval_line
+
+
+def test_launcher_records_bounded_postflight_cleanup_evidence():
+    text = SCRIPT.read_text(encoding="utf-8")
+
+    assert "for _attempt in {1..150}" in text
+    assert "--postflight" in text
+    assert '"${run_dir}/postflight.log"' in text
 
 
 def test_launcher_contains_no_physical_robot_or_pc2_target():

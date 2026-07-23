@@ -31,6 +31,11 @@ class BackendSnapshot:
     base_angular_velocity: tuple[float, float, float]
     imu_angular_velocity: tuple[float, float, float]
     imu_linear_acceleration: tuple[float, float, float]
+    imu_quaternion_wxyz: tuple[float, float, float, float]
+    imu_position_in_base: tuple[float, float, float]
+    imu_quaternion_in_base_wxyz: tuple[float, float, float, float]
+    camera_position_in_base: tuple[float, float, float]
+    camera_quaternion_in_base_wxyz: tuple[float, float, float, float]
     applied_command: VelocityCommand
     contact_count: int
 
@@ -46,6 +51,7 @@ def load_runner_module(path: Path) -> ModuleType:
         raise BackendError(f"cannot load runner module: {runner}")
 
     module = importlib.util.module_from_spec(spec)
+    modules_before = set(sys.modules)
     keyboard_module = ModuleType("pynput.keyboard")
     keyboard_module.Listener = _DisabledListener
     input_module = ModuleType("pynput")
@@ -67,6 +73,25 @@ def load_runner_module(path: Path) -> ModuleType:
                 sys.modules.pop(key, None)
             else:
                 sys.modules[key] = previous
+
+    forbidden_prefixes = ("unitree" + "_sdk2", "unitree" + "_sdk2py")
+    imported_modules = {
+        value.__name__
+        for value in vars(module).values()
+        if isinstance(value, ModuleType)
+    }
+    imported_modules.update(set(sys.modules) - modules_before)
+    forbidden = sorted(
+        name for name in imported_modules if name.startswith(forbidden_prefixes)
+    )
+    if forbidden:
+        for forbidden_name in forbidden:
+            if forbidden_name not in modules_before:
+                sys.modules.pop(forbidden_name, None)
+        sys.modules.pop(name, None)
+        raise BackendError(
+            f"runner imported forbidden transport modules: {forbidden}"
+        )
 
     if not hasattr(module, "GearWbcController"):
         raise BackendError("runner has no GearWbcController")
@@ -147,6 +172,15 @@ class MujocoBackend:
         self._closed = False
         self._renderer = None
         self._last_time = float(self.data.time)
+        self._base_body_id = self._object_id(
+            self._mujoco.mjtObj.mjOBJ_BODY, "pelvis"
+        )
+        self._imu_site_id = self._object_id(
+            self._mujoco.mjtObj.mjOBJ_SITE, "imu_in_torso"
+        )
+        self._camera_id = self._object_id(
+            self._mujoco.mjtObj.mjOBJ_CAMERA, "head_camera"
+        )
         self._validate_dimensions()
 
     def set_command(self, command: VelocityCommand) -> None:
@@ -181,6 +215,30 @@ class MujocoBackend:
 
     def snapshot(self) -> BackendSnapshot:
         try:
+            base_position = np.asarray(self.data.xpos[self._base_body_id])
+            base_rotation = np.asarray(
+                self.data.xmat[self._base_body_id]
+            ).reshape(3, 3)
+            imu_position = np.asarray(self.data.site_xpos[self._imu_site_id])
+            imu_rotation = np.asarray(
+                self.data.site_xmat[self._imu_site_id]
+            ).reshape(3, 3)
+            camera_position = np.asarray(self.data.cam_xpos[self._camera_id])
+            camera_rotation = np.asarray(
+                self.data.cam_xmat[self._camera_id]
+            ).reshape(3, 3)
+            imu_relative_position, imu_relative_rotation = _relative_pose(
+                base_position,
+                base_rotation,
+                imu_position,
+                imu_rotation,
+            )
+            camera_relative_position, camera_relative_rotation = _relative_pose(
+                base_position,
+                base_rotation,
+                camera_position,
+                camera_rotation,
+            )
             snapshot = BackendSnapshot(
                 sim_time=float(self.data.time),
                 base_position=_finite_tuple(self.data.qpos[0:3], 3, "base position"),
@@ -198,6 +256,19 @@ class MujocoBackend:
                 ),
                 imu_linear_acceleration=_finite_tuple(
                     self.data.sensordata[3:6], 3, "IMU linear acceleration"
+                ),
+                imu_quaternion_wxyz=_matrix_to_wxyz(imu_rotation),
+                imu_position_in_base=_finite_tuple(
+                    imu_relative_position, 3, "IMU position in base"
+                ),
+                imu_quaternion_in_base_wxyz=_matrix_to_wxyz(
+                    imu_relative_rotation
+                ),
+                camera_position_in_base=_finite_tuple(
+                    camera_relative_position, 3, "camera position in base"
+                ),
+                camera_quaternion_in_base_wxyz=_matrix_to_wxyz(
+                    camera_relative_rotation
                 ),
                 applied_command=self._read_command(),
                 contact_count=int(self.data.ncon),
@@ -247,6 +318,12 @@ class MujocoBackend:
             raise BackendError("control_decimation must be positive")
         if int(self.model.nu) < int(self.controller.n_joints):
             raise BackendError("model has fewer actuators than joints")
+
+    def _object_id(self, object_type: Any, name: str) -> int:
+        identifier = int(self._mujoco.mj_name2id(self.model, object_type, name))
+        if identifier < 0:
+            raise BackendError(f"MuJoCo model has no required object: {name}")
+        return identifier
 
     def _apply_pd_torques(self) -> None:
         actions = int(self.controller.config["num_actions"])
@@ -375,6 +452,77 @@ def _finite_tuple(values: Any, length: int, label: str) -> tuple[float, ...]:
     if array.shape != (length,) or not np.isfinite(array).all():
         raise BackendError(f"{label} must contain {length} finite values")
     return tuple(float(value) for value in array)
+
+
+def _relative_pose(
+    base_position: np.ndarray,
+    base_rotation: np.ndarray,
+    target_position: np.ndarray,
+    target_rotation: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    inverse_base = base_rotation.T
+    return (
+        inverse_base @ (target_position - base_position),
+        inverse_base @ target_rotation,
+    )
+
+
+def _matrix_to_wxyz(matrix: np.ndarray) -> tuple[float, float, float, float]:
+    rotation = np.asarray(matrix, dtype=np.float64).reshape(3, 3)
+    trace = float(np.trace(rotation))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        quaternion = np.array(
+            [
+                0.25 * scale,
+                (rotation[2, 1] - rotation[1, 2]) / scale,
+                (rotation[0, 2] - rotation[2, 0]) / scale,
+                (rotation[1, 0] - rotation[0, 1]) / scale,
+            ]
+        )
+    else:
+        diagonal = np.diag(rotation)
+        index = int(np.argmax(diagonal))
+        if index == 0:
+            scale = math.sqrt(
+                1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]
+            ) * 2.0
+            quaternion = np.array(
+                [
+                    (rotation[2, 1] - rotation[1, 2]) / scale,
+                    0.25 * scale,
+                    (rotation[0, 1] + rotation[1, 0]) / scale,
+                    (rotation[0, 2] + rotation[2, 0]) / scale,
+                ]
+            )
+        elif index == 1:
+            scale = math.sqrt(
+                1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]
+            ) * 2.0
+            quaternion = np.array(
+                [
+                    (rotation[0, 2] - rotation[2, 0]) / scale,
+                    (rotation[0, 1] + rotation[1, 0]) / scale,
+                    0.25 * scale,
+                    (rotation[1, 2] + rotation[2, 1]) / scale,
+                ]
+            )
+        else:
+            scale = math.sqrt(
+                1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]
+            ) * 2.0
+            quaternion = np.array(
+                [
+                    (rotation[1, 0] - rotation[0, 1]) / scale,
+                    (rotation[0, 2] + rotation[2, 0]) / scale,
+                    (rotation[1, 2] + rotation[2, 1]) / scale,
+                    0.25 * scale,
+                ]
+            )
+    norm = float(np.linalg.norm(quaternion))
+    if not math.isfinite(norm) or norm <= 0.0:
+        raise BackendError("rotation matrix produced an invalid quaternion")
+    return tuple(float(value) for value in quaternion / norm)
 
 
 class _DisabledListener:

@@ -75,9 +75,10 @@ thresholds:
   motion_duration_sec: 2.0
   motion_min_displacement_m: 0.08
   motion_max_displacement_m: 0.30
+  motion_max_lateral_m: 0.05
+  motion_max_yaw_error_deg: 10.0
   timeout_zero_sec: 0.60
   stopped_speed_mps: 0.03
   stopped_hold_sec: 1.0
   wall_time_multiplier: 4.0
   startup_allowance_sec: 30.0
-

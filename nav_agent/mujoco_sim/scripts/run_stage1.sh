@@ -11,6 +11,10 @@ evidence_root="${repo_root}/outputs/mujoco_holoagent"
 run_dir="${evidence_root}/${run_id}"
 preflight_log="${evidence_root}/${run_id}.preflight.log"
 bridge_pid=""
+evaluator_pid=""
+recorded_bridge_pid=""
+recorded_evaluator_pid=""
+cleanup_done=0
 
 export ROS_DOMAIN_ID=77
 export ROS_LOCALHOST_ONLY=1
@@ -19,19 +23,47 @@ export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export MUJOCO_GL=egl
 export PYTHONPATH="${repo_root}/nav_agent/mujoco_sim:/home/jihun/work/GR00T-WholeBodyControl/.venv_data_collection/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:/opt/ros/humble/lib/python3.10/site-packages"
 
-cleanup() {
-  if [[ -n "${bridge_pid}" ]] && kill -0 "${bridge_pid}" 2>/dev/null; then
-    kill -INT "${bridge_pid}" 2>/dev/null || true
+stop_recorded_pid() {
+  local pid="$1"
+  if [[ -z "${pid}" ]]; then
+    return
+  fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -INT "${pid}" 2>/dev/null || true
     for _attempt in 1 2 3 4 5; do
-      if ! kill -0 "${bridge_pid}" 2>/dev/null; then
-        break
-      fi
+      if ! kill -0 "${pid}" 2>/dev/null; then break; fi
       sleep 1
     done
-    if kill -0 "${bridge_pid}" 2>/dev/null; then
-      kill -TERM "${bridge_pid}" 2>/dev/null || true
-    fi
-    wait "${bridge_pid}" 2>/dev/null || true
+  fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM "${pid}" 2>/dev/null || true
+    for _attempt in 1 2 3 4 5; do
+      if ! kill -0 "${pid}" 2>/dev/null; then break; fi
+      sleep 1
+    done
+  fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -KILL "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+  fi
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    wait "${pid}" 2>/dev/null || true
+  fi
+}
+
+cleanup() {
+  if [[ ${cleanup_done} -eq 1 ]]; then return; fi
+  cleanup_done=1
+  stop_recorded_pid "${evaluator_pid}"
+  stop_recorded_pid "${bridge_pid}"
+  if [[ -d "${run_dir}" ]]; then
+    "${python_bin}" -m holoagent_mujoco.preflight \
+      --config "${config_path}" \
+      --run-dir "${run_dir}" \
+      --postflight \
+      --bridge-pid "${recorded_bridge_pid:-0}" \
+      --evaluator-pid "${recorded_evaluator_pid:-0}" \
+      >"${run_dir}/postflight.log" 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -55,23 +87,57 @@ cp -- "${config_path}" "${run_dir}/stage1.yaml"
 "${python_bin}" -m holoagent_mujoco.bridge_node \
   --config "${config_path}" >"${run_dir}/bridge.log" 2>&1 &
 bridge_pid=$!
+recorded_bridge_pid="${bridge_pid}"
 printf '%s\n' "${bridge_pid}" >"${run_dir}/bridge.pid"
+
+ready_file="${run_dir}/motion_graph_ready.json"
+approval_file="${run_dir}/motion_graph_approved.sha256"
+"${python_bin}" -m holoagent_mujoco.stage1_eval \
+  --config "${config_path}" \
+  --output "${run_dir}/result.json" \
+  --ready-file "${ready_file}" \
+  --approval-file "${approval_file}" >"${run_dir}/evaluator.log" 2>&1 &
+evaluator_pid=$!
+recorded_evaluator_pid="${evaluator_pid}"
+printf '%s\n' "${evaluator_pid}" >"${run_dir}/evaluator.pid"
+
+for _attempt in {1..120}; do
+  if [[ -f "${ready_file}" ]]; then break; fi
+  if ! kill -0 "${evaluator_pid}" 2>/dev/null; then break; fi
+  sleep 1
+done
+if [[ ! -f "${ready_file}" ]]; then
+  exit 1
+fi
 
 "${python_bin}" -m holoagent_mujoco.preflight \
   --config "${config_path}" \
   --run-dir "${run_dir}" \
   --container "${container_name}" \
-  --graph-only >"${run_dir}/graph_preflight.log" 2>&1
+  --graph-only \
+  --expected-node /holoagent_mujoco_bridge \
+  --expected-node /holoagent_stage1_eval \
+  >"${run_dir}/graph_preflight.log" 2>&1
 
-set +e
-"${python_bin}" -m holoagent_mujoco.stage1_eval \
-  --config "${config_path}" \
-  --output "${run_dir}/result.json" >"${run_dir}/evaluator.log" 2>&1
-evaluation_status=$?
-set -e
+ready_digest="$(sha256sum "${ready_file}" | awk '{print $1}')"
+printf '%s\n' "${ready_digest}" >"${approval_file}"
+
+evaluation_status=124
+for _attempt in {1..150}; do
+  if ! kill -0 "${evaluator_pid}" 2>/dev/null; then
+    set +e
+    wait "${evaluator_pid}"
+    evaluation_status=$?
+    set -e
+    evaluator_pid=""
+    break
+  fi
+  sleep 1
+done
 
 cleanup
 bridge_pid=""
+evaluator_pid=""
 trap - EXIT
 printf '%s\n' "${run_dir}"
 exit "${evaluation_status}"

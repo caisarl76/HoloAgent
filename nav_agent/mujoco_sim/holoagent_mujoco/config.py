@@ -100,6 +100,8 @@ class ThresholdConfig:
     motion_duration_sec: float
     motion_min_displacement_m: float
     motion_max_displacement_m: float
+    motion_max_lateral_m: float
+    motion_max_yaw_error_deg: float
     timeout_zero_sec: float
     stopped_speed_mps: float
     stopped_hold_sec: float
@@ -258,6 +260,8 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
         "motion_duration_sec",
         "motion_min_displacement_m",
         "motion_max_displacement_m",
+        "motion_max_lateral_m",
+        "motion_max_yaw_error_deg",
         "timeout_zero_sec",
         "stopped_speed_mps",
         "stopped_hold_sec",
@@ -307,9 +311,16 @@ def _verify_digest_pins(backend: BackendConfig) -> None:
         "balance_policy": backend.balance_policy,
         "walk_policy": backend.walk_policy,
     }
+    provided = {name for name, _ in backend.expected_sha256}
+    required = set(paths)
+    if provided != required:
+        missing = sorted(required - provided)
+        unexpected = sorted(provided - required)
+        raise ConfigError(
+            "backend.expected_sha256 must contain exactly "
+            f"{sorted(required)}; missing={missing}; unexpected={unexpected}"
+        )
     for name, expected in backend.expected_sha256:
-        if name not in paths:
-            raise ConfigError(f"backend.expected_sha256 has unknown key: {name}")
         actual = file_sha256(paths[name])
         if actual != expected:
             raise ConfigError(
@@ -435,4 +446,3 @@ def _sha256_text(value: Any, label: str) -> str:
     if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
         raise ConfigError(f"{label} must be a SHA-256 hex digest")
     return text
-

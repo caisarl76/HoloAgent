@@ -11,6 +11,7 @@ from holoagent_mujoco.preflight import (
     assert_no_forbidden_source,
     create_run_directory,
     graph_lists_match,
+    graph_snapshots_match,
     scan_forbidden_processes,
     validate_container_inspect,
     validate_isolation_environment,
@@ -155,3 +156,30 @@ def test_host_and_container_graphs_must_match_expected_bridge_only():
     with pytest.raises(PreflightError, match="differ"):
         graph_lists_match(host, "/unexpected\n")
 
+
+def test_complete_active_graph_snapshot_requires_two_expected_nodes():
+    snapshot = """=== NODES ===
+/holoagent_mujoco_bridge
+/holoagent_stage1_eval
+=== TOPICS ===
+/clock [rosgraph_msgs/msg/Clock]
+=== SERVICES ===
+/holoagent_mujoco_bridge/get_parameters [rcl_interfaces/srv/GetParameters]
+=== ACTIONS ===
+=== ENDPOINTS ===
+/holoagent_mujoco_bridge
+/holoagent_stage1_eval
+"""
+
+    assert graph_snapshots_match(
+        snapshot,
+        snapshot,
+        ("/holoagent_mujoco_bridge", "/holoagent_stage1_eval"),
+    ) == ["/holoagent_mujoco_bridge", "/holoagent_stage1_eval"]
+
+    with pytest.raises(PreflightError, match="snapshots differ"):
+        graph_snapshots_match(
+            snapshot,
+            snapshot.replace("/clock", "/wrong"),
+            ("/holoagent_mujoco_bridge", "/holoagent_stage1_eval"),
+        )

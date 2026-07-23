@@ -12,7 +12,8 @@ from holoagent_mujoco.ros_messages import (
     image_message,
     imu_message,
     odometry_message,
-    static_sensor_transforms,
+    sensor_transforms,
+    static_map_transform,
     time_message,
     transform_message,
     twist_message,
@@ -41,6 +42,11 @@ SNAPSHOT = BackendSnapshot(
     base_angular_velocity=(0.7, 0.8, 0.9),
     imu_angular_velocity=(1.0, 1.1, 1.2),
     imu_linear_acceleration=(2.0, 2.1, 2.2),
+    imu_quaternion_wxyz=(0.7, 0.1, 0.2, 0.3),
+    imu_position_in_base=(0.01, 0.02, 0.03),
+    imu_quaternion_in_base_wxyz=(0.8, 0.0, 0.6, 0.0),
+    camera_position_in_base=(0.18, 0.0, 0.35),
+    camera_quaternion_in_base_wxyz=(0.5, 0.5, -0.5, -0.5),
     applied_command=VelocityCommand(0.1, 0.0, -0.2),
     contact_count=4,
 )
@@ -89,10 +95,10 @@ def test_imu_uses_declared_frame_and_snapshot_values():
 
     assert message.header.frame_id == "imu_link"
     assert message.header.stamp.sec == 1
-    assert message.orientation.w == 0.5
+    assert message.orientation.w == 0.7
     assert message.angular_velocity.y == 1.1
     assert message.linear_acceleration.z == 2.2
-    assert message.orientation_covariance[0] == -1.0
+    assert message.orientation_covariance[0] >= 0.0
 
 
 def test_rgb_image_encoding_stride_and_camera_matrix():
@@ -115,17 +121,23 @@ def test_rgb_image_encoding_stride_and_camera_matrix():
     ]
 
 
-def test_static_sensor_frames_and_applied_twist():
-    transforms = static_sensor_transforms(0.0, FRAMES, CAMERA)
+def test_dynamic_sensor_frames_and_static_map_contract():
+    transforms = sensor_transforms(SNAPSHOT, FRAMES)
     by_child = {transform.child_frame_id: transform for transform in transforms}
 
     assert set(by_child) == {"imu_link", "camera_link"}
     assert by_child["imu_link"].header.frame_id == "base_link"
+    assert by_child["imu_link"].transform.translation.x == 0.01
     assert by_child["camera_link"].transform.translation.x == 0.18
     rotation = by_child["camera_link"].transform.rotation
     assert (rotation.x, rotation.y, rotation.z, rotation.w) == pytest.approx(
         (0.5, -0.5, -0.5, 0.5)
     )
+
+    fixed = static_map_transform(0.0, FRAMES)
+    assert fixed.header.frame_id == "sim_map"
+    assert fixed.child_frame_id == "odom"
+    assert fixed.transform.rotation.w == 1.0
 
     twist = twist_message(SNAPSHOT.applied_command)
     assert twist.linear.x == 0.1

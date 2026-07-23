@@ -67,12 +67,9 @@ def imu_message(snapshot: BackendSnapshot, frames: FrameConfig) -> Imu:
     message = Imu()
     message.header.stamp = time_message(snapshot.sim_time)
     message.header.frame_id = frames.imu
-    _set_ros_quaternion(message.orientation, snapshot.base_quaternion_wxyz)
+    _set_ros_quaternion(message.orientation, snapshot.imu_quaternion_wxyz)
     _set_xyz(message.angular_velocity, snapshot.imu_angular_velocity)
     _set_xyz(message.linear_acceleration, snapshot.imu_linear_acceleration)
-    message.orientation_covariance[0] = -1.0
-    message.angular_velocity_covariance[0] = -1.0
-    message.linear_acceleration_covariance[0] = -1.0
     return message
 
 
@@ -133,24 +130,38 @@ def camera_info_message(
     return message
 
 
-def static_sensor_transforms(
-    sim_time: float, frames: FrameConfig, camera: CameraConfig
+def sensor_transforms(
+    snapshot: BackendSnapshot, frames: FrameConfig
 ) -> list[TransformStamped]:
-    stamp = time_message(sim_time)
+    stamp = time_message(snapshot.sim_time)
     imu = TransformStamped()
     imu.header.stamp = stamp
     imu.header.frame_id = frames.base
     imu.child_frame_id = frames.imu
-    imu.transform.rotation.w = 1.0
+    _set_xyz(imu.transform.translation, snapshot.imu_position_in_base)
+    _set_ros_quaternion(
+        imu.transform.rotation, snapshot.imu_quaternion_in_base_wxyz
+    )
 
     camera_transform = TransformStamped()
     camera_transform.header.stamp = stamp
     camera_transform.header.frame_id = frames.base
     camera_transform.child_frame_id = frames.camera
-    _set_xyz(camera_transform.transform.translation, camera.mount_pos)
-    quaternion = _quaternion_from_xyaxes(camera.mount_xyaxes)
-    _set_ros_quaternion(camera_transform.transform.rotation, quaternion)
+    _set_xyz(camera_transform.transform.translation, snapshot.camera_position_in_base)
+    _set_ros_quaternion(
+        camera_transform.transform.rotation,
+        snapshot.camera_quaternion_in_base_wxyz,
+    )
     return [imu, camera_transform]
+
+
+def static_map_transform(sim_time: float, frames: FrameConfig) -> TransformStamped:
+    message = TransformStamped()
+    message.header.stamp = time_message(sim_time)
+    message.header.frame_id = frames.map
+    message.child_frame_id = frames.odom
+    message.transform.rotation.w = 1.0
+    return message
 
 
 def twist_message(command: VelocityCommand) -> Twist:
@@ -226,4 +237,3 @@ def _matrix_to_wxyz(matrix: np.ndarray) -> tuple[float, float, float, float]:
             )
     norm = math.sqrt(sum(value * value for value in quaternion))
     return tuple(value / norm for value in quaternion)
-

@@ -27,7 +27,8 @@ from holoagent_mujoco.ros_messages import (
     image_message,
     imu_message,
     odometry_message,
-    static_sensor_transforms,
+    sensor_transforms,
+    static_map_transform,
     transform_message,
     twist_message,
 )
@@ -137,7 +138,7 @@ class HoloAgentMujocoBridge(Node):
             Twist, "/cmd_vel", self._command_callback, reliable_qos
         )
         self._static_tf_broadcaster.sendTransform(
-            static_sensor_transforms(self._sim_time, config.frames, config.camera)
+            static_map_transform(self._sim_time, config.frames)
         )
 
     @property
@@ -163,7 +164,10 @@ class HoloAgentMujocoBridge(Node):
                 odometry_message(snapshot, self.config.frames)
             )
             self._tf_broadcaster.sendTransform(
-                transform_message(snapshot, self.config.frames)
+                [
+                    transform_message(snapshot, self.config.frames),
+                    *sensor_transforms(snapshot, self.config.frames),
+                ]
             )
         if "camera" in due:
             image = self.backend.render_rgb(

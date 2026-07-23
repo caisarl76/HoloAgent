@@ -7,11 +7,17 @@ import pytest
 from holoagent_mujoco.command import CommandLimits, VelocityCommand
 from holoagent_mujoco.stage1_eval import (
     AppliedCommandSample,
+    CameraInfoContractSample,
+    ImageContractSample,
+    ImuContractSample,
     OdomSample,
+    TransformContractSample,
     build_result,
+    build_failure_result,
     clamp_gate,
-    horizontal_displacement,
+    forward_motion,
     max_speed_in_window,
+    message_contract_errors,
     quaternion_samples_finite,
     realtime_factor,
     simulated_rate,
@@ -55,7 +61,21 @@ def test_stationary_drift_and_bounded_motion_displacement():
     ]
 
     assert stationary_drift(stationary) == pytest.approx(0.05)
-    assert horizontal_displacement(motion) == pytest.approx(0.2)
+    assert forward_motion(motion) == pytest.approx((0.2, 0.0))
+
+
+def test_forward_motion_rejects_backward_and_reports_lateral_displacement():
+    backward = [
+        OdomSample(0.0, 0.0, 0.0, 0.0, (1.0, 0.0, 0.0, 0.0)),
+        OdomSample(1.0, -0.2, 0.0, 0.1, (1.0, 0.0, 0.0, 0.0)),
+    ]
+    sideways = [
+        OdomSample(0.0, 0.0, 0.0, 0.0, (1.0, 0.0, 0.0, 0.0)),
+        OdomSample(1.0, 0.0, 0.2, 0.1, (1.0, 0.0, 0.0, 0.0)),
+    ]
+
+    assert forward_motion(backward)[0] < 0.0
+    assert forward_motion(sideways) == pytest.approx((0.0, 0.2))
 
 
 def test_command_clamps_require_bounds_and_observed_probe():
@@ -119,6 +139,17 @@ def test_first_failing_gate_uses_declared_order():
     assert result["label"] is None
 
 
+def test_runtime_failure_preserves_actual_gate_and_phase():
+    result = build_failure_result(
+        "bounded_motion", {"error": "bridge stopped"}, phase="motion"
+    )
+
+    assert result["first_failing_gate"] == "bounded_motion"
+    assert result["failure_phase"] == "motion"
+    assert result["gates"]["graph"] is True
+    assert result["gates"]["command_clamp"] is True
+
+
 def test_qualified_pass_result_is_json_serializable():
     gates = {
         "graph": True,
@@ -139,6 +170,10 @@ def test_qualified_pass_result_is_json_serializable():
 
     assert result["status"] == "PASS"
     assert result["label"] == "PASS_SIM_ODOM"
+    assert result["qualified_pass"] == "PASS_SIM_ODOM"
+    assert result["stage"] == 1
+    assert result["physical_motion"] is False
+    assert result["simulated_motion"] is True
     assert result["first_failing_gate"] is None
     assert json.loads(json.dumps(result))["metrics"]["rtf"] == 0.8
 
@@ -173,3 +208,107 @@ def test_failed_graph_gate_returns_before_any_phase_command():
     assert result["first_failing_gate"] == "graph"
     assert evaluator.phase_commands == []
     assert evaluator.zero_count == 1
+
+
+def test_motion_graph_guard_fails_closed_on_stale_graph():
+    class FakeEvaluator:
+        zero_count = 0
+
+        def _graph_contract_once(self):
+            return False, "unexpected endpoint"
+
+        def _bridge_uses_sim_time(self):
+            return True
+
+        def publish_zero(self):
+            self.zero_count += 1
+
+    evaluator = FakeEvaluator()
+
+    with pytest.raises(RuntimeError, match="motion graph guard"):
+        Stage1Evaluator._assert_motion_graph(evaluator)
+
+    assert evaluator.zero_count == 1
+
+
+def test_full_message_contract_accepts_expected_frames_and_metadata():
+    config = load_config(Path(__file__).parents[1] / "config" / "stage1.yaml")
+    odom = [
+        OdomSample(
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            (1.0, 0.0, 0.0, 0.0),
+            "odom",
+            "base_link",
+        )
+    ]
+    imu = [
+        ImuContractSample(
+            1.0,
+            "imu_link",
+            (1.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 9.81),
+        )
+    ]
+    images = [
+        ImageContractSample(1.0, "camera_link", 320, 240, "rgb8", 960, 230400)
+    ]
+    info = [
+        CameraInfoContractSample(
+            1.0,
+            "camera_link",
+            320,
+            240,
+            (240.0, 0.0, 160.0, 0.0, 240.0, 120.0, 0.0, 0.0, 1.0),
+            (
+                240.0,
+                0.0,
+                160.0,
+                0.0,
+                0.0,
+                240.0,
+                120.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+            ),
+        )
+    ]
+    transforms = [
+        TransformContractSample(0.0, "sim_map", "odom", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0), True),
+        TransformContractSample(1.0, "odom", "base_link", (0.0, 0.0, 0.8), (1.0, 0.0, 0.0, 0.0), False),
+        TransformContractSample(1.0, "base_link", "imu_link", (0.0, 0.0, 0.2), (1.0, 0.0, 0.0, 0.0), False),
+        TransformContractSample(1.0, "base_link", "camera_link", (0.2, 0.0, 0.3), (1.0, 0.0, 0.0, 0.0), False),
+    ]
+
+    assert message_contract_errors(config, odom, imu, images, info, transforms) == []
+
+
+def test_message_contract_rejects_wrong_frame_nan_and_malformed_image():
+    config = load_config(Path(__file__).parents[1] / "config" / "stage1.yaml")
+    odom = [
+        OdomSample(1.0, 0.0, 0.0, 0.0, (1.0, 0.0, 0.0, 0.0), "map", "base_link")
+    ]
+    imu = [
+        ImuContractSample(
+            1.0,
+            "wrong_imu",
+            (1.0, 0.0, 0.0, 0.0),
+            (float("nan"), 0.0, 0.0),
+            (0.0, 0.0, 9.81),
+        )
+    ]
+    images = [ImageContractSample(1.0, "camera_link", 1, 1, "bgr8", 3, 2)]
+
+    errors = message_contract_errors(config, odom, imu, images, [], [])
+
+    assert any("odometry frames" in error for error in errors)
+    assert any("IMU" in error for error in errors)
+    assert any("image" in error for error in errors)
+    assert any("camera info" in error for error in errors)
+    assert any("TF" in error for error in errors)

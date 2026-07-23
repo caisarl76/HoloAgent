@@ -3,6 +3,8 @@ from __future__ import annotations
 import collections
 from pathlib import Path
 import threading
+import sys
+from types import ModuleType
 
 import numpy as np
 import pytest
@@ -16,7 +18,7 @@ from holoagent_mujoco.backend import (
     make_controller_class,
 )
 from holoagent_mujoco.command import VelocityCommand
-from holoagent_mujoco.config import load_mapping
+from holoagent_mujoco.config import file_sha256, load_mapping
 from test_config import valid_mapping
 
 
@@ -46,15 +48,44 @@ class FakeData:
         self.ctrl = np.zeros(3)
         self.sensordata = np.array([0.1, 0.2, 0.3, 0.0, 0.0, 9.81])
         self.ncon = 2
+        identity = np.eye(3).reshape(9)
+        yaw_90 = np.array(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+        )
+        camera_axes = np.array(
+            [[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        )
+        self.xpos = np.array([[0.0, 0.0, 0.8]])
+        self.xmat = np.array([identity])
+        self.site_xpos = np.array([[0.1, 0.2, 1.1]])
+        self.site_xmat = np.array([yaw_90.reshape(9)])
+        self.cam_xpos = np.array([[0.4, -0.1, 1.3]])
+        self.cam_xmat = np.array([camera_axes.reshape(9)])
 
 
 class FakeMujoco:
+    class mjtObj:
+        mjOBJ_BODY = 1
+        mjOBJ_SITE = 2
+        mjOBJ_CAMERA = 3
+
+    @staticmethod
+    def mj_name2id(model, object_type, name):
+        return {
+            (1, "pelvis"): 0,
+            (2, "imu_in_torso"): 0,
+            (3, "head_camera"): 0,
+        }.get((object_type, name), -1)
+
     @staticmethod
     def mj_step(model, data):
         data.time += model.opt.timestep
 
 
 class FrozenTimeMujoco:
+    mjtObj = FakeMujoco.mjtObj
+    mj_name2id = FakeMujoco.mj_name2id
+
     @staticmethod
     def mj_step(model, data):
         pass
@@ -65,6 +96,7 @@ class FakeController:
         self.model = FakeModel()
         self.data = FakeData()
         self.n_joints = 3
+        self.base_index = 0
         self.config = {
             "num_actions": 2,
             "kps": np.array([100.0, 100.0]),
@@ -114,6 +146,21 @@ def test_load_runner_module_uses_the_configured_file(tmp_path):
     assert Path(module.__file__) == runner
 
 
+def test_load_runner_module_rejects_forbidden_transport_import_delta(tmp_path):
+    forbidden_name = "unitree" + "_sdk2py"
+    sys.modules[forbidden_name] = ModuleType(forbidden_name)
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        f"import {forbidden_name}\nclass GearWbcController: pass\n",
+        encoding="utf-8",
+    )
+    try:
+        with pytest.raises(BackendError, match="forbidden transport"):
+            load_runner_module(runner)
+    finally:
+        sys.modules.pop(forbidden_name, None)
+
+
 def test_controller_adapter_overrides_paths_keyboard_and_cpu_provider(tmp_path):
     raw = valid_mapping()
     config_file = tmp_path / "controller.yaml"
@@ -133,6 +180,7 @@ def test_controller_adapter_overrides_paths_keyboard_and_cpu_provider(tmp_path):
         encoding="utf-8",
     )
     raw["backend"]["config_yaml"] = str(config_file)
+    raw["backend"]["expected_sha256"]["config_yaml"] = file_sha256(config_file)
     cfg = load_mapping(raw)
     generated_xml = tmp_path / "generated.xml"
     generated_xml.write_text("<mujoco/>", encoding="utf-8")
@@ -193,6 +241,11 @@ def test_step_clips_pd_torque_advances_time_and_returns_finite_snapshot():
     assert np.isfinite(np.asarray(first.base_quaternion_wxyz)).all()
     assert first.imu_angular_velocity == (0.1, 0.2, 0.3)
     assert first.imu_linear_acceleration == (0.0, 0.0, 9.81)
+    assert first.imu_position_in_base == pytest.approx((0.1, 0.2, 0.3))
+    assert first.imu_quaternion_in_base_wxyz == pytest.approx(
+        (2**-0.5, 0.0, 0.0, 2**-0.5)
+    )
+    assert first.camera_position_in_base == pytest.approx((0.4, -0.1, 0.5))
     assert first.contact_count == 2
 
 
@@ -255,4 +308,3 @@ def test_close_commands_zero_and_is_idempotent():
     assert controller.control_dict["loco_cmd"].tolist() == [0.0, 0.0, 0.0]
     with pytest.raises(BackendError, match="closed"):
         backend.step()
-

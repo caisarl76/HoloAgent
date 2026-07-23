@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import time
 from typing import Any, Callable, Mapping
@@ -189,12 +190,39 @@ def graph_lists_match(host_output: str, container_output: str) -> list[str]:
     return host
 
 
+def graph_snapshots_match(
+    host_output: str,
+    container_output: str,
+    expected_nodes: tuple[str, ...],
+) -> list[str]:
+    host_lines = [line.rstrip() for line in host_output.splitlines() if line.strip()]
+    container_lines = [
+        line.rstrip() for line in container_output.splitlines() if line.strip()
+    ]
+    if host_lines != container_lines:
+        raise PreflightError("host and container complete ROS graph snapshots differ")
+    try:
+        start = host_lines.index("=== NODES ===") + 1
+        end = host_lines.index("=== TOPICS ===")
+    except ValueError as exc:
+        raise PreflightError("complete graph snapshot markers are missing") from exc
+    nodes = sorted(host_lines[start:end])
+    expected = sorted(expected_nodes)
+    if nodes != expected:
+        raise PreflightError(f"expected active nodes {expected}, got {nodes}")
+    for marker in ("=== SERVICES ===", "=== ACTIONS ===", "=== ENDPOINTS ==="):
+        if marker not in host_lines:
+            raise PreflightError(f"complete graph snapshot missing {marker}")
+    return nodes
+
+
 def capture_graph_parity(
     container: str,
     environment: Mapping[str, str],
     *,
     runner: Runner = subprocess.run,
     timeout_sec: float = 10.0,
+    expected_nodes: tuple[str, ...] = ("/holoagent_mujoco_bridge",),
 ) -> dict[str, Any]:
     docker_environment = [
         "--env",
@@ -207,10 +235,20 @@ def capture_graph_parity(
         f"RMW_IMPLEMENTATION={environment['RMW_IMPLEMENTATION']}",
     ]
     deadline = time.monotonic() + timeout_sec
+    endpoint_commands = " && ".join(
+        f"ros2 node info {shlex.quote(node)}" for node in expected_nodes
+    )
+    graph_command = (
+        "printf '=== NODES ===\\n' && ros2 node list && "
+        "printf '=== TOPICS ===\\n' && ros2 topic list -t && "
+        "printf '=== SERVICES ===\\n' && ros2 service list -t && "
+        "printf '=== ACTIONS ===\\n' && ros2 action list -t && "
+        f"printf '=== ENDPOINTS ===\\n' && {endpoint_commands}"
+    )
     last_error = "graph discovery did not run"
     while time.monotonic() < deadline:
         host = runner(
-            ["ros2", "node", "list"],
+            ["bash", "-lc", "source /opt/ros/humble/setup.bash && " + graph_command],
             env=dict(environment),
             text=True,
             capture_output=True,
@@ -226,7 +264,8 @@ def capture_graph_parity(
                 "bash",
                 "-lc",
                 "source /opt/ros/humble/setup.bash && "
-                "ros2 pkg prefix rmw_cyclonedds_cpp >/dev/null && ros2 node list",
+                "ros2 pkg prefix rmw_cyclonedds_cpp >/dev/null && "
+                + graph_command,
             ],
             text=True,
             capture_output=True,
@@ -235,7 +274,9 @@ def capture_graph_parity(
         )
         if host.returncode == 0 and guest.returncode == 0:
             try:
-                nodes = graph_lists_match(host.stdout, guest.stdout)
+                nodes = graph_snapshots_match(
+                    host.stdout, guest.stdout, expected_nodes
+                )
                 return {
                     "nodes": nodes,
                     "host_output": host.stdout,
@@ -277,20 +318,62 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--container", default="holoagent_running")
     parser.add_argument("--graph-only", action="store_true")
+    parser.add_argument("--postflight", action="store_true")
+    parser.add_argument("--expected-node", action="append", default=[])
+    parser.add_argument("--bridge-pid", type=int)
+    parser.add_argument("--evaluator-pid", type=int)
     arguments = parser.parse_args(argv)
     run_dir = arguments.run_dir.expanduser().resolve()
     result: dict[str, Any]
     try:
-        if arguments.graph_only:
+        if arguments.graph_only or arguments.postflight:
             if not run_dir.is_dir():
                 raise PreflightError(f"run directory does not exist: {run_dir}")
         else:
             create_run_directory(run_dir)
         config = load_config(arguments.config)
         isolation = validate_isolation_environment(os.environ, config)
-        container = inspect_container(arguments.container)
-        if arguments.graph_only:
-            graph = capture_graph_parity(arguments.container, os.environ)
+        if arguments.postflight:
+            processes = scan_forbidden_processes()
+            if processes:
+                raise PreflightError(
+                    f"physical motion executables are running: {processes}"
+                )
+            pids = {
+                "bridge": arguments.bridge_pid,
+                "evaluator": arguments.evaluator_pid,
+            }
+            alive = {
+                name: pid
+                for name, pid in pids.items()
+                if pid is not None and Path(f"/proc/{pid}").exists()
+            }
+            if alive:
+                raise PreflightError(f"Stage 1 child PIDs remain alive: {alive}")
+            result = {
+                "status": "PASS",
+                "gate": "postflight",
+                "isolation": isolation,
+                "child_pids": pids,
+                "forbidden_processes": processes,
+            }
+            _write_json(run_dir / "postflight.json", result)
+        elif arguments.graph_only:
+            container = inspect_container(arguments.container)
+            processes = scan_forbidden_processes()
+            if processes:
+                raise PreflightError(
+                    f"physical motion executables are running: {processes}"
+                )
+            expected_nodes = tuple(
+                arguments.expected_node
+                or ["/holoagent_mujoco_bridge"]
+            )
+            graph = capture_graph_parity(
+                arguments.container,
+                os.environ,
+                expected_nodes=expected_nodes,
+            )
             (run_dir / "host_graph.txt").write_text(
                 graph["host_output"], encoding="utf-8"
             )
@@ -303,9 +386,11 @@ def main(argv: list[str] | None = None) -> int:
                 "isolation": isolation,
                 "container": container,
                 "nodes": graph["nodes"],
+                "forbidden_processes": processes,
             }
             _write_json(run_dir / "graph_preflight.json", result)
         else:
+            container = inspect_container(arguments.container)
             runtime = validate_runtime_imports(config, os.environ)
             assert_no_forbidden_source(Path(__file__).parent)
             processes = scan_forbidden_processes()
@@ -327,12 +412,24 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         result = {
             "status": "FAIL",
-            "gate": "graph_parity" if arguments.graph_only else "initial_preflight",
+            "gate": (
+                "postflight"
+                if arguments.postflight
+                else "graph_parity"
+                if arguments.graph_only
+                else "initial_preflight"
+            ),
             "error": str(exc),
             "exception_type": type(exc).__name__,
         }
         if run_dir.is_dir():
-            name = "graph_preflight.json" if arguments.graph_only else "preflight.json"
+            name = (
+                "postflight.json"
+                if arguments.postflight
+                else "graph_preflight.json"
+                if arguments.graph_only
+                else "preflight.json"
+            )
             _write_json(run_dir / name, result)
         print(json.dumps(result, sort_keys=True))
         return 1
