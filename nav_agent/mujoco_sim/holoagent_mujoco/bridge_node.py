@@ -190,7 +190,13 @@ class HoloAgentMujocoBridge(Node):
             self.backend.set_command(command)
         except BackendError:
             pass
-        self._applied_publisher.publish(twist_message(command))
+        if rclpy.ok():
+            try:
+                self._applied_publisher.publish(twist_message(command))
+            except Exception:
+                # The internal controller is already zero; ROS may have shut down
+                # between the context check and this best-effort final publication.
+                pass
 
     def _command_callback(self, message: Twist) -> None:
         command = self.safety.accept(
@@ -250,6 +256,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 0
     except Exception as exc:
+        if initialized and not rclpy.ok():
+            return 0
         print(f"Stage 1 bridge failed: {exc}", file=sys.stderr)
         return 1
     finally:

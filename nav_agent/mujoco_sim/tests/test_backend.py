@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+from dataclasses import replace
 from pathlib import Path
 import threading
 import sys
@@ -18,7 +19,7 @@ from holoagent_mujoco.backend import (
     make_controller_class,
 )
 from holoagent_mujoco.command import VelocityCommand
-from holoagent_mujoco.config import file_sha256, load_mapping
+from holoagent_mujoco.config import load_mapping
 from test_config import valid_mapping
 
 
@@ -161,8 +162,30 @@ def test_load_runner_module_rejects_forbidden_transport_import_delta(tmp_path):
         sys.modules.pop(forbidden_name, None)
 
 
+def test_runner_import_blocker_prevents_transport_module_side_effect(
+    tmp_path, monkeypatch
+):
+    forbidden_name = "unitree" + "_sdk2py"
+    side_effect = tmp_path / "transport-imported"
+    (tmp_path / f"{forbidden_name}.py").write_text(
+        f"from pathlib import Path\nPath({str(side_effect)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        f"import {forbidden_name}\nclass GearWbcController: pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    with pytest.raises(BackendError, match="forbidden transport"):
+        load_runner_module(runner)
+
+    assert not side_effect.exists()
+
+
 def test_controller_adapter_overrides_paths_keyboard_and_cpu_provider(tmp_path):
-    raw = valid_mapping()
+    cfg = load_mapping(valid_mapping())
     config_file = tmp_path / "controller.yaml"
     config_file.write_text(
         yaml.safe_dump(
@@ -179,9 +202,10 @@ def test_controller_adapter_overrides_paths_keyboard_and_cpu_provider(tmp_path):
         ),
         encoding="utf-8",
     )
-    raw["backend"]["config_yaml"] = str(config_file)
-    raw["backend"]["expected_sha256"]["config_yaml"] = file_sha256(config_file)
-    cfg = load_mapping(raw)
+    cfg = replace(
+        cfg,
+        backend=replace(cfg.backend, config_yaml=config_file),
+    )
     generated_xml = tmp_path / "generated.xml"
     generated_xml.write_text("<mujoco/>", encoding="utf-8")
 
@@ -229,6 +253,24 @@ def test_controller_adapter_overrides_paths_keyboard_and_cpu_provider(tmp_path):
     assert output.device.type == "cpu"
 
 
+def test_controller_adapter_rejects_deferred_transport_import(tmp_path):
+    cfg = load_mapping(valid_mapping())
+    generated_xml = tmp_path / "generated.xml"
+    generated_xml.write_text("<mujoco/>", encoding="utf-8")
+    forbidden_name = "unitree" + "_sdk2py.deferred"
+
+    class BaseController:
+        def __init__(self, config_path):
+            sys.modules[forbidden_name] = ModuleType(forbidden_name)
+
+    Adapter = make_controller_class(BaseController, cfg, generated_xml, object())
+    try:
+        with pytest.raises(BackendError, match="forbidden transport"):
+            Adapter(str(cfg.backend.config_yaml.parent))
+    finally:
+        sys.modules.pop(forbidden_name, None)
+
+
 def test_step_clips_pd_torque_advances_time_and_returns_finite_snapshot():
     controller = FakeController()
     backend = MujocoBackend(controller, FakeMujoco)
@@ -246,7 +288,25 @@ def test_step_clips_pd_torque_advances_time_and_returns_finite_snapshot():
         (2**-0.5, 0.0, 0.0, 2**-0.5)
     )
     assert first.camera_position_in_base == pytest.approx((0.4, -0.1, 0.5))
+    assert first.camera_quaternion_in_base_wxyz == pytest.approx(
+        (-0.5, 0.5, -0.5, 0.5)
+    )
     assert first.contact_count == 2
+
+
+def test_snapshot_rotates_global_linear_velocity_into_base_frame():
+    controller = FakeController()
+    yaw_90 = np.array(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    controller.data.xmat[0] = yaw_90.reshape(9)
+    controller.data.qvel[:6] = [1.0, 0.0, 0.0, 0.1, 0.2, 0.3]
+    backend = MujocoBackend(controller, FakeMujoco)
+
+    snapshot = backend.snapshot()
+
+    assert snapshot.base_linear_velocity == pytest.approx((0.0, -1.0, 0.0))
+    assert snapshot.base_angular_velocity == pytest.approx((0.1, 0.2, 0.3))
 
 
 def test_policy_decimation_selects_balance_then_walk():

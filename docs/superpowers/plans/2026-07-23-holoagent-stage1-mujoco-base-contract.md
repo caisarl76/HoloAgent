@@ -284,7 +284,7 @@ git commit -m "feat(sim): publish the Stage 1 ROS contract"
 
 - [ ] **Step 1: Write failing metric and phase tests**
 
-Use synthetic samples to test strict clock monotonicity, rates in simulated time, RTF after warm-up, stationary drift, bounded motion displacement, applied-command clamps, timeout latency, one-second post-timeout speed, quaternion finiteness, first-failing-gate ordering, and qualified-pass JSON.
+Use synthetic samples to test strict clock monotonicity, rates in simulated time, RTF after warm-up, stationary drift, bounded motion displacement, applied-command clamps, timeout latency, bounded stop settling plus a one-second stable-speed hold, quaternion finiteness, first-failing-gate ordering, and qualified-pass JSON.
 
 - [ ] **Step 2: Verify RED**
 
@@ -296,7 +296,7 @@ PYTHONPATH=nav_agent/mujoco_sim \
 
 - [ ] **Step 3: Implement the evaluator**
 
-Before non-zero commands, require exactly the allowlisted bridge/evaluator nodes, required topic types/endpoints, no `/object_pose`, no Nav2 node/action, no physical motion executable, and `use_sim_time=true` on both active nodes. Then run: 2 s warm-up, 10 s stationary/rate window, bounded clamp probe, 1 s zero recovery, 2 s at 0.10 m/s, command silence for timeout, and 1 s stopped-speed observation. Enforce wall limit `4 * planned_sim_duration + 30` seconds. Record MuJoCo contact counts as diagnostic evidence without treating expected foot-floor contacts as Stage 1 collisions.
+Before non-zero commands, require exactly the allowlisted bridge/evaluator nodes, required topic types/endpoints, no `/object_pose`, no Nav2 node/action, no physical motion executable, and `use_sim_time=true` on both active nodes. Then run: 2 s warm-up, 10 s stationary/rate window, bounded clamp probe, 1 s zero recovery, 2 s at 0.10 m/s, command silence for timeout, at most 2 s of settling, and a 1 s stopped-speed hold. Enforce wall limit `4 * planned_sim_duration + 30` seconds. Record MuJoCo contact counts as diagnostic evidence without treating expected foot-floor contacts as Stage 1 collisions.
 
 - [ ] **Step 4: Verify GREEN and commit**
 
@@ -393,7 +393,7 @@ Expected required gates:
 - stationary drift at most 0.05 m over 5 simulated seconds;
 - 0.08–0.30 m forward displacement for 0.10 m/s over 2 simulated seconds;
 - applied `abs(x)<=0.22`, `y==0`, `abs(yaw)<=0.30`;
-- zero command within 0.60 simulated seconds and speed below 0.03 m/s for the following second;
+- zero command within 0.60 simulated seconds, settle below 0.03 m/s within 2.0 seconds, and remain below 0.03 m/s for the following second;
 - no unexpected graph endpoints, Nav2, physical motion processes, PC2 address, or Unitree SDK imports.
 
 - [ ] **Step 4: Validate evidence and cleanup**

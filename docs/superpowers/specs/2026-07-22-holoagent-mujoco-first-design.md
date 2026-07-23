@@ -358,7 +358,7 @@ edited after a run.
 | Stationary drift | at most 0.05 m over 5 simulated seconds |
 | Bounded motion | 0.08-0.30 m forward displacement for 0.10 m/s over 2 simulated seconds |
 | Command clamps | `abs(x)<=0.22`, `y==0`, `abs(yaw)<=0.30` |
-| Timeout stop | zero command within 0.60 simulated seconds; speed below 0.03 m/s for the following 1 s |
+| Timeout stop | zero command within 0.60 simulated seconds; settle below 0.03 m/s within 2.0 s, then remain below 0.03 m/s for 1 s |
 | LIO estimate | translation RMSE at most 0.50 m, maximum error at most 1.50 m, yaw RMSE at most 10 degrees over 30 simulated seconds |
 | Nav2 goal | position error at most 0.35 m and yaw error at most 15 degrees within 90 simulated seconds, with no collision |
 

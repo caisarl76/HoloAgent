@@ -18,6 +18,30 @@ class PreflightError(RuntimeError):
 
 Runner = Callable[..., Any]
 
+STAGE1_TOPIC_TYPES = {
+    "/clock": "rosgraph_msgs/msg/Clock",
+    "/cmd_vel": "geometry_msgs/msg/Twist",
+    "/robot_odom": "nav_msgs/msg/Odometry",
+    "/livox/imu": "sensor_msgs/msg/Imu",
+    "/camera/color/image_raw": "sensor_msgs/msg/Image",
+    "/camera/color/camera_info": "sensor_msgs/msg/CameraInfo",
+    "/holoagent_sim/applied_cmd_vel": "geometry_msgs/msg/Twist",
+    "/holoagent_sim/contact_count": "std_msgs/msg/UInt32",
+    "/tf": "tf2_msgs/msg/TFMessage",
+    "/tf_static": "tf2_msgs/msg/TFMessage",
+    "/parameter_events": "rcl_interfaces/msg/ParameterEvent",
+    "/rosout": "rcl_interfaces/msg/Log",
+}
+
+PARAMETER_SERVICE_TYPES = {
+    "describe_parameters": "rcl_interfaces/srv/DescribeParameters",
+    "get_parameter_types": "rcl_interfaces/srv/GetParameterTypes",
+    "get_parameters": "rcl_interfaces/srv/GetParameters",
+    "list_parameters": "rcl_interfaces/srv/ListParameters",
+    "set_parameters": "rcl_interfaces/srv/SetParameters",
+    "set_parameters_atomically": "rcl_interfaces/srv/SetParametersAtomically",
+}
+
 
 def validate_isolation_environment(
     environment: Mapping[str, str], config: Stage1Config
@@ -70,12 +94,33 @@ def validate_runtime_imports(
     *,
     runner: Runner = subprocess.run,
 ) -> dict[str, Any]:
-    probe = (
-        "import json, mujoco, numpy, onnxruntime, rclpy, torch, yaml; "
-        "print(json.dumps({'mujoco': mujoco.__version__, "
-        "'numpy': numpy.__version__, 'onnxruntime': onnxruntime.__version__, "
-        "'rclpy': rclpy.__file__, 'torch': torch.__version__}, sort_keys=True))"
-    )
+    probe = """
+import json
+import mujoco
+import numpy
+import onnxruntime
+import rclpy
+from rclpy.utilities import get_rmw_implementation_identifier
+import torch
+import yaml
+
+rclpy.init()
+node = rclpy.create_node("holoagent_stage1_preflight_probe")
+try:
+    rmw = get_rmw_implementation_identifier()
+    assert rmw == "rmw_cyclonedds_cpp", rmw
+    print(json.dumps({
+        "mujoco": mujoco.__version__,
+        "numpy": numpy.__version__,
+        "onnxruntime": onnxruntime.__version__,
+        "rclpy": rclpy.__file__,
+        "rmw": rmw,
+        "torch": torch.__version__,
+    }, sort_keys=True))
+finally:
+    node.destroy_node()
+    rclpy.shutdown()
+"""
     result = runner(
         [str(config.runtime.python), "-c", probe],
         env=dict(environment),
@@ -201,19 +246,156 @@ def graph_snapshots_match(
     ]
     if host_lines != container_lines:
         raise PreflightError("host and container complete ROS graph snapshots differ")
+    markers = (
+        "=== NODES ===",
+        "=== TOPICS ===",
+        "=== SERVICES ===",
+        "=== ACTIONS ===",
+        "=== ENDPOINTS ===",
+    )
     try:
-        start = host_lines.index("=== NODES ===") + 1
-        end = host_lines.index("=== TOPICS ===")
+        indices = [host_lines.index(marker) for marker in markers]
     except ValueError as exc:
         raise PreflightError("complete graph snapshot markers are missing") from exc
-    nodes = sorted(host_lines[start:end])
+    if indices != sorted(indices):
+        raise PreflightError("complete graph snapshot markers are out of order")
+    sections = {
+        name: host_lines[indices[index] + 1 : indices[index + 1]]
+        for index, name in enumerate(("nodes", "topics", "services", "actions"))
+    }
+    sections["endpoints"] = host_lines[indices[-1] + 1 :]
+    nodes = sorted(sections["nodes"])
     expected = sorted(expected_nodes)
     if nodes != expected:
         raise PreflightError(f"expected active nodes {expected}, got {nodes}")
-    for marker in ("=== SERVICES ===", "=== ACTIONS ===", "=== ENDPOINTS ==="):
-        if marker not in host_lines:
-            raise PreflightError(f"complete graph snapshot missing {marker}")
+    _validate_snapshot_topics(sections["topics"])
+    allowed_services = {
+        f"{node}/{service}"
+        for node in expected
+        for service in PARAMETER_SERVICE_TYPES
+    }
+    observed_services = {
+        _endpoint_name(line): _bracketed_type(line)
+        for line in sections["services"]
+    }
+    expected_services = {
+        f"{node}/{service}": service_type
+        for node in expected
+        for service, service_type in PARAMETER_SERVICE_TYPES.items()
+    }
+    if observed_services != expected_services:
+        raise PreflightError(
+            "unexpected service endpoints: "
+            f"expected={sorted(expected_services)}, got={sorted(observed_services)}"
+        )
+    if sections["actions"]:
+        raise PreflightError(f"unexpected action endpoints: {sections['actions']}")
+    endpoint_paths = {
+        _endpoint_name(line)
+        for line in sections["endpoints"]
+        if line.lstrip().startswith("/")
+    }
+    allowed_endpoint_paths = set(expected) | set(STAGE1_TOPIC_TYPES) | allowed_services
+    unexpected_endpoints = sorted(endpoint_paths - allowed_endpoint_paths)
+    if unexpected_endpoints:
+        raise PreflightError(f"unexpected endpoint details: {unexpected_endpoints}")
+    _validate_endpoint_ownership(sections["endpoints"], tuple(expected))
     return nodes
+
+
+def _endpoint_name(line: str) -> str:
+    return line.strip().split(maxsplit=1)[0].removesuffix(":")
+
+
+def _bracketed_type(line: str) -> str:
+    parts = line.strip().split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].startswith("[") or not parts[1].endswith("]"):
+        raise PreflightError(f"invalid typed endpoint line: {line}")
+    return parts[1][1:-1]
+
+
+def _validate_snapshot_topics(lines: list[str]) -> None:
+    observed: dict[str, str] = {}
+    for line in lines:
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].startswith("[") or not parts[1].endswith("]"):
+            raise PreflightError(f"invalid topic snapshot line: {line}")
+        observed[parts[0]] = parts[1][1:-1]
+    unexpected = sorted(set(observed) - set(STAGE1_TOPIC_TYPES))
+    if unexpected:
+        raise PreflightError(f"unexpected topic endpoints: {unexpected}")
+    missing = sorted(set(STAGE1_TOPIC_TYPES) - set(observed))
+    if missing:
+        raise PreflightError(f"missing topic endpoints: {missing}")
+    wrong_types = {
+        name: observed[name]
+        for name, expected in STAGE1_TOPIC_TYPES.items()
+        if observed[name] != expected
+    }
+    if wrong_types:
+        raise PreflightError(f"topic type mismatch: {wrong_types}")
+
+
+def _validate_endpoint_ownership(
+    lines: list[str], expected_nodes: tuple[str, ...]
+) -> None:
+    headings = {
+        "Subscribers": "subscriptions",
+        "Publishers": "publishers",
+        "Service Servers": "service_servers",
+        "Service Clients": "service_clients",
+        "Action Servers": "action_servers",
+        "Action Clients": "action_clients",
+    }
+    observed = {
+        node: {name: set() for name in headings.values()}
+        for node in expected_nodes
+    }
+    current_node: str | None = None
+    current_section: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        if not line.startswith((" ", "\t")) and stripped in observed:
+            current_node = stripped
+            current_section = None
+            continue
+        heading = headings.get(stripped.removesuffix(":"))
+        if heading is not None:
+            current_section = heading
+            continue
+        if stripped.startswith("/") and current_node and current_section:
+            observed[current_node][current_section].add(_endpoint_name(stripped))
+
+    expected: dict[str, dict[str, set[str]]] = {}
+    bridge = "/holoagent_mujoco_bridge"
+    evaluator = "/holoagent_stage1_eval"
+    if bridge in observed:
+        expected[bridge] = {
+            "subscriptions": {"/clock", "/cmd_vel"},
+            "publishers": (set(STAGE1_TOPIC_TYPES) - {"/cmd_vel"}),
+            "service_servers": {
+                f"{bridge}/{name}" for name in PARAMETER_SERVICE_TYPES
+            },
+            "service_clients": set(),
+            "action_servers": set(),
+            "action_clients": set(),
+        }
+    if evaluator in observed:
+        expected[evaluator] = {
+            "subscriptions": set(STAGE1_TOPIC_TYPES)
+            - {"/cmd_vel", "/parameter_events", "/rosout"},
+            "publishers": {"/cmd_vel", "/parameter_events", "/rosout"},
+            "service_servers": {
+                f"{evaluator}/{name}" for name in PARAMETER_SERVICE_TYPES
+            },
+            "service_clients": {f"{bridge}/get_parameters"},
+            "action_servers": set(),
+            "action_clients": set(),
+        }
+    if observed != expected:
+        raise PreflightError(
+            f"endpoint ownership/direction mismatch: expected={expected}, got={observed}"
+        )
 
 
 def capture_graph_parity(
@@ -221,7 +403,7 @@ def capture_graph_parity(
     environment: Mapping[str, str],
     *,
     runner: Runner = subprocess.run,
-    timeout_sec: float = 10.0,
+    timeout_sec: float = 30.0,
     expected_nodes: tuple[str, ...] = ("/holoagent_mujoco_bridge",),
 ) -> dict[str, Any]:
     docker_environment = [
@@ -235,16 +417,7 @@ def capture_graph_parity(
         f"RMW_IMPLEMENTATION={environment['RMW_IMPLEMENTATION']}",
     ]
     deadline = time.monotonic() + timeout_sec
-    endpoint_commands = " && ".join(
-        f"ros2 node info {shlex.quote(node)}" for node in expected_nodes
-    )
-    graph_command = (
-        "printf '=== NODES ===\\n' && ros2 node list && "
-        "printf '=== TOPICS ===\\n' && ros2 topic list -t && "
-        "printf '=== SERVICES ===\\n' && ros2 service list -t && "
-        "printf '=== ACTIONS ===\\n' && ros2 action list -t && "
-        f"printf '=== ENDPOINTS ===\\n' && {endpoint_commands}"
-    )
+    graph_command = graph_snapshot_command(expected_nodes)
     last_error = "graph discovery did not run"
     while time.monotonic() < deadline:
         host = runner(
@@ -253,7 +426,7 @@ def capture_graph_parity(
             text=True,
             capture_output=True,
             check=False,
-            timeout=5,
+            timeout=15,
         )
         guest = runner(
             [
@@ -270,7 +443,7 @@ def capture_graph_parity(
             text=True,
             capture_output=True,
             check=False,
-            timeout=5,
+            timeout=15,
         )
         if host.returncode == 0 and guest.returncode == 0:
             try:
@@ -293,6 +466,20 @@ def capture_graph_parity(
     raise PreflightError(f"graph parity check failed: {last_error}")
 
 
+def graph_snapshot_command(expected_nodes: tuple[str, ...]) -> str:
+    endpoint_commands = " && ".join(
+        f"ros2 node info --no-daemon {shlex.quote(node)}"
+        for node in expected_nodes
+    )
+    return (
+        "printf '=== NODES ===\\n' && ros2 node list --no-daemon && "
+        "printf '=== TOPICS ===\\n' && ros2 topic list --no-daemon -t && "
+        "printf '=== SERVICES ===\\n' && ros2 service list --no-daemon -t && "
+        "printf '=== ACTIONS ===\\n' && "
+        f"printf '=== ENDPOINTS ===\\n' && {endpoint_commands}"
+    )
+
+
 def artifact_evidence(config: Stage1Config) -> dict[str, dict[str, str]]:
     paths = {
         "runner": config.backend.runner,
@@ -312,6 +499,51 @@ def artifact_evidence(config: Stage1Config) -> dict[str, dict[str, str]]:
     }
 
 
+def merge_postflight_result(
+    result_path: Path,
+    postflight: Mapping[str, Any],
+    *,
+    final_path: Path | None = None,
+) -> None:
+    path = Path(result_path).expanduser().resolve()
+    if not path.is_file():
+        raise PreflightError(f"evaluator result does not exist: {path}")
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PreflightError(f"cannot read evaluator result: {path}") from exc
+    if not isinstance(result, dict):
+        raise PreflightError("evaluator result root must be an object")
+    passed = postflight.get("status") == "PASS"
+    result["postflight_pass"] = passed
+    if not passed:
+        if result.get("status") == "PASS":
+            result["status"] = "FAIL"
+            result["label"] = None
+            result["qualified_pass"] = None
+            result["first_failing_gate"] = "postflight"
+        metrics = result.setdefault("metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+            result["metrics"] = metrics
+        metrics["postflight_error"] = str(
+            postflight.get("error", "postflight failed")
+        )
+    destination = (
+        Path(final_path).expanduser().resolve()
+        if final_path is not None
+        else path
+    )
+    _write_json(destination, result)
+
+
+def assert_evaluator_exit_status(status: int | None) -> None:
+    if status is None:
+        raise PreflightError("evaluator exit status is required for postflight")
+    if status != 0:
+        raise PreflightError(f"evaluator exit status {status} blocks PASS promotion")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Fail-closed Stage 1 preflight")
     parser.add_argument("--config", type=Path, required=True)
@@ -322,6 +554,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-node", action="append", default=[])
     parser.add_argument("--bridge-pid", type=int)
     parser.add_argument("--evaluator-pid", type=int)
+    parser.add_argument("--result-file", type=Path)
+    parser.add_argument("--final-result-file", type=Path)
+    parser.add_argument("--evaluator-exit-status", type=int)
     arguments = parser.parse_args(argv)
     run_dir = arguments.run_dir.expanduser().resolve()
     result: dict[str, Any]
@@ -331,6 +566,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise PreflightError(f"run directory does not exist: {run_dir}")
         else:
             create_run_directory(run_dir)
+        expected_ros_log_dir = run_dir / "ros_logs"
+        configured_ros_log_dir = os.environ.get("ROS_LOG_DIR", "")
+        if not configured_ros_log_dir or (
+            Path(configured_ros_log_dir).expanduser().resolve()
+            != expected_ros_log_dir
+        ):
+            raise PreflightError(f"ROS_LOG_DIR must equal {expected_ros_log_dir}")
+        expected_ros_log_dir.mkdir(exist_ok=True)
         config = load_config(arguments.config)
         isolation = validate_isolation_environment(os.environ, config)
         if arguments.postflight:
@@ -350,6 +593,7 @@ def main(argv: list[str] | None = None) -> int:
             }
             if alive:
                 raise PreflightError(f"Stage 1 child PIDs remain alive: {alive}")
+            assert_evaluator_exit_status(arguments.evaluator_exit_status)
             result = {
                 "status": "PASS",
                 "gate": "postflight",
@@ -358,6 +602,18 @@ def main(argv: list[str] | None = None) -> int:
                 "forbidden_processes": processes,
             }
             _write_json(run_dir / "postflight.json", result)
+            if (
+                arguments.result_file is None
+                or arguments.final_result_file is None
+            ):
+                raise PreflightError(
+                    "--result-file and --final-result-file are required for postflight"
+                )
+            merge_postflight_result(
+                arguments.result_file,
+                result,
+                final_path=arguments.final_result_file,
+            )
         elif arguments.graph_only:
             container = inspect_container(arguments.container)
             processes = scan_forbidden_processes()
@@ -391,13 +647,13 @@ def main(argv: list[str] | None = None) -> int:
             _write_json(run_dir / "graph_preflight.json", result)
         else:
             container = inspect_container(arguments.container)
-            runtime = validate_runtime_imports(config, os.environ)
             assert_no_forbidden_source(Path(__file__).parent)
             processes = scan_forbidden_processes()
             if processes:
                 raise PreflightError(
                     f"physical motion executables are running: {processes}"
                 )
+            runtime = validate_runtime_imports(config, os.environ)
             result = {
                 "status": "PASS",
                 "gate": "initial_preflight",
@@ -431,6 +687,20 @@ def main(argv: list[str] | None = None) -> int:
                 else "preflight.json"
             )
             _write_json(run_dir / name, result)
+            if (
+                arguments.postflight
+                and arguments.result_file is not None
+                and arguments.final_result_file is not None
+                and arguments.result_file.is_file()
+            ):
+                try:
+                    merge_postflight_result(
+                        arguments.result_file,
+                        result,
+                        final_path=arguments.final_result_file,
+                    )
+                except PreflightError:
+                    pass
         print(json.dumps(result, sort_keys=True))
         return 1
     print(json.dumps(result, sort_keys=True))
@@ -438,7 +708,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
 
 
 if __name__ == "__main__":

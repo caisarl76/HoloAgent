@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import re
 import time
 from typing import Any, Iterable
 
@@ -36,9 +37,37 @@ GATE_ORDER = (
     "command_clamp",
     "bounded_motion",
     "timeout_zero",
+    "stop_settle",
     "stopped_speed",
     "message_finite",
 )
+
+REQUIRED_TOPICS = {
+    "/clock": "rosgraph_msgs/msg/Clock",
+    "/cmd_vel": "geometry_msgs/msg/Twist",
+    "/robot_odom": "nav_msgs/msg/Odometry",
+    "/livox/imu": "sensor_msgs/msg/Imu",
+    "/camera/color/image_raw": "sensor_msgs/msg/Image",
+    "/camera/color/camera_info": "sensor_msgs/msg/CameraInfo",
+    "/holoagent_sim/applied_cmd_vel": "geometry_msgs/msg/Twist",
+    "/holoagent_sim/contact_count": "std_msgs/msg/UInt32",
+    "/tf": "tf2_msgs/msg/TFMessage",
+    "/tf_static": "tf2_msgs/msg/TFMessage",
+}
+
+AUXILIARY_TOPICS = {
+    "/parameter_events": "rcl_interfaces/msg/ParameterEvent",
+    "/rosout": "rcl_interfaces/msg/Log",
+}
+
+PARAMETER_SERVICE_TYPES = {
+    "describe_parameters": "rcl_interfaces/srv/DescribeParameters",
+    "get_parameter_types": "rcl_interfaces/srv/GetParameterTypes",
+    "get_parameters": "rcl_interfaces/srv/GetParameters",
+    "list_parameters": "rcl_interfaces/srv/ListParameters",
+    "set_parameters": "rcl_interfaces/srv/SetParameters",
+    "set_parameters_atomically": "rcl_interfaces/srv/SetParametersAtomically",
+}
 
 
 @dataclass(frozen=True)
@@ -214,6 +243,39 @@ def max_speed_in_window(
     return max(speeds, default=math.inf)
 
 
+def stable_stop_window(
+    samples: Iterable[OdomSample],
+    *,
+    start: float,
+    max_settle: float,
+    hold: float,
+    speed_limit: float,
+) -> tuple[float, float]:
+    values = sorted(
+        (
+            sample
+            for sample in samples
+            if start <= sample.sim_time <= start + max_settle + hold
+        ),
+        key=lambda sample: sample.sim_time,
+    )
+    for candidate in values:
+        if candidate.sim_time > start + max_settle:
+            break
+        end = candidate.sim_time + hold
+        window = [
+            sample
+            for sample in values
+            if candidate.sim_time <= sample.sim_time <= end
+        ]
+        if not window or window[-1].sim_time < end - 1e-6:
+            continue
+        maximum = max(sample.speed for sample in window)
+        if maximum <= speed_limit:
+            return candidate.sim_time - start, maximum
+    return math.inf, math.inf
+
+
 def quaternion_samples_finite(samples: Iterable[OdomSample]) -> bool:
     values = list(samples)
     return bool(values) and all(
@@ -335,8 +397,8 @@ def build_result(gates: dict[str, bool], metrics: dict[str, Any]) -> dict[str, A
         "label": "PASS_SIM_ODOM" if passed else None,
         "qualified_pass": "PASS_SIM_ODOM" if passed else None,
         "first_failing_gate": first_failure,
-        "motion_enabled": bool(gates.get("graph", False)),
-        "simulated_motion": bool(gates.get("graph", False)),
+        "motion_enabled": False,
+        "simulated_motion": True,
         "physical_motion": False,
         "gates": {name: bool(gates.get(name, False)) for name in GATE_ORDER},
         "metrics": metrics,
@@ -457,6 +519,7 @@ class Stage1Evaluator(Node):
             + 1.0
             + thresholds.motion_duration_sec
             + thresholds.timeout_zero_sec
+            + thresholds.stop_settle_sec
             + thresholds.stopped_hold_sec
         )
         self._wall_deadline = (
@@ -514,7 +577,11 @@ class Stage1Evaluator(Node):
         silence_start = float(self.current_sim_time)
         self.active_gate = "timeout_zero"
         self.phase = "timeout"
-        silence_duration = thresholds.timeout_zero_sec + thresholds.stopped_hold_sec
+        silence_duration = (
+            thresholds.timeout_zero_sec
+            + thresholds.stop_settle_sec
+            + thresholds.stopped_hold_sec
+        )
         self._wait_sim(silence_start + silence_duration, None)
         self.publish_zero()
         self.phase = "metrics"
@@ -561,8 +628,12 @@ class Stage1Evaluator(Node):
             self.applied_commands, silence_start=silence_start
         )
         stopped_start = silence_start + latency
-        stopped_speed = max_speed_in_window(
-            self.odom_samples, start=stopped_start, duration=thresholds.stopped_hold_sec
+        stop_settle_latency, stopped_speed = stable_stop_window(
+            self.odom_samples,
+            start=stopped_start,
+            max_settle=thresholds.stop_settle_sec,
+            hold=thresholds.stopped_hold_sec,
+            speed_limit=thresholds.stopped_speed_mps,
         )
         drift = stationary_drift(stationary_samples)
         forward_displacement, lateral_displacement = forward_motion(motion_samples)
@@ -579,7 +650,8 @@ class Stage1Evaluator(Node):
             "motion_lateral_displacement_m": lateral_displacement,
             "motion_yaw_error_deg": yaw_error_degrees,
             "timeout_latency_sec": latency,
-            "post_timeout_max_speed_mps": stopped_speed,
+            "stop_settle_latency_sec": stop_settle_latency,
+            "stopped_hold_max_speed_mps": stopped_speed,
             "max_contact_count": max_contacts,
             "tf_messages": self.tf_messages,
             "static_tf_messages": self.static_tf_messages,
@@ -624,6 +696,7 @@ class Stage1Evaluator(Node):
             and abs(lateral_displacement) <= thresholds.motion_max_lateral_m
             and yaw_error_degrees <= thresholds.motion_max_yaw_error_deg,
             "timeout_zero": latency <= thresholds.timeout_zero_sec,
+            "stop_settle": stop_settle_latency <= thresholds.stop_settle_sec,
             "stopped_speed": stopped_speed <= thresholds.stopped_speed_mps,
             "message_finite": not contract_errors,
         }
@@ -645,8 +718,7 @@ class Stage1Evaluator(Node):
         while self.current_sim_time is None or self.current_sim_time < target_sim_time:
             self._check_wall_deadline()
             now = time.monotonic()
-            nonzero = command is not None and not command.is_zero
-            if nonzero and now - last_graph_check >= 0.1:
+            if motion_graph_guard_required(command) and now - last_graph_check >= 0.1:
                 self._assert_motion_graph(check_remote_parameter=False)
                 last_graph_check = now
             if command is not None and now - last_publish >= 0.02:
@@ -694,22 +766,63 @@ class Stage1Evaluator(Node):
         expected_approval = file_sha256(ready)
         while True:
             self._check_wall_deadline()
-            self._assert_motion_graph(check_remote_parameter=False)
+            self._assert_motion_graph(
+                check_remote_parameter=False,
+                allow_cli_verifiers=True,
+            )
             if approval.is_file():
                 supplied = approval.read_text(encoding="utf-8").strip()
                 if supplied != expected_approval:
                     raise RuntimeError("external graph approval digest mismatch")
+                self._wait_for_cli_verifier_departure()
                 return
             rclpy.spin_once(self, timeout_sec=0.05)
 
-    def _assert_motion_graph(self, *, check_remote_parameter: bool = True) -> None:
-        valid, reason = self._graph_contract_once()
+    def _wait_for_cli_verifier_departure(self) -> None:
+        deadline = time.monotonic() + 5.0
+        last_reason = "ROS CLI verifier did not leave the graph"
+        while time.monotonic() < deadline:
+            self._check_wall_deadline()
+            valid, last_reason = self._graph_contract_once()
+            if valid:
+                return
+            permissive_valid, permissive_reason = self._graph_contract_once(
+                allow_cli_verifiers=True
+            )
+            if not permissive_valid:
+                self.active_gate = "graph"
+                self.phase = "motion_graph_guard"
+                self.publish_zero()
+                raise RuntimeError(
+                    f"motion graph guard failed: {permissive_reason}"
+                )
+            rclpy.spin_once(self, timeout_sec=0.05)
+        self.active_gate = "graph"
+        self.phase = "motion_graph_guard"
+        self.publish_zero()
+        raise RuntimeError(
+            f"motion graph guard failed after verifier departure timeout: {last_reason}"
+        )
+
+    def _assert_motion_graph(
+        self,
+        *,
+        check_remote_parameter: bool = True,
+        allow_cli_verifiers: bool = False,
+    ) -> None:
+        valid, reason = self._graph_contract_once(
+            allow_cli_verifiers=allow_cli_verifiers
+        )
         if not valid or (check_remote_parameter and not self._bridge_uses_sim_time()):
+            self.active_gate = "graph"
+            self.phase = "motion_graph_guard"
             self.publish_zero()
             detail = reason if not valid else "bridge use_sim_time is not true"
             raise RuntimeError(f"motion graph guard failed: {detail}")
 
-    def _graph_contract_once(self) -> tuple[bool, str]:
+    def _graph_contract_once(
+        self, *, allow_cli_verifiers: bool = False
+    ) -> tuple[bool, str]:
         nodes = sorted(
             _qualified_name(name, namespace)
             for name, namespace in self.get_node_names_and_namespaces()
@@ -720,19 +833,20 @@ class Stage1Evaluator(Node):
         services = {
             name: sorted(types) for name, types in self.get_service_names_and_types()
         }
+        action_endpoints = sorted(name for name in topics if "/_action/" in name)
         self.graph_evidence = {
             "nodes": nodes,
             "topics": topics,
             "services": services,
-            "actions": [],
+            "actions": action_endpoints,
             "endpoints": {},
         }
-        allowed_nodes = {
-            "/holoagent_mujoco_bridge",
-            "/holoagent_stage1_eval",
-        }
-        if set(nodes) != allowed_nodes:
-            return False, f"unexpected nodes: {nodes}"
+        allowed_nodes = {"/holoagent_mujoco_bridge", "/holoagent_stage1_eval"}
+        node_error = node_contract_error(
+            nodes, allow_cli_verifiers=allow_cli_verifiers
+        )
+        if node_error is not None:
+            return False, node_error
         forbidden_node_tokens = (
             "nav2",
             "controller_server",
@@ -741,27 +855,14 @@ class Stage1Evaluator(Node):
         )
         if any(token in name for token in forbidden_node_tokens for name in nodes):
             return False, "navigation node discovered"
-        if "/object_pose" in topics:
-            return False, "/object_pose is forbidden in Stage 1"
-        if any("/_action/" in name for name in topics):
-            return False, "action endpoint discovered in Stage 1"
-        required = {
-            "/clock": "rosgraph_msgs/msg/Clock",
-            "/cmd_vel": "geometry_msgs/msg/Twist",
-            "/robot_odom": "nav_msgs/msg/Odometry",
-            "/livox/imu": "sensor_msgs/msg/Imu",
-            "/camera/color/image_raw": "sensor_msgs/msg/Image",
-            "/camera/color/camera_info": "sensor_msgs/msg/CameraInfo",
-            "/holoagent_sim/applied_cmd_vel": "geometry_msgs/msg/Twist",
-            "/holoagent_sim/contact_count": "std_msgs/msg/UInt32",
-            "/tf": "tf2_msgs/msg/TFMessage",
-            "/tf_static": "tf2_msgs/msg/TFMessage",
-        }
-        for topic, expected_type in required.items():
-            if topics.get(topic) != [expected_type]:
-                return False, f"{topic} type mismatch: {topics.get(topic)}"
+        topic_error = topic_contract_error(topics)
+        if topic_error is not None:
+            return False, topic_error
+        service_error = service_contract_error(services, tuple(sorted(allowed_nodes)))
+        if service_error is not None:
+            return False, service_error
         endpoint_evidence: dict[str, dict[str, list[str]]] = {}
-        for topic in required:
+        for topic in REQUIRED_TOPICS:
             publishers = _endpoint_node_names(
                 self.get_publishers_info_by_topic(topic)
             )
@@ -794,27 +895,11 @@ class Stage1Evaluator(Node):
                 return False, (
                     f"{topic} subscriber ownership mismatch: {subscriptions}"
                 )
-        standard_parameter_services = {
-            "describe_parameters",
-            "get_parameter_types",
-            "get_parameters",
-            "list_parameters",
-            "set_parameters",
-            "set_parameters_atomically",
-        }
-        for service in services:
-            parts = service.strip("/").split("/")
-            if (
-                len(parts) != 2
-                or f"/{parts[0]}" not in allowed_nodes
-                or parts[1] not in standard_parameter_services
-            ):
-                return False, f"unexpected service endpoint: {service}"
         self.graph_evidence = {
             "nodes": nodes,
             "topics": topics,
             "services": services,
-            "actions": [],
+            "actions": action_endpoints,
             "endpoints": endpoint_evidence,
         }
         if not bool(self.get_parameter("use_sim_time").value):
@@ -1007,9 +1092,13 @@ def main(argv: list[str] | None = None) -> int:
             _enrich_result(result, config, arguments.output)
     finally:
         if node is not None:
-            node.publish_zero()
-            for _ in range(3):
-                rclpy.spin_once(node, timeout_sec=0.02)
+            try:
+                node.publish_zero()
+            except Exception:
+                pass
+            if rclpy.ok():
+                for _ in range(3):
+                    rclpy.spin_once(node, timeout_sec=0.02)
             node.destroy_node()
         if initialized and rclpy.ok():
             rclpy.shutdown()
@@ -1061,6 +1150,58 @@ def _endpoint_node_names(endpoint_info: Iterable[Any]) -> list[str]:
         _qualified_name(endpoint.node_name, endpoint.node_namespace)
         for endpoint in endpoint_info
     )
+
+
+def motion_graph_guard_required(command: VelocityCommand | None) -> bool:
+    """Keep guarding while a prior non-zero command can be timing out."""
+    return command is None or not command.is_zero
+
+
+def node_contract_error(
+    nodes: list[str], *, allow_cli_verifiers: bool = False
+) -> str | None:
+    expected = ["/holoagent_mujoco_bridge", "/holoagent_stage1_eval"]
+    observed = list(nodes)
+    if allow_cli_verifiers:
+        observed = [
+            name
+            for name in observed
+            if not (
+                re.fullmatch(r"/_ros2cli_[0-9]+", name)
+                or re.fullmatch(r"/_ros2cli_daemon_77_[0-9a-f]{32}", name)
+            )
+        ]
+    if observed != expected:
+        return f"unexpected nodes: {nodes}"
+    return None
+
+
+def topic_contract_error(topics: dict[str, list[str]]) -> str | None:
+    allowed = {**REQUIRED_TOPICS, **AUXILIARY_TOPICS}
+    unexpected = sorted(set(topics) - set(allowed))
+    if unexpected:
+        return f"unexpected topic endpoint: {unexpected[0]}"
+    for topic, expected_type in allowed.items():
+        observed = topics.get(topic)
+        if observed != [expected_type]:
+            return f"{topic} type mismatch: {observed}"
+    return None
+
+
+def service_contract_error(
+    services: dict[str, list[str]], nodes: tuple[str, ...]
+) -> str | None:
+    expected = {
+        f"{node}/{name}": [service_type]
+        for node in nodes
+        for name, service_type in PARAMETER_SERVICE_TYPES.items()
+    }
+    if services != expected:
+        return (
+            "service contract mismatch: "
+            f"expected={sorted(expected)}, got={sorted(services)}"
+        )
+    return None
 
 
 def _write_json(path: Path, result: dict[str, Any]) -> None:

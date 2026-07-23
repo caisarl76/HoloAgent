@@ -18,11 +18,16 @@ def test_launcher_has_valid_bash_syntax():
 def test_launcher_exports_exact_dds_isolation_contract():
     text = SCRIPT.read_text(encoding="utf-8")
 
+    assert "source /opt/ros/humble/setup.bash" in text
+    assert "set +u\nsource /opt/ros/humble/setup.bash\nset -u" in text
     assert "export ROS_DOMAIN_ID=77" in text
     assert "export ROS_LOCALHOST_ONLY=1" in text
     assert "export ROS2CLI_DISABLE_DAEMON=1" in text
     assert "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp" in text
     assert "export MUJOCO_GL=egl" in text
+    assert "HOLOAGENT_STAGE1_RMW_OVERLAY" in text
+    assert 'export ROS_LOG_DIR="${run_dir}/ros_logs"' in text
+    assert 'lib/x86_64-linux-gnu' in text
 
 
 def test_cleanup_targets_only_recorded_bridge_pid():
@@ -54,7 +59,14 @@ def test_launcher_records_bounded_postflight_cleanup_evidence():
 
     assert "for _attempt in {1..150}" in text
     assert "--postflight" in text
+    assert "--result-file" in text
+    assert "--final-result-file" in text
+    assert '--evaluator-exit-status "${evaluation_status}"' in text
+    assert 'result.pending.json' in text
     assert '"${run_dir}/postflight.log"' in text
+    assert "postflight_status=$?" in text
+    assert "if [[ ${postflight_status} -ne 0 ]]" in text
+    assert 'postflight.log" 2>&1 || true' not in text
 
 
 def test_launcher_contains_no_physical_robot_or_pc2_target():

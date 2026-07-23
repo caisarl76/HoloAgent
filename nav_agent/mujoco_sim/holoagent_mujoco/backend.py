@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import hashlib
 import importlib
+import importlib.abc
 import importlib.util
 import math
 from pathlib import Path
@@ -20,6 +22,44 @@ from holoagent_mujoco.config import Stage1Config
 
 class BackendError(RuntimeError):
     """Raised when the controller or MuJoCo violates the Stage 1 contract."""
+
+
+def _forbidden_transport_modules(names: set[str]) -> list[str]:
+    prefixes = ("unitree" + "_sdk2", "unitree" + "_sdk2py")
+    return sorted(name for name in names if name.startswith(prefixes))
+
+
+class _TransportImportBlocker(importlib.abc.MetaPathFinder):
+    def __init__(self) -> None:
+        self.blocked: set[str] = set()
+
+    def find_spec(self, fullname, path=None, target=None):
+        if _forbidden_transport_modules({fullname}):
+            self.blocked.add(fullname)
+            raise BackendError(f"forbidden transport import blocked: {fullname}")
+        return None
+
+
+@contextmanager
+def _block_transport_imports():
+    existing = _forbidden_transport_modules(set(sys.modules))
+    if existing:
+        raise BackendError(f"forbidden transport modules are already loaded: {existing}")
+    blocker = _TransportImportBlocker()
+    sys.meta_path.insert(0, blocker)
+    try:
+        yield
+    finally:
+        if blocker in sys.meta_path:
+            sys.meta_path.remove(blocker)
+        inserted = _forbidden_transport_modules(set(sys.modules))
+        for name in inserted:
+            sys.modules.pop(name, None)
+        violations = sorted(set(inserted) | blocker.blocked)
+        if violations:
+            raise BackendError(
+                f"forbidden transport import blocked: {violations}"
+            )
 
 
 @dataclass(frozen=True)
@@ -63,9 +103,12 @@ def load_runner_module(path: Path) -> ModuleType:
     sys.modules["pynput.keyboard"] = keyboard_module
     sys.modules[name] = module
     try:
-        spec.loader.exec_module(module)
+        with _block_transport_imports():
+            spec.loader.exec_module(module)
     except Exception as exc:
         sys.modules.pop(name, None)
+        if isinstance(exc, BackendError):
+            raise
         raise BackendError(f"failed to import runner: {runner}") from exc
     finally:
         for key, previous in saved_modules.items():
@@ -74,16 +117,13 @@ def load_runner_module(path: Path) -> ModuleType:
             else:
                 sys.modules[key] = previous
 
-    forbidden_prefixes = ("unitree" + "_sdk2", "unitree" + "_sdk2py")
     imported_modules = {
         value.__name__
         for value in vars(module).values()
         if isinstance(value, ModuleType)
     }
     imported_modules.update(set(sys.modules) - modules_before)
-    forbidden = sorted(
-        name for name in imported_modules if name.startswith(forbidden_prefixes)
-    )
+    forbidden = _forbidden_transport_modules(imported_modules)
     if forbidden:
         for forbidden_name in forbidden:
             if forbidden_name not in modules_before:
@@ -109,6 +149,38 @@ def make_controller_class(
         raise BackendError(f"generated scene does not exist: {scene_path}")
 
     class DirectControllerAdapter(base_class):
+        def __init__(self, *args, **kwargs):
+            forbidden_before = _forbidden_transport_modules(set(sys.modules))
+            if forbidden_before:
+                raise BackendError(
+                    "forbidden transport modules were loaded before controller "
+                    f"initialization: {forbidden_before}"
+                )
+            modules_before = set(sys.modules)
+            try:
+                with _block_transport_imports():
+                    super().__init__(*args, **kwargs)
+            except Exception as exc:
+                forbidden = _forbidden_transport_modules(
+                    set(sys.modules) - modules_before
+                )
+                for name in forbidden:
+                    sys.modules.pop(name, None)
+                if forbidden:
+                    raise BackendError(
+                        "controller initialization imported forbidden transport "
+                        f"modules: {forbidden}"
+                    ) from exc
+                raise
+            forbidden = _forbidden_transport_modules(set(sys.modules) - modules_before)
+            for name in forbidden:
+                sys.modules.pop(name, None)
+            if forbidden:
+                raise BackendError(
+                    "controller initialization imported forbidden transport "
+                    f"modules: {forbidden}"
+                )
+
         def keyboard_listener(self, control_dict, controller_config):
             return None
 
@@ -227,6 +299,7 @@ class MujocoBackend:
             camera_rotation = np.asarray(
                 self.data.cam_xmat[self._camera_id]
             ).reshape(3, 3)
+            camera_optical_rotation = camera_rotation @ np.diag([1.0, -1.0, -1.0])
             imu_relative_position, imu_relative_rotation = _relative_pose(
                 base_position,
                 base_rotation,
@@ -237,7 +310,7 @@ class MujocoBackend:
                 base_position,
                 base_rotation,
                 camera_position,
-                camera_rotation,
+                camera_optical_rotation,
             )
             snapshot = BackendSnapshot(
                 sim_time=float(self.data.time),
@@ -246,7 +319,9 @@ class MujocoBackend:
                     self.data.qpos[3:7], 4, "base quaternion"
                 ),
                 base_linear_velocity=_finite_tuple(
-                    self.data.qvel[0:3], 3, "base linear velocity"
+                    base_rotation.T @ np.asarray(self.data.qvel[0:3]),
+                    3,
+                    "base linear velocity",
                 ),
                 base_angular_velocity=_finite_tuple(
                     self.data.qvel[3:6], 3, "base angular velocity"

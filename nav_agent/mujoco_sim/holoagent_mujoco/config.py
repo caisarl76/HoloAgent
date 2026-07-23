@@ -10,6 +10,15 @@ from typing import Any, Mapping
 import yaml
 
 
+APPROVED_BACKEND_SHA256 = {
+    "runner": "b78dfb546ee250116b3853f96a12f82174aca248808da33caf199ec8e42f82fd",
+    "config_yaml": "31226a224ca8450e89d9ce17d5cb31c052192a9cbfedc8d145f1cb95627ac7a2",
+    "xml": "3b0b5a1c8299fda85cf328cc2a8df53ccc765ce37f20030175295049947b1a19",
+    "balance_policy": "f645da599d4ca3d29ed273c8f4712620bb680d34977469ca3aeabe5bb9631c18",
+    "walk_policy": "7c82255b6905ffcc4468fa7f8ddcf7b70db168cf1042107ccab887cb6a8e5407",
+}
+
+
 class ConfigError(ValueError):
     """Raised when Stage 1 configuration is unsafe or incomplete."""
 
@@ -103,6 +112,7 @@ class ThresholdConfig:
     motion_max_lateral_m: float
     motion_max_yaw_error_deg: float
     timeout_zero_sec: float
+    stop_settle_sec: float
     stopped_speed_mps: float
     stopped_hold_sec: float
     wall_time_multiplier: float
@@ -263,6 +273,7 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
         "motion_max_lateral_m",
         "motion_max_yaw_error_deg",
         "timeout_zero_sec",
+        "stop_settle_sec",
         "stopped_speed_mps",
         "stopped_hold_sec",
         "wall_time_multiplier",
@@ -319,6 +330,16 @@ def _verify_digest_pins(backend: BackendConfig) -> None:
         raise ConfigError(
             "backend.expected_sha256 must contain exactly "
             f"{sorted(required)}; missing={missing}; unexpected={unexpected}"
+        )
+    manifest = dict(backend.expected_sha256)
+    if manifest != APPROVED_BACKEND_SHA256:
+        changed = sorted(
+            name
+            for name in required
+            if manifest.get(name) != APPROVED_BACKEND_SHA256[name]
+        )
+        raise ConfigError(
+            f"backend.expected_sha256 differs from approved artifact manifest: {changed}"
         )
     for name, expected in backend.expected_sha256:
         actual = file_sha256(paths[name])

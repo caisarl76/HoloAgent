@@ -18,12 +18,17 @@ from holoagent_mujoco.stage1_eval import (
     forward_motion,
     max_speed_in_window,
     message_contract_errors,
+    motion_graph_guard_required,
+    node_contract_error,
     quaternion_samples_finite,
     realtime_factor,
+    service_contract_error,
     simulated_rate,
+    stable_stop_window,
     stationary_drift,
     strictly_monotonic,
     timeout_latency,
+    topic_contract_error,
 )
 from holoagent_mujoco.stage1_eval import Stage1Evaluator
 from holoagent_mujoco.config import load_config
@@ -116,6 +121,32 @@ def test_timeout_latency_and_post_timeout_speed_window():
     )
 
 
+def test_stable_stop_requires_settling_then_full_hold_window():
+    odometry = [
+        OdomSample(
+            index / 10.0,
+            0.0,
+            0.0,
+            speed,
+            (1.0, 0.0, 0.0, 0.0),
+        )
+        for index, speed in enumerate(
+            [0.17, 0.09, 0.04, 0.02, 0.035, 0.025] + [0.01] * 16
+        )
+    ]
+
+    settle, hold_max = stable_stop_window(
+        odometry,
+        start=0.0,
+        max_settle=1.0,
+        hold=1.0,
+        speed_limit=0.03,
+    )
+
+    assert settle == pytest.approx(0.5)
+    assert hold_max == pytest.approx(0.025)
+
+
 def test_quaternion_finiteness_rejects_nan():
     good = [OdomSample(0.0, 0.0, 0.0, 0.0, (1.0, 0.0, 0.0, 0.0))]
     bad = [OdomSample(0.0, 0.0, 0.0, 0.0, (float("nan"), 0.0, 0.0, 0.0))]
@@ -162,6 +193,7 @@ def test_qualified_pass_result_is_json_serializable():
         "command_clamp": True,
         "bounded_motion": True,
         "timeout_zero": True,
+        "stop_settle": True,
         "stopped_speed": True,
         "message_finite": True,
     }
@@ -173,6 +205,7 @@ def test_qualified_pass_result_is_json_serializable():
     assert result["qualified_pass"] == "PASS_SIM_ODOM"
     assert result["stage"] == 1
     assert result["physical_motion"] is False
+    assert result["motion_enabled"] is False
     assert result["simulated_motion"] is True
     assert result["first_failing_gate"] is None
     assert json.loads(json.dumps(result))["metrics"]["rtf"] == 0.8
@@ -213,8 +246,10 @@ def test_failed_graph_gate_returns_before_any_phase_command():
 def test_motion_graph_guard_fails_closed_on_stale_graph():
     class FakeEvaluator:
         zero_count = 0
+        active_gate = "bounded_motion"
+        phase = "motion"
 
-        def _graph_contract_once(self):
+        def _graph_contract_once(self, **kwargs):
             return False, "unexpected endpoint"
 
         def _bridge_uses_sim_time(self):
@@ -229,6 +264,109 @@ def test_motion_graph_guard_fails_closed_on_stale_graph():
         Stage1Evaluator._assert_motion_graph(evaluator)
 
     assert evaluator.zero_count == 1
+    assert evaluator.active_gate == "graph"
+    assert evaluator.phase == "motion_graph_guard"
+
+
+def test_graph_guard_remains_active_while_command_times_out():
+    assert motion_graph_guard_required(None)
+    assert motion_graph_guard_required(VelocityCommand(0.1, 0.0, 0.0))
+    assert not motion_graph_guard_required(VelocityCommand.zero())
+
+
+def test_only_preapproval_ros2cli_verifier_nodes_are_temporarily_allowed():
+    core = ["/holoagent_mujoco_bridge", "/holoagent_stage1_eval"]
+    with_cli = ["/_ros2cli_56531", *core]
+    with_daemon = [
+        "/_ros2cli_daemon_77_fadfcf5940a749328af955cc162a4265",
+        *core,
+    ]
+
+    assert node_contract_error(core) is None
+    assert node_contract_error(with_cli) is not None
+    assert node_contract_error(with_cli, allow_cli_verifiers=True) is None
+    assert node_contract_error(with_daemon, allow_cli_verifiers=True) is None
+    assert (
+        node_contract_error(
+            ["/untrusted_cli", *core], allow_cli_verifiers=True
+        )
+        is not None
+    )
+
+
+def test_motion_approval_waits_for_cli_verifier_departure(monkeypatch):
+    calls = []
+
+    class FakeEvaluator:
+        active_gate = "graph"
+        phase = "motion_approval"
+
+        def _check_wall_deadline(self):
+            pass
+
+        def _graph_contract_once(self, *, allow_cli_verifiers=False):
+            calls.append(allow_cli_verifiers)
+            if calls == [False]:
+                return False, "unexpected verifier"
+            if allow_cli_verifiers:
+                return True, "ok"
+            return True, "ok"
+
+        def publish_zero(self):
+            raise AssertionError("valid verifier departure must not force a failure")
+
+    monkeypatch.setattr(
+        "holoagent_mujoco.stage1_eval.rclpy.spin_once",
+        lambda node, timeout_sec: None,
+    )
+
+    Stage1Evaluator._wait_for_cli_verifier_departure(FakeEvaluator())
+
+    assert calls == [False, True, False]
+
+
+def test_topic_contract_rejects_additional_ordinary_endpoint():
+    topics = {
+        "/clock": ["rosgraph_msgs/msg/Clock"],
+        "/cmd_vel": ["geometry_msgs/msg/Twist"],
+        "/robot_odom": ["nav_msgs/msg/Odometry"],
+        "/livox/imu": ["sensor_msgs/msg/Imu"],
+        "/camera/color/image_raw": ["sensor_msgs/msg/Image"],
+        "/camera/color/camera_info": ["sensor_msgs/msg/CameraInfo"],
+        "/holoagent_sim/applied_cmd_vel": ["geometry_msgs/msg/Twist"],
+        "/holoagent_sim/contact_count": ["std_msgs/msg/UInt32"],
+        "/tf": ["tf2_msgs/msg/TFMessage"],
+        "/tf_static": ["tf2_msgs/msg/TFMessage"],
+        "/parameter_events": ["rcl_interfaces/msg/ParameterEvent"],
+        "/rosout": ["rcl_interfaces/msg/Log"],
+    }
+    assert topic_contract_error(topics) is None
+
+    topics["/unexpected"] = ["std_msgs/msg/String"]
+
+    assert topic_contract_error(topics) == "unexpected topic endpoint: /unexpected"
+
+
+def test_service_contract_requires_exact_parameter_endpoints_and_types():
+    nodes = ("/holoagent_mujoco_bridge", "/holoagent_stage1_eval")
+    types = {
+        "describe_parameters": "rcl_interfaces/srv/DescribeParameters",
+        "get_parameter_types": "rcl_interfaces/srv/GetParameterTypes",
+        "get_parameters": "rcl_interfaces/srv/GetParameters",
+        "list_parameters": "rcl_interfaces/srv/ListParameters",
+        "set_parameters": "rcl_interfaces/srv/SetParameters",
+        "set_parameters_atomically": "rcl_interfaces/srv/SetParametersAtomically",
+    }
+    services = {
+        f"{node}/{name}": [service_type]
+        for node in nodes
+        for name, service_type in types.items()
+    }
+    assert service_contract_error(services, nodes) is None
+
+    del services["/holoagent_stage1_eval/get_parameters"]
+
+    assert "service contract mismatch" in service_contract_error(services, nodes)
 
 
 def test_full_message_contract_accepts_expected_frames_and_metadata():

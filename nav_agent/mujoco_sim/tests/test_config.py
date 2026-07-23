@@ -104,6 +104,7 @@ def valid_mapping() -> dict:
             "motion_max_lateral_m": 0.05,
             "motion_max_yaw_error_deg": 10.0,
             "timeout_zero_sec": 0.60,
+            "stop_settle_sec": 2.0,
             "stopped_speed_mps": 0.03,
             "stopped_hold_sec": 1.0,
             "wall_time_multiplier": 4.0,
@@ -164,6 +165,14 @@ def test_backend_digest_manifest_rejects_unknown_keys():
     raw["backend"]["expected_sha256"]["other"] = "0" * 64
 
     with pytest.raises(ConfigError, match="exactly.*other"):
+        load_mapping(raw)
+
+
+def test_backend_digest_manifest_rejects_unapproved_pin():
+    raw = valid_mapping()
+    raw["backend"]["expected_sha256"]["runner"] = "0" * 64
+
+    with pytest.raises(ConfigError, match="approved artifact manifest"):
         load_mapping(raw)
 
 
