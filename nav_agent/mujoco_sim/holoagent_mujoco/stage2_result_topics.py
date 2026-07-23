@@ -1,0 +1,16 @@
+STAGE2_TOPIC_TYPES = {
+    "/camera/color/camera_info": "sensor_msgs/msg/CameraInfo",
+    "/camera/color/image_raw": "sensor_msgs/msg/Image",
+    "/clock": "rosgraph_msgs/msg/Clock",
+    "/cmd_vel": "geometry_msgs/msg/Twist",
+    "/holoagent_sim/applied_cmd_vel": "geometry_msgs/msg/Twist",
+    "/holoagent_sim/contact_count": "std_msgs/msg/UInt32",
+    "/holoagent_sim/lidar_points": "sensor_msgs/msg/PointCloud2",
+    "/livox/imu": "sensor_msgs/msg/Imu",
+    "/livox/lidar": "livox_ros_driver2/msg/CustomMsg",
+    "/parameter_events": "rcl_interfaces/msg/ParameterEvent",
+    "/robot_odom": "nav_msgs/msg/Odometry",
+    "/rosout": "rcl_interfaces/msg/Log",
+    "/tf": "tf2_msgs/msg/TFMessage",
+    "/tf_static": "tf2_msgs/msg/TFMessage",
+}

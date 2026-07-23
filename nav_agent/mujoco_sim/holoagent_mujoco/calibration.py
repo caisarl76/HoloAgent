@@ -157,6 +157,9 @@ def generate_fastlivo_config(
         "config_sha256": config_sha256,
         "source_sha256": source_sha256,
         "source_config_path": str(config.source_path) if config.source_path else None,
+        "source_config_sha256": (
+            file_sha256(config.source_path) if config.source_path else None
+        ),
         "forbidden_real_rig_source": False,
         "lidar_points_per_scan": config.lidar.configured_points,
         "lidar_min_finite_points": config.lidar.min_finite_points,

@@ -75,6 +75,9 @@ def test_calibration_metadata_binds_output_to_config_source(tmp_path):
     assert metadata["config_sha256"] == generated.config_sha256
     assert metadata["source_sha256"] == generated.source_sha256
     assert metadata["source_config_path"] == str(CONFIG_PATH.resolve())
+    assert metadata["source_config_sha256"] == hashlib.sha256(
+        CONFIG_PATH.read_bytes()
+    ).hexdigest()
     assert metadata["forbidden_real_rig_source"] is False
 
 
