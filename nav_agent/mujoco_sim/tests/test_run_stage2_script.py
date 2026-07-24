@@ -53,6 +53,7 @@ def test_stage2_launcher_graph_gates_measurement_and_promotes_atomically():
     assert "--postflight" in text
     assert "--evaluator-exit-status" in text
     assert approval < graph  # path declaration precedes external graph gate
+    assert "ros2 action list" not in text
 
 
 def test_stage2_launcher_contains_no_robot_or_remote_target():
