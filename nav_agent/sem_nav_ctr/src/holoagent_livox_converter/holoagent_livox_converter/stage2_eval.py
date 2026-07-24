@@ -185,7 +185,9 @@ class Stage2Evaluator(Node):
             line_override=None,
         )
 
-        self.create_subscription(Clock, "/clock", self._clock, qos_profile_sensor_data)
+        self.create_subscription(
+            Clock, "/clock", self._clock_callback, qos_profile_sensor_data
+        )
         self.create_subscription(Imu, "/livox/imu", self._imu, qos_profile_sensor_data)
         self.create_subscription(
             Image,
@@ -348,7 +350,7 @@ class Stage2Evaluator(Node):
         values = future.result().values
         return len(values) == 1 and bool(values[0].bool_value)
 
-    def _clock(self, message: Clock) -> None:
+    def _clock_callback(self, message: Clock) -> None:
         stamp = _stamp_ns(message.clock)
         self.current_clock_ns = stamp
         if self.collector is not None:
