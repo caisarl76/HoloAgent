@@ -150,8 +150,11 @@ docker exec --env ROS_DOMAIN_ID=77 --env ROS_LOCALHOST_ONLY=1 \
   --env ROS2CLI_DISABLE_DAEMON=1 --env RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
   --env ROS_LOG_DIR="${container_run_dir}/ros_logs" \
   "${container_name}" bash -lc "
-    set +u; source /opt/ros/humble/setup.bash; source /livox/livox_ws/install/setup.bash; set -u
+    set +u
+    source /opt/ros/humble/setup.bash
+    source /livox/livox_ws/install/setup.bash
     source ${converter_build}/install/setup.bash
+    set -u
     export PYTHONPATH=${container_root}/nav_agent/mujoco_sim:${container_root}/nav_agent/sem_nav_ctr/src/holoagent_livox_converter:\${PYTHONPATH:-}
     printf '%s\\n' \"\$\$\" >${container_run_dir}/converter.container.pid
     exec ${converter_build}/install/holoagent_livox_converter/lib/holoagent_livox_converter/livox_converter --ros-args \\
@@ -165,10 +168,13 @@ docker exec --env ROS_DOMAIN_ID=77 --env ROS_LOCALHOST_ONLY=1 \
   --env ROS2CLI_DISABLE_DAEMON=1 --env RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
   --env ROS_LOG_DIR="${container_run_dir}/ros_logs" \
   "${container_name}" bash -lc "
-    set +u; source /opt/ros/humble/setup.bash; source /livox/livox_ws/install/setup.bash; set -u
+    set +u
+    source /opt/ros/humble/setup.bash
+    source /livox/livox_ws/install/setup.bash
     source ${vikit_install}/vikit_common/share/vikit_common/local_setup.bash
     source ${vikit_install}/vikit_ros/share/vikit_ros/local_setup.bash
     source ${fastlivo_install}/fast_livo/share/fast_livo/local_setup.bash
+    set -u
     printf '%s\\n' \"\$\$\" >${container_run_dir}/fastlivo.container.pid
     exec ${fastlivo_install}/fast_livo/lib/fast_livo/fastlivo_mapping --ros-args \\
       --params-file ${container_run_dir}/fastlivo_sim.yaml \\
@@ -181,8 +187,11 @@ docker exec --env ROS_DOMAIN_ID=77 --env ROS_LOCALHOST_ONLY=1 \
   --env ROS2CLI_DISABLE_DAEMON=1 --env RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
   --env ROS_LOG_DIR="${container_run_dir}/ros_logs" \
   "${container_name}" bash -lc "
-    set +u; source /opt/ros/humble/setup.bash; source /livox/livox_ws/install/setup.bash; set -u
+    set +u
+    source /opt/ros/humble/setup.bash
+    source /livox/livox_ws/install/setup.bash
     source ${converter_build}/install/setup.bash
+    set -u
     export PYTHONPATH=${container_root}/nav_agent/mujoco_sim:${container_root}/nav_agent/sem_nav_ctr/src/holoagent_livox_converter:\${PYTHONPATH:-}
     printf '%s\\n' \"\$\$\" >${container_run_dir}/evaluator.container.pid
     exec ${converter_build}/install/holoagent_livox_converter/lib/holoagent_livox_converter/stage3_eval \\
@@ -211,8 +220,13 @@ bash -lc "source /opt/ros/humble/setup.bash; ${graph_command}" >"${run_dir}/host
 docker exec --env ROS_DOMAIN_ID=77 --env ROS_LOCALHOST_ONLY=1 \
   --env ROS2CLI_DISABLE_DAEMON=1 --env RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
   "${container_name}" bash -lc "
-    set +u; source /opt/ros/humble/setup.bash; source /livox/livox_ws/install/setup.bash
-    source ${fastlivo_install}/fast_livo/share/fast_livo/local_setup.bash; set -u
+    set +u
+    source /opt/ros/humble/setup.bash
+    source /livox/livox_ws/install/setup.bash
+    source ${vikit_install}/vikit_common/share/vikit_common/local_setup.bash
+    source ${vikit_install}/vikit_ros/share/vikit_ros/local_setup.bash
+    source ${fastlivo_install}/fast_livo/share/fast_livo/local_setup.bash
+    set -u
     ${graph_command}
   " >"${run_dir}/container_graph.txt"
 
