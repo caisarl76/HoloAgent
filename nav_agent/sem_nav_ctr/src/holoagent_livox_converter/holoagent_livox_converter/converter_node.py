@@ -22,17 +22,20 @@ class LivoxConverterNode(Node):
         )
         if not self.get_parameter("use_sim_time").value:
             raise RuntimeError("Livox converter must use simulated time")
-        self.declare_parameter("input_topic", "/holoagent_sim/lidar_points")
-        self.declare_parameter("output_topic", "/livox/lidar")
-        self.declare_parameter("acquisition_mode", "snapshot")
-        self.declare_parameter("scan_period_ns", 100_000_000)
-        self.declare_parameter("min_finite_points", 2500)
-        self.declare_parameter("noise_std_m", 0.0)
-        self.declare_parameter("dropout_probability", 0.0)
-        self.declare_parameter("random_seed", 7)
-        self.declare_parameter("reflectivity_override", -1)
-        self.declare_parameter("tag_override", -1)
-        self.declare_parameter("line_override", -1)
+        for name, default in (
+            ("input_topic", "/holoagent_sim/lidar_points"),
+            ("output_topic", "/livox/lidar"),
+            ("acquisition_mode", "snapshot"),
+            ("scan_period_ns", 100_000_000),
+            ("min_finite_points", 2500),
+            ("noise_std_m", 0.0),
+            ("dropout_probability", 0.0),
+            ("random_seed", 7),
+            ("reflectivity_override", -1),
+            ("tag_override", -1),
+            ("line_override", -1),
+        ):
+            _declare_parameter_once(self, name, default)
         self._options = ConversionOptions(
             acquisition_mode=str(self.get_parameter("acquisition_mode").value),
             scan_period_ns=int(self.get_parameter("scan_period_ns").value),
@@ -84,6 +87,11 @@ class LivoxConverterNode(Node):
 def _optional_uint8(value) -> int | None:
     parsed = int(value)
     return None if parsed < 0 else parsed
+
+
+def _declare_parameter_once(node, name: str, default) -> None:
+    if not node.has_parameter(name):
+        node.declare_parameter(name, default)
 
 
 def main(args: list[str] | None = None) -> None:

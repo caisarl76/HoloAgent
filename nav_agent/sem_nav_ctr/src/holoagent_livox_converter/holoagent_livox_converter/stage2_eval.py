@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import time
@@ -23,7 +24,7 @@ from holoagent_livox_converter.converter_core import (
 )
 from holoagent_livox_converter.stage2_collector import Stage2Collector
 from holoagent_livox_converter.stage2_metrics import Stage2Limits, evaluate_stage2
-from holoagent_mujoco.config import Stage1Config, file_sha256, load_config
+from holoagent_mujoco.config import file_sha256
 
 
 EXPECTED_NODES = {
@@ -49,8 +50,77 @@ EXPECTED_TOPICS = {
 }
 
 
+@dataclass(frozen=True)
+class EvalThresholds:
+    warmup_sec: float
+    rate_window_sec: float
+    clock_min_hz: float
+    min_realtime_factor: float
+    imu_min_hz: float
+    imu_max_hz: float
+    camera_min_hz: float
+    camera_max_hz: float
+    lidar_min_hz: float
+    lidar_max_hz: float
+    wall_time_multiplier: float
+    startup_allowance_sec: float
+
+
+@dataclass(frozen=True)
+class EvalLidar:
+    acquisition_mode: str
+    scan_lines: int
+    azimuth_samples: int
+    scan_period_sec: float
+    min_finite_points: int
+    random_seed: int
+
+    @property
+    def configured_points(self) -> int:
+        return self.scan_lines * self.azimuth_samples
+
+
+@dataclass(frozen=True)
+class EvalFrames:
+    lidar: str
+
+
+@dataclass(frozen=True)
+class EvalConfig:
+    thresholds: EvalThresholds
+    lidar: EvalLidar
+    frames: EvalFrames
+    source_path: Path
+
+
+def load_eval_config(path: Path) -> EvalConfig:
+    source = path.expanduser().resolve()
+    document = yaml.safe_load(source.read_text(encoding="utf-8"))
+    thresholds = document["thresholds"]
+    lidar = document["lidar"]
+    frames = document["frames"]
+    return EvalConfig(
+        thresholds=EvalThresholds(
+            **{
+                name: float(thresholds[name])
+                for name in EvalThresholds.__dataclass_fields__
+            }
+        ),
+        lidar=EvalLidar(
+            acquisition_mode=str(lidar["acquisition_mode"]),
+            scan_lines=int(lidar["scan_lines"]),
+            azimuth_samples=int(lidar["azimuth_samples"]),
+            scan_period_sec=float(lidar["scan_period_sec"]),
+            min_finite_points=int(lidar["min_finite_points"]),
+            random_seed=int(lidar["random_seed"]),
+        ),
+        frames=EvalFrames(lidar=str(frames["lidar"])),
+        source_path=source,
+    )
+
+
 def validate_calibration_evidence(
-    config: Stage1Config, calibration_path: Path, metadata_path: Path
+    config: EvalConfig, calibration_path: Path, metadata_path: Path
 ) -> bool:
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -77,7 +147,7 @@ def validate_calibration_evidence(
 class Stage2Evaluator(Node):
     def __init__(
         self,
-        config: Stage1Config,
+        config: EvalConfig,
         *,
         calibration_path: Path,
         metadata_path: Path,
@@ -346,7 +416,7 @@ def _endpoint_name(endpoint: Any) -> str:
     )
 
 
-def _limits(config: Stage1Config) -> Stage2Limits:
+def _limits(config: EvalConfig) -> Stage2Limits:
     thresholds = config.thresholds
     return Stage2Limits(
         rate_window_sec=thresholds.rate_window_sec,
@@ -401,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
     initialized = False
     result: dict[str, object]
     try:
-        config = load_config(arguments.config)
+        config = load_eval_config(arguments.config)
         rclpy.init(args=ros_arguments)
         initialized = True
         node = Stage2Evaluator(
