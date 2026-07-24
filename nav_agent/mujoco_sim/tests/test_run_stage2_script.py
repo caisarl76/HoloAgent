@@ -35,6 +35,8 @@ def test_stage2_launcher_records_exact_host_and_container_pids():
     assert "pkill" not in text
     assert "killall" not in text
     assert "jobs -p" not in text
+    assert "exec ${build_root}/install/holoagent_livox_converter/lib/" in text
+    assert "exec ros2 run" not in text
 
 
 def test_stage2_launcher_graph_gates_measurement_and_promotes_atomically():

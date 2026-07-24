@@ -172,6 +172,39 @@ def _container_pid_alive(container: str, pid: int | None) -> bool:
     return result.returncode == 0
 
 
+def parse_container_stage_processes(output: str) -> list[dict[str, Any]]:
+    found = []
+    for line in output.splitlines():
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        command = parts[1]
+        if any(
+            token in command
+            for token in (
+                "/holoagent_livox_converter/livox_converter",
+                "/holoagent_livox_converter/stage2_eval",
+                "ros2 run holoagent_livox_converter livox_converter",
+                "ros2 run holoagent_livox_converter stage2_eval",
+            )
+        ):
+            found.append({"pid": int(parts[0]), "command": command})
+    return found
+
+
+def _container_stage_processes(container: str) -> list[dict[str, Any]]:
+    result = subprocess.run(
+        ["docker", "exec", container, "ps", "-eo", "pid=,args="],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise PreflightError("cannot inspect container process table")
+    return parse_container_stage_processes(result.stdout)
+
+
 def _write_json(path: Path, value: object) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -220,6 +253,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise PreflightError(
                     f"Stage 2 PIDs remain alive: host={alive_host}, container={alive_container}"
                 )
+            remnants = _container_stage_processes(args.container)
+            if remnants:
+                raise PreflightError(f"Stage 2 container processes remain: {remnants}")
             assert_evaluator_exit_status(args.evaluator_exit_status)
             if args.result_file is None or args.final_result_file is None:
                 raise PreflightError("postflight result paths are required")
@@ -248,6 +284,9 @@ def main(argv: list[str] | None = None) -> int:
             run_dir.mkdir()
             (run_dir / "ros_logs").mkdir()
             assert_no_forbidden_source(Path(__file__).parent)
+            remnants = _container_stage_processes(args.container)
+            if remnants:
+                raise PreflightError(f"stale Stage 2 container processes: {remnants}")
             result = {
                 "status": "PASS",
                 "gate": "initial_preflight",

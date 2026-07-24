@@ -178,7 +178,7 @@ docker exec \
     source ${build_root}/install/setup.bash
     export PYTHONPATH=${container_root}/nav_agent/mujoco_sim:${container_root}/nav_agent/sem_nav_ctr/src/holoagent_livox_converter:\${PYTHONPATH:-}
     printf '%s\\n' \"\$\$\" >${container_run_dir}/converter.container.pid
-    exec ros2 run holoagent_livox_converter livox_converter --ros-args \\
+    exec ${build_root}/install/holoagent_livox_converter/lib/holoagent_livox_converter/livox_converter --ros-args \\
       -p use_sim_time:=true \\
       -p acquisition_mode:=snapshot \\
       -p scan_period_ns:=100000000 \\
@@ -200,7 +200,7 @@ docker exec \
     source ${build_root}/install/setup.bash
     export PYTHONPATH=${container_root}/nav_agent/mujoco_sim:${container_root}/nav_agent/sem_nav_ctr/src/holoagent_livox_converter:\${PYTHONPATH:-}
     printf '%s\\n' \"\$\$\" >${container_run_dir}/evaluator.container.pid
-    exec ros2 run holoagent_livox_converter stage2_eval \\
+    exec ${build_root}/install/holoagent_livox_converter/lib/holoagent_livox_converter/stage2_eval \\
       --config ${container_root}/nav_agent/mujoco_sim/config/stage2.yaml \\
       --calibration ${container_run_dir}/fastlivo_sim.yaml \\
       --calibration-metadata ${container_run_dir}/fastlivo_sim_calibration.json \\

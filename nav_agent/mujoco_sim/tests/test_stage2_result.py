@@ -8,6 +8,7 @@ import pytest
 from holoagent_mujoco.preflight import PARAMETER_SERVICE_TYPES, PreflightError
 from holoagent_mujoco.stage2_result import (
     EXPECTED_NODES,
+    parse_container_stage_processes,
     validate_container_contract,
     validate_graph_parity,
 )
@@ -92,3 +93,15 @@ def test_graph_parity_requires_exact_nodes_topics_services_and_no_actions():
 def test_graph_parity_rejects_host_container_difference():
     with pytest.raises(PreflightError, match="differ"):
         validate_graph_parity(_snapshot(), _snapshot() + "/foreign\n")
+
+
+def test_container_process_parser_finds_wrappers_and_direct_nodes():
+    output = """\
+1224 /usr/bin/python3 /opt/ros/humble/bin/ros2 run holoagent_livox_converter livox_converter
+1363 /usr/bin/python3 /tmp/run/install/holoagent_livox_converter/lib/holoagent_livox_converter/livox_converter
+1400 /bin/sleep infinity
+"""
+    assert [item["pid"] for item in parse_container_stage_processes(output)] == [
+        1224,
+        1363,
+    ]
