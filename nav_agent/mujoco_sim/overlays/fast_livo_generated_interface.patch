@@ -1,0 +1,10 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -171,6 +171,7 @@
+ add_library(pre src/preprocess.cpp)
+ add_library(imu_proc src/IMU_Processing.cpp)
+ add_library(laser_mapping src/LIVMapper.cpp include/sc-relo/Scancontext.cpp src/ground_detection.cpp src/zupt.cpp)
++add_dependencies(laser_mapping ${PROJECT_NAME}__rosidl_generator_cpp)
+ add_library(utils src/utils.cpp)
+ add_library(incremental_mapping include/multi-session/Incremental_mapping.cpp include/sc-relo/Scancontext.cpp)
+ add_library(pose_estimator include/online-relo/pose_estimator.cpp include/sc-relo/Scancontext.cpp)

@@ -184,8 +184,12 @@ def parse_container_stage_processes(output: str) -> list[dict[str, Any]]:
             for token in (
                 "/holoagent_livox_converter/livox_converter",
                 "/holoagent_livox_converter/stage2_eval",
+                "/holoagent_livox_converter/stage3_eval",
+                "/fast_livo/fastlivo_mapping",
                 "ros2 run holoagent_livox_converter livox_converter",
                 "ros2 run holoagent_livox_converter stage2_eval",
+                "ros2 run holoagent_livox_converter stage3_eval",
+                "ros2 run fast_livo fastlivo_mapping",
             )
         ):
             found.append({"pid": int(parts[0]), "command": command})

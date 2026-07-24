@@ -22,6 +22,7 @@ setup(
         "console_scripts": [
             "livox_converter = holoagent_livox_converter.converter_node:main",
             "stage2_eval = holoagent_livox_converter.stage2_eval:main",
+            "stage3_eval = holoagent_livox_converter.stage3_eval:main",
         ]
     },
 )
