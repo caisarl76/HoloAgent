@@ -4,13 +4,29 @@ from livox_ros_driver2.msg import CustomMsg, CustomPoint
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import PointCloud2
 
 from holoagent_livox_converter.converter_core import (
     ConversionOptions,
     decode_pointcloud,
 )
+
+
+def fast_livo_output_qos() -> QoSProfile:
+    """Offer the reliability requested by FastLIVO's Livox subscription."""
+    return QoSProfile(
+        history=HistoryPolicy.KEEP_LAST,
+        depth=5,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.VOLATILE,
+    )
 
 
 class LivoxConverterNode(Node):
@@ -52,7 +68,7 @@ class LivoxConverterNode(Node):
         self._publisher = self.create_publisher(
             CustomMsg,
             str(self.get_parameter("output_topic").value),
-            qos_profile_sensor_data,
+            fast_livo_output_qos(),
         )
         self._subscription = self.create_subscription(
             PointCloud2,

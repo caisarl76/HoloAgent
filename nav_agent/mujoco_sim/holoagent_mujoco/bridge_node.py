@@ -67,6 +67,16 @@ class SimRateScheduler:
         return frozenset(due)
 
 
+def fast_livo_sensor_qos() -> QoSProfile:
+    """Offer reliable sensor delivery for FastLIVO's reliable subscriptions."""
+    return QoSProfile(
+        history=HistoryPolicy.KEEP_LAST,
+        depth=5,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+
+
 def run_fail_closed_loop(
     iteration: Callable[[], None],
     force_zero: Callable[[], None],
@@ -119,14 +129,15 @@ class HoloAgentMujocoBridge(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
+        livo_sensor_qos = fast_livo_sensor_qos()
         reliable_qos = QoSProfile(depth=10)
         self._clock_publisher = self.create_publisher(Clock, "/clock", clock_qos)
         self._odom_publisher = self.create_publisher(
             Odometry, "/robot_odom", reliable_qos
         )
-        self._imu_publisher = self.create_publisher(Imu, "/livox/imu", sensor_qos)
+        self._imu_publisher = self.create_publisher(Imu, "/livox/imu", livo_sensor_qos)
         self._image_publisher = self.create_publisher(
-            Image, "/camera/color/image_raw", sensor_qos
+            Image, "/camera/color/image_raw", livo_sensor_qos
         )
         self._camera_info_publisher = self.create_publisher(
             CameraInfo, "/camera/color/camera_info", sensor_qos

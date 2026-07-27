@@ -30,6 +30,19 @@ def test_stage3_graph_is_exact_and_host_container_identical():
     assert result["topics"] == STAGE3_TOPIC_TYPES
 
 
+def test_stage3_graph_includes_observed_image_transport_endpoints():
+    for image_topic in ("/depth_img", "/overlay_img", "/rgb_img"):
+        assert STAGE3_TOPIC_TYPES[f"{image_topic}/compressed"] == (
+            "sensor_msgs/msg/CompressedImage"
+        )
+        assert STAGE3_TOPIC_TYPES[f"{image_topic}/compressedDepth"] == (
+            "sensor_msgs/msg/CompressedImage"
+        )
+        assert STAGE3_TOPIC_TYPES[f"{image_topic}/theora"] == (
+            "theora_image_transport/msg/Packet"
+        )
+
+
 def test_stage3_graph_rejects_an_unexpected_motion_participant():
     altered = _snapshot().replace("=== TOPICS ===", "/g1_pubvel_node\n=== TOPICS ===")
     with pytest.raises(PreflightError, match="unexpected Stage 3 nodes"):

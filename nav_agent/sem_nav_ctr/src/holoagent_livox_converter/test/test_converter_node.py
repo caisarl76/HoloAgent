@@ -1,4 +1,9 @@
-from holoagent_livox_converter.converter_node import _declare_parameter_once
+from rclpy.qos import ReliabilityPolicy
+
+from holoagent_livox_converter.converter_node import (
+    _declare_parameter_once,
+    fast_livo_output_qos,
+)
 
 
 class FakeNode:
@@ -21,3 +26,7 @@ def test_parameter_override_is_not_declared_twice():
     _declare_parameter_once(node, "min_finite_points", 2500)
 
     assert node.calls == [("min_finite_points", 2500)]
+
+
+def test_fast_livo_output_qos_offers_reliable_delivery():
+    assert fast_livo_output_qos().reliability == ReliabilityPolicy.RELIABLE

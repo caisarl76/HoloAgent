@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import pytest
+from rclpy.qos import ReliabilityPolicy
 
-from holoagent_mujoco.bridge_node import SimRateScheduler, run_fail_closed_loop
+from holoagent_mujoco.bridge_node import (
+    SimRateScheduler,
+    fast_livo_sensor_qos,
+    run_fail_closed_loop,
+)
 
 
 def test_integer_accumulator_scheduler_hits_exact_stage1_rates():
@@ -45,6 +50,10 @@ def test_stage2_scheduler_emits_exact_lidar_rate_without_changing_stage1_rates()
             counts[stream] += 1
 
     assert counts == {"imu": 200, "odom": 50, "camera": 15, "lidar": 10}
+
+
+def test_fast_livo_sensor_qos_offers_reliable_delivery():
+    assert fast_livo_sensor_qos().reliability == ReliabilityPolicy.RELIABLE
 
 
 def test_loop_forces_final_zero_after_iteration_exception():
