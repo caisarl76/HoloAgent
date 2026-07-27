@@ -87,7 +87,7 @@ capture_host_graph() {
   printf '=== SERVICES ===\n'
   ros2 service list --no-daemon -t | sort
   printf '=== ACTIONS ===\n'
-  ros2 action list --no-daemon -t | sort
+  ros2 action list -t | sort
 }
 
 capture_container_graph() {
@@ -109,7 +109,7 @@ capture_container_graph() {
       printf '=== SERVICES ===\\n'
       ros2 service list --no-daemon -t | sort
       printf '=== ACTIONS ===\\n'
-      ros2 action list --no-daemon -t | sort
+      ros2 action list -t | sort
     "
 }
 
@@ -185,19 +185,10 @@ docker exec "${container_name}" bash -lc "
     --build-base ${build_root}/build --install-base ${build_root}/install
 " >"${run_dir}/colcon_build.log" 2>&1
 
-docker exec \
-  --env ROS_DOMAIN_ID=77 --env ROS_LOCALHOST_ONLY=1 \
-  --env ROS2CLI_DISABLE_DAEMON=1 --env RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
-  --env LC_ALL=C \
-  "${container_name}" bash -lc "
-    set +u
-    source /opt/ros/humble/setup.bash
-    source ${build_root}/install/setup.bash
-    set -u
-    ${build_root}/install/holoagent_mujoco/lib/holoagent_mujoco/stage4_prepare \\
-      --config ${container_root}/nav_agent/mujoco_sim/config/stage4.yaml \\
-      --output-dir ${container_run_dir}
-  " >"${run_dir}/stage4_prepare.log" 2>&1
+"${python_bin}" -m holoagent_mujoco.stage4_prepare \
+  --config "${config_path}" --output-dir "${run_dir}" \
+  --runtime-output-dir "${container_run_dir}" \
+  >"${run_dir}/stage4_prepare.log" 2>&1
 
 "${python_bin}" -m holoagent_mujoco.bridge_node --config "${config_path}" \
   >"${run_dir}/bridge.log" 2>&1 &

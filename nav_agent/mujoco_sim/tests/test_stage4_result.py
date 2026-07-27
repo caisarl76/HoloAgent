@@ -9,6 +9,7 @@ from holoagent_mujoco.stage4_result import (
     EXPECTED_SERVICE_TYPES,
     EXPECTED_TOPIC_TYPES,
     parse_stage4_processes,
+    validate_empty_graph,
     validate_evaluator_status,
     validate_stage4_graph,
 )
@@ -50,3 +51,21 @@ def test_stage4_evaluator_exit_status_preserves_pass_or_failure():
     validate_evaluator_status({"status": "FAIL"}, 1)
     with pytest.raises(PreflightError, match="exit one"):
         validate_evaluator_status({"status": "FAIL"}, 0)
+
+
+def test_postflight_graph_allows_only_ros_cli_builtin_topics():
+    snapshot = """=== NODES ===
+=== TOPICS ===
+/parameter_events [rcl_interfaces/msg/ParameterEvent]
+/rosout [rcl_interfaces/msg/Log]
+=== SERVICES ===
+=== ACTIONS ===
+"""
+    graph = validate_empty_graph(snapshot, snapshot)
+    assert graph["nodes"] == []
+
+    altered = snapshot.replace(
+        "=== SERVICES ===", "/cmd_vel [geometry_msgs/msg/Twist]\n=== SERVICES ==="
+    )
+    with pytest.raises(PreflightError, match="not empty"):
+        validate_empty_graph(altered, altered)

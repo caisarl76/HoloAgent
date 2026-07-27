@@ -42,7 +42,7 @@ def test_stage4_runner_is_fail_closed_before_query_motion():
     assert "stage4_graph_approved.sha256" in text
     assert text.index("--graph-host") < text.index("stage4_graph_approved.sha256")
     assert "autostart:=true" in text
-    assert "ros2 action list --no-daemon -t" in text
+    assert "ros2 action list -t" in text
     assert "result.pending.json" in text
     assert "result.json" in text
 

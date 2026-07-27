@@ -14,7 +14,12 @@ from holoagent_mujoco.stage4_map import (
 from holoagent_mujoco.stage4_nav import validate_nav2_parameters
 
 
-def prepare_stage4(config_path: Path, output_dir: Path) -> dict[str, object]:
+def prepare_stage4(
+    config_path: Path,
+    output_dir: Path,
+    *,
+    runtime_output_dir: Path | None = None,
+) -> dict[str, object]:
     config = load_stage4_config(config_path)
     destination = Path(output_dir).expanduser().resolve()
     grid = generate_sim_map(
@@ -39,6 +44,15 @@ def prepare_stage4(config_path: Path, output_dir: Path) -> dict[str, object]:
         expected_pgm_sha256=grid.pgm_sha256,
         prohibited_real_map_paths=config.map.prohibited_real_map_paths,
     )
+    if runtime_output_dir is not None:
+        runtime_destination = Path(runtime_output_dir).expanduser()
+        if not runtime_destination.is_absolute():
+            raise ValueError("runtime output directory must be absolute")
+        loaded = {
+            **loaded,
+            "yaml_path": str(runtime_destination / grid.yaml_path.name),
+            "pgm_path": str(runtime_destination / grid.pgm_path.name),
+        }
     evidence = {
         "stage": 4,
         "config_path": str(config.source_path),
@@ -79,8 +93,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare deterministic Stage 4 assets")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--runtime-output-dir", type=Path)
     arguments = parser.parse_args(argv)
-    evidence = prepare_stage4(arguments.config, arguments.output_dir)
+    evidence = prepare_stage4(
+        arguments.config,
+        arguments.output_dir,
+        runtime_output_dir=arguments.runtime_output_dir,
+    )
     print(json.dumps(evidence, sort_keys=True))
     return 0
 

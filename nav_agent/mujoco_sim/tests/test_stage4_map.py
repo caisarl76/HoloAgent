@@ -97,3 +97,14 @@ def test_stage4_preparation_writes_a_self_consistent_manifest(tmp_path):
     assert evidence["fixtures"][0]["query"] == "go to the blue chair"
     assert evidence["nav2"]["all_use_sim_time"] is True
     assert (tmp_path / "stage4_manifest.json").is_file()
+
+
+def test_stage4_manifest_can_name_the_bind_mounted_runtime_map(tmp_path):
+    config = Path(__file__).resolve().parents[1] / "config" / "stage4.yaml"
+    runtime_dir = Path("/workspace/HoloAgent/outputs/mujoco_holoagent/test-run")
+
+    evidence = prepare_stage4(config, tmp_path, runtime_output_dir=runtime_dir)
+
+    assert evidence["map"]["yaml_path"] == str(runtime_dir / "sim_map.yaml")
+    assert evidence["map"]["pgm_path"] == str(runtime_dir / "sim_map.pgm")
+    assert (tmp_path / "sim_map.yaml").is_file()

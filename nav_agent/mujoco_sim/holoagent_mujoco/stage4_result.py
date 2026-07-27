@@ -167,7 +167,19 @@ def validate_empty_graph(host: str, container: str) -> dict[str, list[str]]:
     if host != container:
         raise PreflightError("host and container postflight graphs differ")
     sections = _parse_snapshot(host)
-    populated = {name: values for name, values in sections.items() if values}
+    cli_topics = {
+        "/parameter_events": "rcl_interfaces/msg/ParameterEvent",
+        "/rosout": "rcl_interfaces/msg/Log",
+    }
+    unexpected = {
+        "nodes": sections["nodes"],
+        "topics": (
+            sections["topics"] if _typed_lines(sections["topics"]) != cli_topics else []
+        ),
+        "services": sections["services"],
+        "actions": sections["actions"],
+    }
+    populated = {name: values for name, values in unexpected.items() if values}
     if populated:
         raise PreflightError(f"Stage 4 postflight graph is not empty: {populated}")
     return sections
