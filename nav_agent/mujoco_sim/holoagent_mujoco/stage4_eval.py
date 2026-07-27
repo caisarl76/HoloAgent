@@ -551,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
     node: Stage4Evaluator | None = None
     initialized = False
     try:
-        config = load_stage4_config(arguments.config)
+        config = load_stage4_config(arguments.config, validate_bridge_artifacts=False)
         rclpy.init(args=ros_arguments)
         initialized = True
         node = Stage4Evaluator(

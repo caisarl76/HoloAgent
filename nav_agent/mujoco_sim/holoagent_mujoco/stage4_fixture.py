@@ -53,7 +53,7 @@ class Stage4FixtureNode(Node):
         )
         if not self.get_parameter("use_sim_time").value:
             raise RuntimeError("sim_fixture must use simulated time")
-        self.config = load_stage4_config(config_path)
+        self.config = load_stage4_config(config_path, validate_bridge_artifacts=False)
         reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         latched = QoSProfile(
             depth=1,

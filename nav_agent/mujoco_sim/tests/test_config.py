@@ -200,6 +200,24 @@ def test_missing_policy_fails_before_ros_start(tmp_path):
         load_mapping(raw)
 
 
+def test_nonexecuting_contract_parser_keeps_pins_without_local_artifacts(tmp_path):
+    raw = valid_mapping()
+    raw["runtime"]["python"] = str(tmp_path / "not-executed-python")
+    raw["runtime"]["extra_python_paths"] = [str(tmp_path / "not-imported")]
+    raw["backend"]["root"] = str(tmp_path / "not-instantiated")
+    for name in ("runner", "config_yaml", "xml", "balance_policy", "walk_policy"):
+        raw["backend"][name] = str(tmp_path / name)
+
+    cfg = load_mapping(raw, validate_runtime_artifacts=False)
+
+    assert cfg.runtime.python == tmp_path / "not-executed-python"
+    assert dict(cfg.backend.expected_sha256) == raw["backend"]["expected_sha256"]
+
+    raw["backend"]["expected_sha256"]["runner"] = "0" * 64
+    with pytest.raises(ConfigError, match="approved artifact manifest"):
+        load_mapping(raw, validate_runtime_artifacts=False)
+
+
 def test_backend_digest_manifest_must_be_complete():
     raw = valid_mapping()
     del raw["backend"]["expected_sha256"]["runner"]

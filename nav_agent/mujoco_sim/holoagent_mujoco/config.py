@@ -163,7 +163,9 @@ class Stage1Config:
     source_path: Path | None = None
 
 
-def load_config(path: str | Path) -> Stage1Config:
+def load_config(
+    path: str | Path, *, validate_runtime_artifacts: bool = True
+) -> Stage1Config:
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise ConfigError(f"config does not exist: {source}")
@@ -171,11 +173,13 @@ def load_config(path: str | Path) -> Stage1Config:
         raw = yaml.safe_load(stream)
     if not isinstance(raw, Mapping):
         raise ConfigError("config root must be a mapping")
-    cfg = load_mapping(raw)
+    cfg = load_mapping(raw, validate_runtime_artifacts=validate_runtime_artifacts)
     return Stage1Config(**{**cfg.__dict__, "source_path": source})
 
 
-def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
+def load_mapping(
+    raw: Mapping[str, Any], *, validate_runtime_artifacts: bool = True
+) -> Stage1Config:
     runtime_raw = _mapping(raw, "runtime")
     backend_raw = _mapping(raw, "backend")
     rates_raw = _mapping(raw, "rates")
@@ -188,11 +192,17 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
 
     runtime = RuntimeConfig(
         python=_path(
-            runtime_raw, "python", "runtime.python", file=True, executable=True
+            runtime_raw,
+            "python",
+            "runtime.python",
+            file=validate_runtime_artifacts,
+            executable=validate_runtime_artifacts,
         ),
         extra_python_paths=tuple(
             _absolute_path(
-                value, f"runtime.extra_python_paths[{index}]", directory=True
+                value,
+                f"runtime.extra_python_paths[{index}]",
+                directory=validate_runtime_artifacts,
             )
             for index, value in enumerate(_list(runtime_raw, "extra_python_paths"))
         ),
@@ -223,14 +233,42 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
         )
     )
     backend = BackendConfig(
-        root=_path(backend_raw, "root", "backend.root", directory=True),
-        runner=_path(backend_raw, "runner", "backend.runner", file=True),
-        config_yaml=_path(backend_raw, "config_yaml", "backend.config_yaml", file=True),
-        xml=_path(backend_raw, "xml", "backend.xml", file=True),
-        balance_policy=_path(
-            backend_raw, "balance_policy", "backend.balance_policy", file=True
+        root=_path(
+            backend_raw,
+            "root",
+            "backend.root",
+            directory=validate_runtime_artifacts,
         ),
-        walk_policy=_path(backend_raw, "walk_policy", "backend.walk_policy", file=True),
+        runner=_path(
+            backend_raw,
+            "runner",
+            "backend.runner",
+            file=validate_runtime_artifacts,
+        ),
+        config_yaml=_path(
+            backend_raw,
+            "config_yaml",
+            "backend.config_yaml",
+            file=validate_runtime_artifacts,
+        ),
+        xml=_path(
+            backend_raw,
+            "xml",
+            "backend.xml",
+            file=validate_runtime_artifacts,
+        ),
+        balance_policy=_path(
+            backend_raw,
+            "balance_policy",
+            "backend.balance_policy",
+            file=validate_runtime_artifacts,
+        ),
+        walk_policy=_path(
+            backend_raw,
+            "walk_policy",
+            "backend.walk_policy",
+            file=validate_runtime_artifacts,
+        ),
         onnx_providers=tuple(
             _nonempty_value(value, f"backend.onnx_providers[{index}]")
             for index, value in enumerate(_list(backend_raw, "onnx_providers"))
@@ -241,7 +279,7 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
         raise ConfigError(
             "backend.onnx_providers must contain only CPUExecutionProvider"
         )
-    _verify_digest_pins(backend)
+    _verify_digest_pins(backend, verify_files=validate_runtime_artifacts)
 
     rates = RateConfig(
         physics_hz=_positive_integer(rates_raw, "physics_hz", "rates.physics_hz"),
@@ -430,7 +468,7 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def _verify_digest_pins(backend: BackendConfig) -> None:
+def _verify_digest_pins(backend: BackendConfig, *, verify_files: bool = True) -> None:
     paths = {
         "runner": backend.runner,
         "config_yaml": backend.config_yaml,
@@ -457,6 +495,8 @@ def _verify_digest_pins(backend: BackendConfig) -> None:
         raise ConfigError(
             f"backend.expected_sha256 differs from approved artifact manifest: {changed}"
         )
+    if not verify_files:
+        return
     for name, expected in backend.expected_sha256:
         actual = file_sha256(paths[name])
         if actual != expected:

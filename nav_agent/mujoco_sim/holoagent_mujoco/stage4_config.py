@@ -52,9 +52,11 @@ class Stage4Config:
     gates: Stage4Gates
 
 
-def load_stage4_config(path: Path) -> Stage4Config:
+def load_stage4_config(
+    path: Path, *, validate_bridge_artifacts: bool = True
+) -> Stage4Config:
     source = Path(path).expanduser().resolve()
-    bridge = load_config(source)
+    bridge = load_config(source, validate_runtime_artifacts=validate_bridge_artifacts)
     raw = yaml.safe_load(source.read_text(encoding="utf-8"))
     if not isinstance(raw, Mapping) or not isinstance(raw.get("stage4"), Mapping):
         raise Stage4ConfigError("stage4 configuration section is required")
