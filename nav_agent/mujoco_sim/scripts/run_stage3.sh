@@ -44,6 +44,7 @@ export ROS_LOCALHOST_ONLY=1
 export ROS2CLI_DISABLE_DAEMON=1
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export MUJOCO_GL=egl
+export LC_ALL=C
 export ROS_LOG_DIR="${run_dir}/ros_logs"
 export PYTHONPATH="${repo_root}/nav_agent/mujoco_sim:/home/jihun/work/GR00T-WholeBodyControl/.venv_data_collection/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:/opt/ros/humble/lib/python3.10/site-packages"
 
@@ -219,6 +220,7 @@ graph_command="printf '=== NODES ===\\n'; ros2 node list --no-daemon | sort; pri
 bash -lc "source /opt/ros/humble/setup.bash; ${graph_command}" >"${run_dir}/host_graph.txt"
 docker exec --env ROS_DOMAIN_ID=77 --env ROS_LOCALHOST_ONLY=1 \
   --env ROS2CLI_DISABLE_DAEMON=1 --env RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+  --env LC_ALL=C \
   "${container_name}" bash -lc "
     set +u
     source /opt/ros/humble/setup.bash

@@ -15,6 +15,12 @@ def test_stage3_launcher_syntax_and_isolation():
     assert "holoagent-stages234" in text
 
 
+def test_stage3_graph_serialization_uses_the_same_c_locale_on_both_sides():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "export LC_ALL=C" in text
+    assert "--env LC_ALL=C" in text
+
+
 def test_stage3_launcher_isolates_perfect_odom_and_gates_before_motion():
     text = SCRIPT.read_text(encoding="utf-8")
     assert "-r /robot_odom:=/stage3/unused_robot_odom" in text
