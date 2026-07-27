@@ -164,7 +164,8 @@ trap cleanup EXIT
 mkdir -p "${repo_root}/outputs/mujoco_holoagent"
 docker exec "${container_name}" dpkg-query -W '-f=${Package}=${Version}\n' \
   ros-humble-navigation2 ros-humble-nav2-bringup ros-humble-nav2-controller \
-  ros-humble-nav2-map-server ros-humble-nav2-planner >"${versions_tmp}"
+  ros-humble-nav2-lifecycle-manager ros-humble-nav2-map-server \
+  ros-humble-nav2-planner ros-humble-diagnostic-updater >"${versions_tmp}"
 
 "${python_bin}" -m holoagent_mujoco.stage4_result \
   --config "${config_path}" --run-dir "${run_dir}" \

@@ -57,6 +57,11 @@ def validate_nav2_parameters(
         raise Nav2ContractError("Stage 4 must use simulator ground-truth odometry")
     for name in ("global_costmap", "local_costmap"):
         costmap = parameters[name]
+        for dimension in ("width", "height"):
+            if dimension in costmap and not isinstance(costmap[dimension], int):
+                raise Nav2ContractError(
+                    f"{name} {dimension} must use Nav2's integer parameter type"
+                )
         if costmap.get("plugins") != ["static_layer", "inflation_layer"]:
             raise Nav2ContractError(f"{name} must use only static and inflation layers")
         inflation = float(costmap["inflation_layer"]["inflation_radius"])

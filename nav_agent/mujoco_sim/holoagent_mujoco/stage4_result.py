@@ -32,9 +32,11 @@ EXPECTED_NODES = (
     "/bt_navigator_navigate_through_poses_rclcpp_node",
     "/bt_navigator_navigate_to_pose_rclcpp_node",
     "/controller_server",
+    "/global_costmap/global_costmap",
     "/holoagent_mujoco_bridge",
     "/holoagent_stage4_eval",
     "/lifecycle_manager_stage4",
+    "/local_costmap/local_costmap",
     "/map_server",
     "/planner_server",
     "/sim_fixture",
@@ -111,13 +113,16 @@ EXPECTED_ACTION_TYPES = {
     "/navigate_through_poses": "nav2_msgs/action/NavigateThroughPoses",
 }
 
-NAV2_PACKAGES = (
-    "ros-humble-navigation2",
-    "ros-humble-nav2-bringup",
-    "ros-humble-nav2-controller",
-    "ros-humble-nav2-map-server",
-    "ros-humble-nav2-planner",
-)
+NAV2_PACKAGE_PREFIXES = {
+    "ros-humble-navigation2": "1.1.20-",
+    "ros-humble-nav2-bringup": "1.1.20-",
+    "ros-humble-nav2-controller": "1.1.20-",
+    "ros-humble-nav2-lifecycle-manager": "1.1.20-",
+    "ros-humble-nav2-map-server": "1.1.20-",
+    "ros-humble-nav2-planner": "1.1.20-",
+    "ros-humble-diagnostic-updater": "4.0.7-",
+}
+NAV2_PACKAGES = tuple(NAV2_PACKAGE_PREFIXES)
 
 
 def _require_exact(
@@ -234,7 +239,10 @@ def validate_nav2_versions(path: Path) -> dict[str, str]:
         raise PreflightError("Nav2 package version evidence must be an object")
     if set(versions) != set(NAV2_PACKAGES):
         raise PreflightError("Nav2 package version evidence is incomplete")
-    if any(not str(value).startswith("1.1.20-") for value in versions.values()):
+    if any(
+        not str(versions[name]).startswith(prefix)
+        for name, prefix in NAV2_PACKAGE_PREFIXES.items()
+    ):
         raise PreflightError(f"unexpected Nav2 package versions: {versions}")
     return {name: str(versions[name]) for name in NAV2_PACKAGES}
 

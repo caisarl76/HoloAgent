@@ -11,6 +11,7 @@ from holoagent_mujoco.stage4_result import (
     parse_stage4_processes,
     validate_empty_graph,
     validate_evaluator_status,
+    validate_nav2_versions,
     validate_stage4_graph,
 )
 
@@ -69,3 +70,28 @@ def test_postflight_graph_allows_only_ros_cli_builtin_topics():
     )
     with pytest.raises(PreflightError, match="not empty"):
         validate_empty_graph(altered, altered)
+
+
+def test_nav2_version_gate_rejects_the_incompatible_diagnostic_library(tmp_path):
+    evidence = tmp_path / "versions.txt"
+    evidence.write_text(
+        """ros-humble-navigation2=1.1.20-build
+ros-humble-nav2-bringup=1.1.20-build
+ros-humble-nav2-controller=1.1.20-build
+ros-humble-nav2-lifecycle-manager=1.1.20-build
+ros-humble-nav2-map-server=1.1.20-build
+ros-humble-nav2-planner=1.1.20-build
+ros-humble-diagnostic-updater=4.0.7-build
+""",
+        encoding="utf-8",
+    )
+    assert validate_nav2_versions(evidence)["ros-humble-diagnostic-updater"].startswith(
+        "4.0.7-"
+    )
+
+    evidence.write_text(
+        evidence.read_text(encoding="utf-8").replace("4.0.7-", "4.0.6-"),
+        encoding="utf-8",
+    )
+    with pytest.raises(PreflightError, match="unexpected Nav2 package versions"):
+        validate_nav2_versions(evidence)
