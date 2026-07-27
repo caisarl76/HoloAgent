@@ -15,6 +15,7 @@ import yaml
 from holoagent_mujoco.backend import (
     BackendError,
     MujocoBackend,
+    _scene_collision_count,
     load_runner_module,
     make_controller_class,
 )
@@ -288,6 +289,31 @@ def test_step_clips_pd_torque_advances_time_and_returns_finite_snapshot():
     assert first.lidar_position_world == pytest.approx((0.1, 0.2, 1.1))
     assert first.lidar_position_in_base == pytest.approx((0.1, 0.2, 0.3))
     assert first.contact_count == 2
+
+
+def test_scene_collision_count_ignores_floor_contacts_and_counts_generated_obstacles():
+    class Contact:
+        def __init__(self, geom1, geom2):
+            self.geom1 = geom1
+            self.geom2 = geom2
+
+    class Model:
+        names = {1: "left_foot", 2: "floor", 3: "sim_wall_north", 4: "sim_corner_southeast"}
+
+    class Data:
+        ncon = 3
+        contact = [Contact(1, 2), Contact(1, 3), Contact(4, 1)]
+
+    class ContactMujoco:
+        class mjtObj:
+            mjOBJ_GEOM = 5
+
+        @staticmethod
+        def mj_id2name(model, object_type, identifier):
+            assert object_type == 5
+            return model.names.get(identifier)
+
+    assert _scene_collision_count(Model(), Data(), ContactMujoco) == 2
 
 
 def test_static_raycast_uses_only_generated_geometry_group():

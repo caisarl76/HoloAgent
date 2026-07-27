@@ -78,6 +78,7 @@ class BackendSnapshot:
     camera_quaternion_in_base_wxyz: tuple[float, float, float, float]
     applied_command: VelocityCommand
     contact_count: int
+    scene_collision_count: int = 0
     lidar_position_in_base: tuple[float, float, float] = (0.0, 0.0, 0.0)
     lidar_quaternion_in_base_wxyz: tuple[float, float, float, float] = (
         1.0,
@@ -369,6 +370,9 @@ class MujocoBackend:
                 ),
                 applied_command=self._read_command(),
                 contact_count=int(self.data.ncon),
+                scene_collision_count=_scene_collision_count(
+                    self.model, self.data, self._mujoco
+                ),
                 lidar_position_in_base=_finite_tuple(
                     lidar_relative_position, 3, "lidar position in base"
                 ),
@@ -568,6 +572,29 @@ class MujocoBackend:
                 self.controller.control_dict["loco_cmd"][:] = 0.0
         finally:
             self.data.ctrl[:] = 0.0
+
+
+def _scene_collision_count(model: Any, data: Any, mujoco_module: Any) -> int:
+    """Count contacts with generated solid scene geometry, excluding the floor."""
+    object_types = getattr(mujoco_module, "mjtObj", None)
+    geom_type = getattr(object_types, "mjOBJ_GEOM", None)
+    name_lookup = getattr(mujoco_module, "mj_id2name", None)
+    contacts = getattr(data, "contact", None)
+    if geom_type is None or name_lookup is None or contacts is None:
+        return 0
+    count = 0
+    for contact in contacts[: int(data.ncon)]:
+        names = (
+            name_lookup(model, geom_type, int(contact.geom1)),
+            name_lookup(model, geom_type, int(contact.geom2)),
+        )
+        if any(
+            isinstance(name, str)
+            and name.startswith(("sim_wall_", "sim_corner_"))
+            for name in names
+        ):
+            count += 1
+    return count
 
 
 def _load_cpu_policy(path: Path, providers: tuple[str, ...], ort_module: Any):

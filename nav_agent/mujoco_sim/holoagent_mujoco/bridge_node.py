@@ -148,6 +148,11 @@ class HoloAgentMujocoBridge(Node):
         self._contact_publisher = self.create_publisher(
             UInt32, "/holoagent_sim/contact_count", sensor_qos
         )
+        self._collision_publisher = None
+        if config.scene.publish_collision_count:
+            self._collision_publisher = self.create_publisher(
+                UInt32, "/holoagent_sim/collision_count", sensor_qos
+            )
         self._lidar_publisher = None
         self._lidar_sensor = None
         self._lidar_history = None
@@ -183,6 +188,10 @@ class HoloAgentMujocoBridge(Node):
         contact_message = UInt32()
         contact_message.data = snapshot.contact_count
         self._contact_publisher.publish(contact_message)
+        if self._collision_publisher is not None:
+            collision_message = UInt32()
+            collision_message.data = snapshot.scene_collision_count
+            self._collision_publisher.publish(collision_message)
 
         due = self.scheduler.tick()
         if "imu" in due:

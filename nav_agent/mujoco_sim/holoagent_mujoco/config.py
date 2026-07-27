@@ -116,6 +116,7 @@ class SceneConfig:
     half_extent: float
     wall_height: float
     wall_thickness: float
+    publish_collision_count: bool = False
 
 
 @dataclass(frozen=True)
@@ -356,6 +357,12 @@ def load_mapping(raw: Mapping[str, Any]) -> Stage1Config:
         wall_thickness=_positive_float(
             scene_raw, "wall_thickness", "scene.wall_thickness"
         ),
+        publish_collision_count=_optional_boolean(
+            scene_raw,
+            "publish_collision_count",
+            False,
+            "scene.publish_collision_count",
+        ),
     )
 
     threshold_names = (
@@ -513,6 +520,14 @@ def _boolean(parent: Mapping[str, Any], key: str, label: str) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"{label} must be boolean")
     return value
+
+
+def _optional_boolean(
+    parent: Mapping[str, Any], key: str, default: bool, label: str
+) -> bool:
+    if key not in parent:
+        return default
+    return _boolean(parent, key, label)
 
 
 def _integer(parent: Mapping[str, Any], key: str, label: str) -> int:

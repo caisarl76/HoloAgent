@@ -13,6 +13,8 @@ setup(
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml", "README.md"]),
         (f"share/{package_name}/config", glob("config/*.yaml")),
+        (f"share/{package_name}/launch", glob("launch/*.launch.py")),
+        (f"share/{package_name}/behavior_trees", glob("behavior_trees/*.xml")),
         (f"share/{package_name}/scripts", glob("scripts/*.sh")),
     ],
     install_requires=["setuptools", "numpy", "PyYAML"],
@@ -28,6 +30,9 @@ setup(
             "stage1_eval = holoagent_mujoco.stage1_eval:main",
             "preflight = holoagent_mujoco.preflight:main",
             "generate_calibration = holoagent_mujoco.calibration:main",
+            "stage4_fixture = holoagent_mujoco.stage4_fixture:main",
+            "stage4_eval = holoagent_mujoco.stage4_eval:main",
+            "stage4_prepare = holoagent_mujoco.stage4_prepare:main",
         ]
     },
 )
