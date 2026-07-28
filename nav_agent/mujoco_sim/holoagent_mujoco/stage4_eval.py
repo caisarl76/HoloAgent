@@ -72,6 +72,7 @@ class Stage4Evaluator(Node):
         self.applied_commands: list[VelocitySample] = []
         self.max_scene_collision_count = 0
         self.graph_evidence: dict[str, Any] = {}
+        self.all_use_sim_time = False
         self.active_gate = "graph"
         wall_limit = (
             config.gates.wall_time_multiplier * config.gates.goal_timeout_sim_sec
@@ -169,7 +170,6 @@ class Stage4Evaluator(Node):
         self.active_gate = "stop"
         stop = self._observe_stop(action_done_ns)
         final_pose = self.latest_pose
-        all_use_sim_time = self._all_nodes_use_sim_time()
         simulated_duration = (int(self.current_clock_ns) - collect_start_ns) / 1e9
         result = evaluate_stage4(
             expected_fixture=Pose2D(expected.x, expected.y, expected.yaw),
@@ -186,7 +186,7 @@ class Stage4Evaluator(Node):
             wall_duration_sec=time.monotonic() - wall_start,
             graph_approved=True,
             map_approved=True,
-            all_use_sim_time=all_use_sim_time,
+            all_use_sim_time=self.all_use_sim_time,
             limits=Stage4Limits(
                 position_tolerance_m=self.config.gates.position_tolerance_m,
                 yaw_tolerance_deg=self.config.gates.yaw_tolerance_deg,
@@ -293,6 +293,9 @@ class Stage4Evaluator(Node):
             bridge=self.config.bridge,
             inflation_radius_m=self.config.map.inflation_radius_m,
         )
+        self.all_use_sim_time = self._all_nodes_use_sim_time()
+        if not self.all_use_sim_time:
+            raise RuntimeError("one or more Stage 4 nodes do not use simulated time")
         if manifest.get("config_sha256") != file_sha256(self.config.source_path):
             raise RuntimeError("Stage 4 manifest config digest mismatch")
         return manifest
@@ -428,7 +431,12 @@ class Stage4Evaluator(Node):
             raise RuntimeError(f"{client_name} parameter service is unavailable")
         request = GetParameters.Request(names=[parameter])
         future = client.call_async(request)
-        self._spin_until_future(future, wall_timeout_sec=3.0)
+        try:
+            self._spin_until_future(future, wall_timeout_sec=3.0)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{client_name}.{parameter} query did not complete"
+            ) from exc
         response = future.result()
         if response is None or len(response.values) != 1:
             raise RuntimeError(f"{client_name}.{parameter} is unavailable")
@@ -572,6 +580,20 @@ def main(argv: list[str] | None = None) -> int:
         result["config_sha256"] = file_sha256(arguments.config)
     except Exception as exc:
         result = _failure(exc, node.active_gate if node is not None else "startup")
+        if node is not None:
+            observed_motion = any(
+                abs(sample.x) > 1e-4 or abs(sample.y) > 1e-4 or abs(sample.yaw) > 1e-4
+                for sample in (*node.commands, *node.applied_commands)
+            )
+            result["simulated_motion"] = observed_motion
+            result["metrics"].update(
+                {
+                    "command_samples": len(node.commands),
+                    "applied_command_samples": len(node.applied_commands),
+                    "path_pose_count": node.path_pose_count,
+                    "max_scene_collision_count": node.max_scene_collision_count,
+                }
+            )
     finally:
         if node is not None:
             node.destroy_node()
