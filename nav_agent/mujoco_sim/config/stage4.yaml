@@ -125,6 +125,7 @@ stage4:
   navigation:
     params_file: nav_agent/mujoco_sim/config/stage4_nav2.yaml
     behavior_tree: nav_agent/mujoco_sim/behavior_trees/stage4_navigate_to_pose.xml
+    behavior_tree_through_poses: nav_agent/mujoco_sim/behavior_trees/stage4_navigate_through_poses.xml
   gates:
     goal_timeout_sim_sec: 90.0
     position_tolerance_m: 0.35

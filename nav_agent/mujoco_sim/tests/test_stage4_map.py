@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from holoagent_mujoco.config import SceneConfig
 from holoagent_mujoco.stage4_map import (
@@ -108,3 +109,12 @@ def test_stage4_manifest_can_name_the_bind_mounted_runtime_map(tmp_path):
     assert evidence["map"]["yaml_path"] == str(runtime_dir / "sim_map.yaml")
     assert evidence["map"]["pgm_path"] == str(runtime_dir / "sim_map.pgm")
     assert (tmp_path / "sim_map.yaml").is_file()
+    runtime_params = yaml.safe_load(
+        (tmp_path / "stage4_nav2_runtime.yaml").read_text(encoding="utf-8")
+    )
+    assert runtime_params["map_server"]["ros__parameters"]["yaml_filename"] == str(
+        runtime_dir / "sim_map.yaml"
+    )
+    assert evidence["nav2"]["runtime_params_path"] == str(
+        runtime_dir / "stage4_nav2_runtime.yaml"
+    )

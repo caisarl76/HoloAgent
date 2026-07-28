@@ -224,7 +224,7 @@ docker exec \
     set -u
     printf '%s\\n' \"\$\$\" >${container_run_dir}/nav.container.pid
     exec ros2 launch holoagent_mujoco stage4_nav2.launch.py \\
-      params_file:=${container_root}/nav_agent/mujoco_sim/config/stage4_nav2.yaml \\
+      params_file:=${container_run_dir}/stage4_nav2_runtime.yaml \\
       map:=${container_run_dir}/sim_map.yaml use_sim_time:=true autostart:=true
   " >"${run_dir}/nav2.log" 2>&1 &
 nav_host_pid=$!

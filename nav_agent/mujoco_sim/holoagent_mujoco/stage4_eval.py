@@ -270,8 +270,21 @@ class Stage4Evaluator(Node):
             expected_pgm_sha256=str(map_evidence["pgm_sha256"]),
             prohibited_real_map_paths=self.config.map.prohibited_real_map_paths,
         )
+        runtime_params = Path(manifest["nav2"]["runtime_params_path"])
+        if file_sha256(runtime_params) != manifest["nav2"]["runtime_params_sha256"]:
+            raise RuntimeError("Stage 4 runtime Nav2 parameter digest mismatch")
+        if (
+            file_sha256(self.config.behavior_tree)
+            != manifest["nav2"]["behavior_tree_sha256"]
+        ):
+            raise RuntimeError("Stage 4 NavigateToPose tree digest mismatch")
+        if (
+            file_sha256(self.config.behavior_tree_through_poses)
+            != manifest["nav2"]["behavior_tree_through_poses_sha256"]
+        ):
+            raise RuntimeError("Stage 4 NavigateThroughPoses tree digest mismatch")
         validate_nav2_parameters(
-            self.config.nav2_params,
+            runtime_params,
             bridge=self.config.bridge,
             inflation_radius_m=self.config.map.inflation_radius_m,
         )

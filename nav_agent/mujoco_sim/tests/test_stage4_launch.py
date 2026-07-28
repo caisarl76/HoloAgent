@@ -4,6 +4,9 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 LAUNCH = PACKAGE_ROOT / "launch" / "stage4_nav2.launch.py"
 RUNNER = PACKAGE_ROOT / "scripts" / "run_stage4.sh"
+THROUGH_POSES_TREE = (
+    PACKAGE_ROOT / "behavior_trees" / "stage4_navigate_through_poses.xml"
+)
 
 
 def test_stage4_launch_is_minimal_nav2_without_localization_or_robot_drivers():
@@ -29,6 +32,10 @@ def test_package_installs_stage4_launch_and_behavior_tree():
     setup = (PACKAGE_ROOT / "setup.py").read_text(encoding="utf-8")
     assert 'glob("launch/*.launch.py")' in setup
     assert 'glob("behavior_trees/*.xml")' in setup
+    tree = THROUGH_POSES_TREE.read_text(encoding="utf-8")
+    assert "ComputePathThroughPoses" in tree
+    assert "FollowPath" in tree
+    assert "RecoveryNode" not in tree
 
 
 def test_stage4_runner_is_fail_closed_before_query_motion():

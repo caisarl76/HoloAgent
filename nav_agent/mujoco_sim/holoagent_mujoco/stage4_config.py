@@ -49,6 +49,7 @@ class Stage4Config:
     fixtures: dict[str, FixturePose]
     nav2_params: Path
     behavior_tree: Path
+    behavior_tree_through_poses: Path
     gates: Stage4Gates
 
 
@@ -105,6 +106,9 @@ def load_stage4_config(
     repo_root = source.parents[3]
     nav2_params = _repo_file(repo_root, navigation, "params_file")
     behavior_tree = _repo_file(repo_root, navigation, "behavior_tree")
+    behavior_tree_through_poses = _repo_file(
+        repo_root, navigation, "behavior_tree_through_poses"
+    )
     gates_raw = _mapping(stage4, "gates")
     gate_names = (
         "goal_timeout_sim_sec",
@@ -134,6 +138,7 @@ def load_stage4_config(
         fixtures=fixtures,
         nav2_params=nav2_params,
         behavior_tree=behavior_tree,
+        behavior_tree_through_poses=behavior_tree_through_poses,
         gates=gates,
     )
 

@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+import yaml
+
 from holoagent_mujoco.config import file_sha256
 from holoagent_mujoco.stage4_config import load_stage4_config
 from holoagent_mujoco.stage4_map import (
@@ -44,15 +46,31 @@ def prepare_stage4(
         expected_pgm_sha256=grid.pgm_sha256,
         prohibited_real_map_paths=config.map.prohibited_real_map_paths,
     )
-    if runtime_output_dir is not None:
-        runtime_destination = Path(runtime_output_dir).expanduser()
-        if not runtime_destination.is_absolute():
-            raise ValueError("runtime output directory must be absolute")
-        loaded = {
-            **loaded,
-            "yaml_path": str(runtime_destination / grid.yaml_path.name),
-            "pgm_path": str(runtime_destination / grid.pgm_path.name),
-        }
+    runtime_destination = (
+        destination
+        if runtime_output_dir is None
+        else Path(runtime_output_dir).expanduser()
+    )
+    if not runtime_destination.is_absolute():
+        raise ValueError("runtime output directory must be absolute")
+    loaded = {
+        **loaded,
+        "yaml_path": str(runtime_destination / grid.yaml_path.name),
+        "pgm_path": str(runtime_destination / grid.pgm_path.name),
+    }
+    runtime_params_path = destination / "stage4_nav2_runtime.yaml"
+    runtime_params = yaml.safe_load(config.nav2_params.read_text(encoding="utf-8"))
+    runtime_params["map_server"]["ros__parameters"]["yaml_filename"] = loaded[
+        "yaml_path"
+    ]
+    runtime_params_path.write_text(
+        yaml.safe_dump(runtime_params, sort_keys=False), encoding="utf-8"
+    )
+    validate_nav2_parameters(
+        runtime_params_path,
+        bridge=config.bridge,
+        inflation_radius_m=config.map.inflation_radius_m,
+    )
     evidence = {
         "stage": 4,
         "config_path": str(config.source_path),
@@ -75,6 +93,12 @@ def prepare_stage4(
             "params_sha256": file_sha256(config.nav2_params),
             "behavior_tree_path": str(config.behavior_tree),
             "behavior_tree_sha256": file_sha256(config.behavior_tree),
+            "behavior_tree_through_poses_path": str(config.behavior_tree_through_poses),
+            "behavior_tree_through_poses_sha256": file_sha256(
+                config.behavior_tree_through_poses
+            ),
+            "runtime_params_path": str(runtime_destination / runtime_params_path.name),
+            "runtime_params_sha256": file_sha256(runtime_params_path),
         },
     }
     _write_json(destination / "stage4_manifest.json", evidence)

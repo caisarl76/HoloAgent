@@ -18,7 +18,13 @@ def test_checked_in_nav2_parameters_are_ground_truth_and_nonholonomic():
     assert evidence["global_frame"] == "sim_map"
     assert evidence["odom_topic"] == "/robot_odom"
     assert evidence["controller_plugin"] == "dwb_core::DWBLocalPlanner"
-    assert evidence["navigators"] == ["navigate_to_pose"]
+    assert evidence["navigators"] == ["navigate_to_pose", "navigate_through_poses"]
+    assert evidence["bt_plugin_libs"] == [
+        "nav2_compute_path_to_pose_action_bt_node",
+        "nav2_compute_path_through_poses_action_bt_node",
+        "nav2_follow_path_action_bt_node",
+        "nav2_pipeline_sequence_bt_node",
+    ]
     assert evidence["lateral_velocity_range"] == [0.0, 0.0]
     assert evidence["vy_samples"] == 1
     assert evidence["max_vel_x"] <= bridge.command.max_linear_x

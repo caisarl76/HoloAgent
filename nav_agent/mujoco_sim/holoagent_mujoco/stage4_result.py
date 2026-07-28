@@ -30,6 +30,7 @@ from holoagent_mujoco.stage4_config import load_stage4_config
 
 EXPECTED_NODES = (
     "/bt_navigator",
+    "/bt_navigator_navigate_through_poses_rclcpp_node",
     "/bt_navigator_navigate_to_pose_rclcpp_node",
     "/controller_server",
     "/global_costmap/global_costmap",
@@ -110,6 +111,7 @@ EXPECTED_ACTION_TYPES = {
     "/compute_path_to_pose": "nav2_msgs/action/ComputePathToPose",
     "/follow_path": "nav2_msgs/action/FollowPath",
     "/navigate_to_pose": "nav2_msgs/action/NavigateToPose",
+    "/navigate_through_poses": "nav2_msgs/action/NavigateThroughPoses",
 }
 
 NAV2_PACKAGE_PREFIXES = {
