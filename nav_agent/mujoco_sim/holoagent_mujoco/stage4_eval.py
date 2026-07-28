@@ -36,22 +36,7 @@ from holoagent_mujoco.stage4_metrics import (
     evaluate_stage4,
 )
 from holoagent_mujoco.stage4_nav import validate_nav2_parameters
-
-
-EXPECTED_NODES = {
-    "/bt_navigator",
-    "/bt_navigator_navigate_through_poses_rclcpp_node",
-    "/bt_navigator_navigate_to_pose_rclcpp_node",
-    "/controller_server",
-    "/global_costmap/global_costmap",
-    "/holoagent_mujoco_bridge",
-    "/holoagent_stage4_eval",
-    "/lifecycle_manager_stage4",
-    "/local_costmap/local_costmap",
-    "/map_server",
-    "/planner_server",
-    "/sim_fixture",
-}
+from holoagent_mujoco.stage4_result import validate_stage4_node_names
 
 
 def _endpoint_name(endpoint: Any) -> str:
@@ -242,8 +227,11 @@ class Stage4Evaluator(Node):
             name: sorted(types) for name, types in self.get_topic_names_and_types()
         }
         self.graph_evidence = {"nodes": sorted(nodes), "topics": topics}
-        if nodes != EXPECTED_NODES:
-            return False, f"unexpected Stage 4 ROS nodes: {sorted(nodes)}"
+        try:
+            node_contract = validate_stage4_node_names(nodes)
+        except Exception as exc:
+            return False, str(exc)
+        self.graph_evidence["node_contract"] = node_contract
         required = {
             "/clock": "rosgraph_msgs/msg/Clock",
             "/cmd_vel": "geometry_msgs/msg/Twist",

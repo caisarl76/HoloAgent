@@ -17,6 +17,7 @@ def test_stage4_launch_is_minimal_nav2_without_localization_or_robot_drivers():
     ):
         assert f'package="{package}"' in text
     assert "yaml_filename" in text
+    assert "ParameterValue(map_yaml, value_type=str)" in text
     assert 'default_value="false"' in text
     assert "amcl" not in text.lower()
     assert "slam" not in text.lower()

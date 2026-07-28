@@ -49,6 +49,12 @@ def validate_nav2_parameters(
         raise Nav2ContractError("Nav2 velocity exceeds the bridge command envelope")
 
     bt = parameters["bt_navigator"]
+    if bt.get("navigators") != ["navigate_to_pose"]:
+        raise Nav2ContractError("Stage 4 must enable only NavigateToPose")
+    if bt.get("navigate_to_pose", {}).get("plugin") != (
+        "nav2_bt_navigator/NavigateToPoseNavigator"
+    ):
+        raise Nav2ContractError("Stage 4 NavigateToPose plugin mismatch")
     if bt.get("global_frame") != bridge.frames.map:
         raise Nav2ContractError("BT global frame must match sim_map")
     if bt.get("robot_base_frame") != bridge.frames.base:
@@ -77,6 +83,7 @@ def validate_nav2_parameters(
         "global_frame": bt["global_frame"],
         "odom_topic": bt["odom_topic"],
         "controller_plugin": plugin["plugin"],
+        "navigators": bt["navigators"],
         "lateral_velocity_range": [plugin["min_vel_y"], plugin["max_vel_y"]],
         "vy_samples": plugin["vy_samples"],
         "max_vel_x": max_x,

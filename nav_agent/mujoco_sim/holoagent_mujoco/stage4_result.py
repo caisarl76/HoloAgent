@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Any
 
@@ -29,7 +30,6 @@ from holoagent_mujoco.stage4_config import load_stage4_config
 
 EXPECTED_NODES = (
     "/bt_navigator",
-    "/bt_navigator_navigate_through_poses_rclcpp_node",
     "/bt_navigator_navigate_to_pose_rclcpp_node",
     "/controller_server",
     "/global_costmap/global_costmap",
@@ -110,7 +110,6 @@ EXPECTED_ACTION_TYPES = {
     "/compute_path_to_pose": "nav2_msgs/action/ComputePathToPose",
     "/follow_path": "nav2_msgs/action/FollowPath",
     "/navigate_to_pose": "nav2_msgs/action/NavigateToPose",
-    "/navigate_through_poses": "nav2_msgs/action/NavigateThroughPoses",
 }
 
 NAV2_PACKAGE_PREFIXES = {
@@ -123,6 +122,23 @@ NAV2_PACKAGE_PREFIXES = {
     "ros-humble-diagnostic-updater": "4.0.7-",
 }
 NAV2_PACKAGES = tuple(NAV2_PACKAGE_PREFIXES)
+TRANSFORM_LISTENER_PATTERN = re.compile(r"^/transform_listener_impl_[0-9a-f]{12}$")
+
+
+def validate_stage4_node_names(nodes: set[str]) -> dict[str, list[str]]:
+    generated = sorted(
+        name for name in nodes if TRANSFORM_LISTENER_PATTERN.fullmatch(name)
+    )
+    static = sorted(nodes - set(generated))
+    missing = sorted(set(EXPECTED_NODES) - set(static))
+    unexpected = sorted(set(static) - set(EXPECTED_NODES))
+    if missing or unexpected or len(generated) != 2:
+        raise PreflightError(
+            "unexpected Stage 4 nodes: "
+            f"missing={missing}, unexpected={unexpected}, "
+            f"transform_listeners={generated}"
+        )
+    return {"static": static, "transform_listeners": generated}
 
 
 def _require_exact(
@@ -147,13 +163,8 @@ def validate_stage4_graph(host: str, container: str) -> dict[str, Any]:
     if host != container:
         raise PreflightError("host and container Stage 4 graphs differ")
     sections = _parse_snapshot(host)
-    nodes = tuple(sorted(sections["nodes"]))
-    if nodes != EXPECTED_NODES:
-        missing = sorted(set(EXPECTED_NODES) - set(nodes))
-        unexpected = sorted(set(nodes) - set(EXPECTED_NODES))
-        raise PreflightError(
-            f"unexpected Stage 4 nodes: missing={missing}, unexpected={unexpected}"
-        )
+    nodes = set(sections["nodes"])
+    node_contract = validate_stage4_node_names(nodes)
     topics = _typed_lines(sections["topics"])
     services = _typed_lines(sections["services"])
     actions = _typed_lines(sections["actions"])
@@ -161,7 +172,8 @@ def validate_stage4_graph(host: str, container: str) -> dict[str, Any]:
     _require_exact(services, EXPECTED_SERVICE_TYPES, label="service")
     _require_exact(actions, EXPECTED_ACTION_TYPES, label="action")
     return {
-        "nodes": list(nodes),
+        "nodes": sorted(nodes),
+        "node_contract": node_contract,
         "topics": topics,
         "services": services,
         "actions": actions,

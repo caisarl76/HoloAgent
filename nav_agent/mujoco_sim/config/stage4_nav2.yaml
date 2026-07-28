@@ -128,6 +128,9 @@ bt_navigator:
     odom_topic: /robot_odom
     bt_loop_duration: 10
     default_server_timeout: 20
+    navigators: [navigate_to_pose]
+    navigate_to_pose:
+      plugin: nav2_bt_navigator/NavigateToPoseNavigator
     default_nav_to_pose_bt_xml: /workspace/HoloAgent/nav_agent/mujoco_sim/behavior_trees/stage4_navigate_to_pose.xml
     plugin_lib_names:
       - nav2_compute_path_to_pose_action_bt_node
@@ -135,9 +138,5 @@ bt_navigator:
       - nav2_pipeline_sequence_bt_node
 
 bt_navigator_navigate_to_pose_rclcpp_node:
-  ros__parameters:
-    use_sim_time: true
-
-bt_navigator_navigate_through_poses_rclcpp_node:
   ros__parameters:
     use_sim_time: true

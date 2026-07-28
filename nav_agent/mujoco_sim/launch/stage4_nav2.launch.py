@@ -2,6 +2,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -29,7 +30,10 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
                 parameters=[
                     params_file,
-                    {"use_sim_time": use_sim_time, "yaml_filename": map_yaml},
+                    {
+                        "use_sim_time": use_sim_time,
+                        "yaml_filename": ParameterValue(map_yaml, value_type=str),
+                    },
                 ],
             ),
             Node(

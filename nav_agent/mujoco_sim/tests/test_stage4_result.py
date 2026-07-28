@@ -17,7 +17,13 @@ from holoagent_mujoco.stage4_result import (
 
 
 def _snapshot() -> str:
-    sections = ["=== NODES ===", *EXPECTED_NODES, "=== TOPICS ==="]
+    sections = [
+        "=== NODES ===",
+        *EXPECTED_NODES,
+        "/transform_listener_impl_000000000001",
+        "/transform_listener_impl_000000000002",
+        "=== TOPICS ===",
+    ]
     sections.extend(f"{name} [{kind}]" for name, kind in EXPECTED_TOPIC_TYPES.items())
     sections.append("=== SERVICES ===")
     sections.extend(f"{name} [{kind}]" for name, kind in EXPECTED_SERVICE_TYPES.items())
@@ -28,13 +34,20 @@ def _snapshot() -> str:
 
 def test_stage4_graph_is_exact_and_identical_from_host_and_container():
     graph = validate_stage4_graph(_snapshot(), _snapshot())
-    assert graph["nodes"] == list(EXPECTED_NODES)
+    assert graph["node_contract"]["static"] == list(EXPECTED_NODES)
+    assert len(graph["node_contract"]["transform_listeners"]) == 2
     assert graph["topics"] == EXPECTED_TOPIC_TYPES
 
 
 def test_stage4_graph_rejects_physical_motion_participant():
     altered = _snapshot().replace("=== TOPICS ===", "/g1_pubvel_node\n=== TOPICS ===")
     with pytest.raises(PreflightError, match="unexpected Stage 4 nodes"):
+        validate_stage4_graph(altered, altered)
+
+
+def test_stage4_graph_rejects_wrong_transform_listener_count():
+    altered = _snapshot().replace("/transform_listener_impl_000000000002\n", "")
+    with pytest.raises(PreflightError, match="transform_listeners"):
         validate_stage4_graph(altered, altered)
 
 
