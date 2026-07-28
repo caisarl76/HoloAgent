@@ -50,45 +50,27 @@ container_pid_alive() {
 stop_container_pid() {
   local pid="$1"
   if [[ -z "${pid}" ]]; then return; fi
-  if container_pid_alive "${pid}"; then
-    docker exec "${container_name}" kill -INT "${pid}" >/dev/null 2>&1 || true
+  for signal in INT TERM KILL; do
+    if ! container_pid_alive "${pid}"; then break; fi
+    docker exec "${container_name}" kill -"${signal}" "${pid}" >/dev/null 2>&1 || true
     for _attempt in 1 2 3 4 5; do
       if ! container_pid_alive "${pid}"; then break; fi
       sleep 1
     done
-  fi
-  if container_pid_alive "${pid}"; then
-    docker exec "${container_name}" kill -TERM "${pid}" >/dev/null 2>&1 || true
-    for _attempt in 1 2 3 4 5; do
-      if ! container_pid_alive "${pid}"; then break; fi
-      sleep 1
-    done
-  fi
-  if container_pid_alive "${pid}"; then
-    docker exec "${container_name}" kill -KILL "${pid}" >/dev/null 2>&1 || true
-  fi
+  done
 }
 
 stop_host_pid() {
   local pid="$1"
   if [[ -z "${pid}" ]]; then return; fi
-  if kill -0 "${pid}" 2>/dev/null; then
-    kill -INT "${pid}" 2>/dev/null || true
+  for signal in INT TERM KILL; do
+    if ! kill -0 "${pid}" 2>/dev/null; then break; fi
+    kill -"${signal}" "${pid}" 2>/dev/null || true
     for _attempt in 1 2 3 4 5; do
       if ! kill -0 "${pid}" 2>/dev/null; then break; fi
       sleep 1
     done
-  fi
-  if kill -0 "${pid}" 2>/dev/null; then
-    kill -TERM "${pid}" 2>/dev/null || true
-    for _attempt in 1 2 3 4 5; do
-      if ! kill -0 "${pid}" 2>/dev/null; then break; fi
-      sleep 1
-    done
-  fi
-  if kill -0 "${pid}" 2>/dev/null; then
-    kill -KILL "${pid}" 2>/dev/null || true
-  fi
+  done
   wait "${pid}" 2>/dev/null || true
 }
 
@@ -136,6 +118,8 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "${repo_root}/outputs/mujoco_holoagent"
+ros2 daemon stop >/dev/null 2>&1 || true
+sleep 1
 "${python_bin}" -m holoagent_mujoco.stage2_result \
   --config "${config_path}" \
   --run-dir "${run_dir}" \

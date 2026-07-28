@@ -31,7 +31,8 @@ def test_stage2_launcher_records_exact_host_and_container_pids():
     assert "evaluator_host_pid=$!" in text
     assert "converter.container.pid" in text
     assert "evaluator.container.pid" in text
-    assert 'kill -INT "${pid}"' in text
+    assert "for signal in INT TERM KILL" in text
+    assert 'kill -"${signal}" "${pid}"' in text
     assert "pkill" not in text
     assert "killall" not in text
     assert "jobs -p" not in text
@@ -54,6 +55,7 @@ def test_stage2_launcher_graph_gates_measurement_and_promotes_atomically():
     assert "--evaluator-exit-status" in text
     assert approval < graph  # path declaration precedes external graph gate
     assert "ros2 action list -t | sort" in text
+    assert "ros2 daemon stop" in text
 
 
 def test_stage2_launcher_contains_no_robot_or_remote_target():
