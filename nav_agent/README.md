@@ -68,6 +68,8 @@ Unitree G1 真机部署前，请先阅读 [DEPLOY_UNITREE_G1.md](DEPLOY_UNITREE_
 如果当前没有机器人硬件，按
 [SIMULATION_FASTLIVO_NAVAGENT.md](SIMULATION_FASTLIVO_NAVAGENT.md)
 把 Habitat 语义测试、MuJoCo/FastLIVO 传感器仿真、NavAgent dry-run 分开验证。
+当前仓库的 MuJoCo-first Stage 1–4 实现、证据查看命令和 PC2 无运动交接步骤见
+[mujoco_sim/README.md](mujoco_sim/README.md)。
 以下命令从仓库根目录 `/home/jihun/work/HoloAgent` 执行。建议先走
 Docker 内安全 dry-run，不在宿主机安装 NavAgent 依赖：
 

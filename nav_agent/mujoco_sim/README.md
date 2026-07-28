@@ -1,4 +1,4 @@
-# HoloAgent Stage 1 MuJoCo Base Contract
+# HoloAgent MuJoCo-First Navigation Commissioning
 
 This package validates the G1 navigation base contract in MuJoCo before any
 real-robot execution. It accepts a conservative `/cmd_vel`, drives only the
@@ -82,5 +82,149 @@ The evaluator first writes `result.pending.json`. Only successful postflight
 atomically creates the authoritative `result.json`; an interrupted run cannot
 leave an authoritative PASS behind.
 
-Stages 2–4 remain separate work: synthetic Livox, LIO/LIVO, and simulator-native
-semantic Nav2 validation must not be inferred from a Stage 1 pass.
+## Commissioning stages
+
+Each label is deliberately narrow:
+
+| Stage | Required result | What it establishes |
+|---|---|---|
+| 1 | `PASS_SIM_ODOM` | base command, clock, odometry, sensor-rate, and stop contracts |
+| 2 | `PASS_SYNTHETIC_LIVOX` | deterministic raw and Livox-format lidar contracts |
+| 3 | `PASS_LIO_ONLY` or recorded `FAIL_ESTIMATOR` | FastLIVO quality against MuJoCo truth; failure does not block Stage 4 |
+| 4 | `PASS_SIM_SEMANTIC_PLUMBING` | fixed phrase → `sim_fixture` → Nav2 → bounded MuJoCo motion |
+
+Stage 4 uses a deterministic `sim_map` generated from the known MuJoCo room.
+It prohibits the real-building map by exact path and validates the generated
+YAML and PGM hashes before approval. The fixed `sim_fixture` pose is checked
+against inflated free space. This proves frame-consistent HoloAgent navigation
+plumbing, not FSR-VLN semantic accuracy in the synthetic scene.
+
+Run later stages only in the dedicated no-device container described by the
+commissioning design:
+
+```bash
+bash nav_agent/mujoco_sim/scripts/run_stage2.sh
+bash nav_agent/mujoco_sim/scripts/run_stage3.sh
+bash nav_agent/mujoco_sim/scripts/run_stage4.sh
+```
+
+Stage 3's estimator result must be retained even when it fails. Stage 4 is
+allowed to continue with simulator ground-truth localization because its map
+and navigation gate do not consume Stage 3 output.
+
+## View results
+
+Set a run directory explicitly so failed exploratory runs are not confused
+with the authoritative result:
+
+```bash
+stage4_run=outputs/mujoco_holoagent/20260728T035826Z
+```
+
+Show the qualified label, every gate, and motion metrics:
+
+```bash
+python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print("status:",r["status"]); print("label:",r["label"]); print("postflight:",r["postflight_pass"]); print("gates:"); [print(f"  {k}: {v}") for k,v in r["gates"].items()]; print("metrics:"); [print(f"  {k}: {v}") for k,v in r["metrics"].items()]' "$stage4_run/result.json"
+```
+
+The Stage 4 motion evidence is numeric and headless. Inspect the planned path
+size, final error, command envelope, collision count, and stop behavior with:
+
+```bash
+python3 -c 'import json,sys; m=json.load(open(sys.argv[1]))["metrics"]; keys=("path_pose_count","position_error_m","yaw_error_deg","max_abs_cmd_x","max_abs_cmd_y","max_abs_cmd_yaw","max_scene_collision_count","zero_latency_sec","settle_latency_sec"); [print(f"{k}: {m[k]}") for k in keys]' "$stage4_run/result.json"
+rg 'Received a goal|Reached the goal|Goal succeeded' "$stage4_run/nav2.log"
+```
+
+Open the exact simulator occupancy map on a graphical workstation:
+
+```bash
+xdg-open "$stage4_run/sim_map.pgm"
+```
+
+Inspect DDS parity and the approved graph:
+
+```bash
+diff -u "$stage4_run/host_graph.txt" "$stage4_run/container_graph.txt"
+sed -n '1,220p' "$stage4_run/host_graph.txt"
+python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps(r["graph"]["node_contract"],indent=2)); print(json.dumps(r["graph"]["use_sim_time"],indent=2))' "$stage4_run/stage4_graph_ready.json"
+```
+
+After shutdown, both postflight graph files may contain only the ROS CLI's
+built-in `/parameter_events` and `/rosout` topics; no nodes, services, or
+actions may remain:
+
+```bash
+cat "$stage4_run/postflight_host_graph.txt"
+cat "$stage4_run/postflight_container_graph.txt"
+```
+
+For Stage 2 sensor rates and point density:
+
+```bash
+stage2_run=outputs/mujoco_holoagent/20260724T055647Z
+python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["label"]); print(json.dumps(r["metrics"],indent=2,sort_keys=True))' "$stage2_run/result.json"
+```
+
+For the Stage 3 estimator error and its qualified or failed label:
+
+```bash
+stage3_run=outputs/mujoco_holoagent/20260727T023738Z
+python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["status"],r["label"],r["first_failing_gate"]); print(json.dumps(r["metrics"],indent=2,sort_keys=True))' "$stage3_run/result.json"
+```
+
+## HoloAgent-0 workstation scope
+
+The repository-level HoloAgent-0 stack combines Embodied AgentOS, 3D spatial
+memory, embodied skills, and FSR-VLN. For navigation, FSR-VLN/HMSG retrieves a
+semantic target and publishes `/object_pose`; Nav2 and the robot adapter execute
+the goal. Stage 0 validates the restored semantic query path. Stages 1–4 then
+validate the simulator command, sensor, estimator, and navigation layers. See
+`docs/user_guide/Intruduction.md` and `nav_agent/README.md` for the wider stack.
+
+## PC2 no-motion handoff
+
+`PASS_SIM_SEMANTIC_PLUMBING` authorizes preparation checks only. It does not
+authorize a real G1 command. On PC2, keep the motion bridge disabled and use a
+separate commissioning domain:
+
+```bash
+source robots/unitree/install_pc2/setup.bash
+export ROS_DOMAIN_ID=78
+
+pgrep -x g1_pubvel_node
+pgrep -x g1_pubmove_node
+pgrep -x g1_pubcmd_node
+ip -brief link show enP8p1s0
+```
+
+All three `pgrep` commands must produce no output. Linkage and architecture
+checks are read-only; apply them to the PC2-installed executables before any
+launch:
+
+```bash
+file robots/unitree/install_pc2/g1_move/lib/g1_move/g1_pubvel_node
+ldd robots/unitree/install_pc2/g1_move/lib/g1_move/g1_pubvel_node
+```
+
+Verify topic names and rates by subscribing only:
+
+```bash
+ros2 topic list -t
+ros2 topic hz --window 20 /livox/lidar
+ros2 topic hz --window 200 /livox/imu
+ros2 topic hz --window 30 /camera/color/image_raw
+```
+
+Preview the semantic stack with every motion switch off:
+
+```bash
+START_G1_PUBVEL=0 \
+G1_DRY_RUN=1 \
+ALLOW_G1_MOTION=0 \
+PRINT_SEM_NAV_COMMANDS=1 \
+bash nav_agent/scripts/run_sem_nav.sh
+```
+
+Do not start `g1_pubvel_node`, `g1_pubmove_node`, or `g1_pubcmd_node` during
+this handoff. Physical movement requires a later explicit operator approval,
+an available emergency stop, and a separate robot-mode readiness check.
