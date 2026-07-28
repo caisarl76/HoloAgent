@@ -114,8 +114,13 @@ class Stage4Evaluator(Node):
                 "planner_server",
                 "controller_server",
                 "bt_navigator",
+                "bt_navigator_navigate_to_pose_rclcpp_node",
+                "bt_navigator_navigate_through_poses_rclcpp_node",
+                "global_costmap/global_costmap",
+                "local_costmap/local_costmap",
                 "lifecycle_manager_stage4",
                 "sim_fixture",
+                "holoagent_mujoco_bridge",
             )
         }
 

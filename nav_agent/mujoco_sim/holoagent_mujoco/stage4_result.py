@@ -47,14 +47,22 @@ EXPECTED_NODES = (
 # expected to expose any distribution-specific Nav2 endpoints before approval.
 EXPECTED_TOPIC_TYPES = {
     "/behavior_tree_log": "nav2_msgs/msg/BehaviorTreeLog",
+    "/bond": "bond/msg/Status",
+    "/bt_navigator/transition_event": "lifecycle_msgs/msg/TransitionEvent",
     "/camera/color/camera_info": "sensor_msgs/msg/CameraInfo",
     "/camera/color/image_raw": "sensor_msgs/msg/Image",
     "/clock": "rosgraph_msgs/msg/Clock",
     "/cmd_vel": "geometry_msgs/msg/Twist",
+    "/controller_server/transition_event": "lifecycle_msgs/msg/TransitionEvent",
+    "/cost_cloud": "sensor_msgs/msg/PointCloud2",
+    "/diagnostics": "diagnostic_msgs/msg/DiagnosticArray",
+    "/evaluation": "dwb_msgs/msg/LocalPlanEvaluation",
     "/global_costmap/costmap": "nav_msgs/msg/OccupancyGrid",
     "/global_costmap/costmap_raw": "nav2_msgs/msg/Costmap",
     "/global_costmap/costmap_updates": "map_msgs/msg/OccupancyGridUpdate",
-    "/global_costmap/footprint": "geometry_msgs/msg/PolygonStamped",
+    "/global_costmap/footprint": "geometry_msgs/msg/Polygon",
+    "/global_costmap/global_costmap/transition_event": "lifecycle_msgs/msg/TransitionEvent",
+    "/global_costmap/published_footprint": "geometry_msgs/msg/PolygonStamped",
     "/goal_pose": "geometry_msgs/msg/PoseStamped",
     "/holoagent_sim/applied_cmd_vel": "geometry_msgs/msg/Twist",
     "/holoagent_sim/collision_count": "std_msgs/msg/UInt32",
@@ -63,17 +71,26 @@ EXPECTED_TOPIC_TYPES = {
     "/local_costmap/costmap": "nav_msgs/msg/OccupancyGrid",
     "/local_costmap/costmap_raw": "nav2_msgs/msg/Costmap",
     "/local_costmap/costmap_updates": "map_msgs/msg/OccupancyGridUpdate",
-    "/local_costmap/footprint": "geometry_msgs/msg/PolygonStamped",
+    "/local_costmap/footprint": "geometry_msgs/msg/Polygon",
+    "/local_costmap/local_costmap/transition_event": "lifecycle_msgs/msg/TransitionEvent",
+    "/local_costmap/published_footprint": "geometry_msgs/msg/PolygonStamped",
+    "/local_plan": "nav_msgs/msg/Path",
     "/map": "nav_msgs/msg/OccupancyGrid",
-    "/map_updates": "map_msgs/msg/OccupancyGridUpdate",
+    "/map_server/transition_event": "lifecycle_msgs/msg/TransitionEvent",
+    "/marker": "visualization_msgs/msg/MarkerArray",
     "/object_pose": "geometry_msgs/msg/PoseStamped",
+    "/odom": "nav_msgs/msg/Odometry",
     "/parameter_events": "rcl_interfaces/msg/ParameterEvent",
     "/plan": "nav_msgs/msg/Path",
+    "/planner_server/transition_event": "lifecycle_msgs/msg/TransitionEvent",
+    "/received_global_plan": "nav_msgs/msg/Path",
     "/robot_odom": "nav_msgs/msg/Odometry",
     "/rosout": "rcl_interfaces/msg/Log",
     "/sim_fixture/query": "std_msgs/msg/String",
+    "/speed_limit": "nav2_msgs/msg/SpeedLimit",
     "/tf": "tf2_msgs/msg/TFMessage",
     "/tf_static": "tf2_msgs/msg/TFMessage",
+    "/transformed_global_plan": "nav_msgs/msg/Path",
 }
 
 EXPECTED_SERVICE_TYPES = {
@@ -99,15 +116,39 @@ EXPECTED_SERVICE_TYPES.update(
         "/map_server/get_available_transitions": "lifecycle_msgs/srv/GetAvailableTransitions",
         "/map_server/get_transition_graph": "lifecycle_msgs/srv/GetAvailableTransitions",
         "/map_server/load_map": "nav2_msgs/srv/LoadMap",
+        "/map_server/map": "nav_msgs/srv/GetMap",
         "/planner_server/change_state": "lifecycle_msgs/srv/ChangeState",
         "/planner_server/get_state": "lifecycle_msgs/srv/GetState",
         "/planner_server/get_available_states": "lifecycle_msgs/srv/GetAvailableStates",
         "/planner_server/get_available_transitions": "lifecycle_msgs/srv/GetAvailableTransitions",
         "/planner_server/get_transition_graph": "lifecycle_msgs/srv/GetAvailableTransitions",
+        "/is_path_valid": "nav2_msgs/srv/IsPathValid",
+        "/lifecycle_manager_stage4/is_active": "std_srvs/srv/Trigger",
+        "/lifecycle_manager_stage4/manage_nodes": "nav2_msgs/srv/ManageLifecycleNodes",
+        "/global_costmap/clear_around_global_costmap": "nav2_msgs/srv/ClearCostmapAroundRobot",
+        "/global_costmap/clear_entirely_global_costmap": "nav2_msgs/srv/ClearEntireCostmap",
+        "/global_costmap/clear_except_global_costmap": "nav2_msgs/srv/ClearCostmapExceptRegion",
+        "/global_costmap/get_costmap": "nav2_msgs/srv/GetCostmap",
+        "/local_costmap/clear_around_local_costmap": "nav2_msgs/srv/ClearCostmapAroundRobot",
+        "/local_costmap/clear_entirely_local_costmap": "nav2_msgs/srv/ClearEntireCostmap",
+        "/local_costmap/clear_except_local_costmap": "nav2_msgs/srv/ClearCostmapExceptRegion",
+        "/local_costmap/get_costmap": "nav2_msgs/srv/GetCostmap",
     }
 )
 
+for costmap in ("/global_costmap/global_costmap", "/local_costmap/local_costmap"):
+    EXPECTED_SERVICE_TYPES.update(
+        {
+            f"{costmap}/change_state": "lifecycle_msgs/srv/ChangeState",
+            f"{costmap}/get_state": "lifecycle_msgs/srv/GetState",
+            f"{costmap}/get_available_states": "lifecycle_msgs/srv/GetAvailableStates",
+            f"{costmap}/get_available_transitions": "lifecycle_msgs/srv/GetAvailableTransitions",
+            f"{costmap}/get_transition_graph": "lifecycle_msgs/srv/GetAvailableTransitions",
+        }
+    )
+
 EXPECTED_ACTION_TYPES = {
+    "/compute_path_through_poses": "nav2_msgs/action/ComputePathThroughPoses",
     "/compute_path_to_pose": "nav2_msgs/action/ComputePathToPose",
     "/follow_path": "nav2_msgs/action/FollowPath",
     "/navigate_to_pose": "nav2_msgs/action/NavigateToPose",
