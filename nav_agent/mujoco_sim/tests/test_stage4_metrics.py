@@ -68,3 +68,40 @@ def test_collision_or_lateral_command_fails_without_overclaim():
     assert result["qualified_pass"] is None
     assert result["first_failing_gate"] == "command_bounds"
     assert result["gates"]["collision_free"] is False
+
+
+def test_headerless_commands_may_share_a_clock_tick_but_never_reverse_time():
+    kwargs = {
+        "expected_fixture": Pose2D(1.25, 0.0, 0.0),
+        "observed_fixture": Pose2D(1.25, 0.0, 0.0),
+        "final_pose": Pose2D(1.25, 0.0, 0.0),
+        "path_pose_count": 2,
+        "action_succeeded": True,
+        "max_scene_collision_count": 0,
+        "zero_latency_sec": 0.1,
+        "settle_latency_sec": 0.1,
+        "stopped_hold_sec": 1.0,
+        "simulated_duration_sec": 1.0,
+        "wall_duration_sec": 1.0,
+        "graph_approved": True,
+        "map_approved": True,
+        "all_use_sim_time": True,
+        "limits": Stage4Limits(),
+    }
+    shared_tick = evaluate_stage4(
+        **kwargs,
+        commands=(
+            VelocitySample(1_000, 0.1, 0.0, 0.0),
+            VelocitySample(1_000, 0.1, 0.0, 0.0),
+        ),
+    )
+    assert shared_tick["gates"]["message_finite"] is True
+
+    reversed_time = evaluate_stage4(
+        **kwargs,
+        commands=(
+            VelocitySample(1_001, 0.1, 0.0, 0.0),
+            VelocitySample(1_000, 0.1, 0.0, 0.0),
+        ),
+    )
+    assert reversed_time["gates"]["message_finite"] is False

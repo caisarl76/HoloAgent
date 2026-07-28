@@ -61,14 +61,14 @@ def evaluate_stage4(
         and all(math.isfinite(value) for value in (sample.x, sample.y, sample.yaw))
         for sample in commands
     )
-    monotonic = all(
-        current.stamp_ns > previous.stamp_ns
+    chronological = all(
+        current.stamp_ns >= previous.stamp_ns
         for previous, current in zip(commands, commands[1:])
     )
     command_bounds = (
         bool(commands)
         and finite
-        and monotonic
+        and chronological
         and all(
             abs(sample.x) <= limits.max_linear_x + 1e-9
             and abs(sample.y) <= limits.max_linear_y + 1e-9
@@ -91,7 +91,7 @@ def evaluate_stage4(
         "graph": bool(graph_approved),
         "map": bool(map_approved),
         "use_sim_time": bool(all_use_sim_time),
-        "message_finite": finite and monotonic,
+        "message_finite": finite and chronological,
         "sim_fixture": fixture_position_error <= 1e-6 and fixture_yaw_error <= 1e-6,
         "path": path_pose_count >= 2,
         "command_bounds": command_bounds and commanded_motion,
