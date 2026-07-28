@@ -7,6 +7,7 @@ RUNNER = PACKAGE_ROOT / "scripts" / "run_stage4.sh"
 THROUGH_POSES_TREE = (
     PACKAGE_ROOT / "behavior_trees" / "stage4_navigate_through_poses.xml"
 )
+EVALUATOR = PACKAGE_ROOT / "holoagent_mujoco" / "stage4_eval.py"
 
 
 def test_stage4_launch_is_minimal_nav2_without_localization_or_robot_drivers():
@@ -49,7 +50,11 @@ def test_stage4_runner_is_fail_closed_before_query_motion():
     assert "stage4_graph_ready.json" in text
     assert "stage4_graph_approved.sha256" in text
     assert text.index("--graph-host") < text.index("stage4_graph_approved.sha256")
-    assert "autostart:=true" in text
+    assert "autostart:=false" in text
+    assert "stage4_activate" in text
+    assert "stage4_activation.json" in text
+    assert "--activation ${container_run_dir}/stage4_activation.json" in text
+    assert text.index("stage4_activate") < text.index("stage4_eval")
     assert "ros2 action list -t" in text
     assert "result.pending.json" in text
     assert "result.json" in text
@@ -62,3 +67,12 @@ def test_stage4_runner_has_no_physical_transport_or_broad_cleanup():
     assert "ssh " not in text
     assert "pkill" not in text
     assert "killall" not in text
+
+
+def test_stage4_evaluator_queries_helper_clocks_and_times_only_approved_motion():
+    text = EVALUATOR.read_text(encoding="utf-8")
+    assert '"bt_navigator_navigate_to_pose_rclcpp_node"' in text
+    assert '"bt_navigator_navigate_through_poses_rclcpp_node"' in text
+    assert 'values["configured/bt_navigator_navigate_to_pose_rclcpp_node"] = True' not in text
+    assert "measurement_wall_start = time.monotonic()" in text
+    assert "wall_duration_sec=time.monotonic() - measurement_wall_start" in text

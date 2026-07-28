@@ -35,6 +35,7 @@ def evaluate_stage3(
     use_sim_time: dict[str, bool],
     calibration_match: bool,
     perfect_odom_isolated: bool,
+    sensor_contract: dict[str, object],
     message_errors: tuple[str, ...] = (),
 ) -> dict[str, object]:
     finite = _finite_monotonic(ground_truth) and _finite_monotonic(estimates)
@@ -56,11 +57,20 @@ def evaluate_stage3(
     yaw_rmse = _rmse(yaw_errors)
     estimate_hz = len(estimates) / limits.duration_sec
     excitation_m, excitation_yaw_deg = _excitation(truth)
+    sensor_gates = sensor_contract.get("gates")
+    sensor_contract_pass = (
+        sensor_contract.get("status") == "PASS"
+        and sensor_contract.get("label") == "PASS_SYNTHETIC_LIVOX"
+        and isinstance(sensor_gates, dict)
+        and bool(sensor_gates)
+        and all(bool(value) for value in sensor_gates.values())
+    )
 
     gates = {
         "graph": bool(graph_approved),
         "use_sim_time": bool(use_sim_time) and all(use_sim_time.values()),
         "calibration": bool(calibration_match),
+        "sensor_contract": sensor_contract_pass,
         "perfect_odom_isolated": bool(perfect_odom_isolated),
         "message_finite": finite and not message_errors,
         "estimate_stream": len(aligned) >= math.ceil(
@@ -98,6 +108,7 @@ def evaluate_stage3(
             "excitation_yaw_deg": excitation_yaw_deg,
             "message_contract_errors": list(message_errors),
             "use_sim_time": dict(use_sim_time),
+            "sensor_contract": sensor_contract,
         },
     }
 

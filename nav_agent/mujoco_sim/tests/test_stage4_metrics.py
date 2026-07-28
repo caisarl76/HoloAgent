@@ -22,6 +22,7 @@ def _passing_result():
         path_pose_count=20,
         action_succeeded=True,
         max_scene_collision_count=0,
+        collision_sample_count=4000,
         zero_latency_sec=0.2,
         settle_latency_sec=0.8,
         stopped_hold_sec=1.1,
@@ -53,6 +54,7 @@ def test_collision_or_lateral_command_fails_without_overclaim():
         path_pose_count=2,
         action_succeeded=True,
         max_scene_collision_count=1,
+        collision_sample_count=2000,
         zero_latency_sec=0.1,
         settle_latency_sec=0.1,
         stopped_hold_sec=1.0,
@@ -78,6 +80,7 @@ def test_headerless_commands_may_share_a_clock_tick_but_never_reverse_time():
         "path_pose_count": 2,
         "action_succeeded": True,
         "max_scene_collision_count": 0,
+        "collision_sample_count": 200,
         "zero_latency_sec": 0.1,
         "settle_latency_sec": 0.1,
         "stopped_hold_sec": 1.0,
@@ -105,3 +108,32 @@ def test_headerless_commands_may_share_a_clock_tick_but_never_reverse_time():
         ),
     )
     assert reversed_time["gates"]["message_finite"] is False
+
+
+def test_missing_collision_telemetry_cannot_pass_as_collision_free():
+    kwargs = {
+        "expected_fixture": Pose2D(1.25, 0.0, 0.0),
+        "observed_fixture": Pose2D(1.25, 0.0, 0.0),
+        "final_pose": Pose2D(1.25, 0.0, 0.0),
+        "commands": (VelocitySample(1, 0.1, 0.0, 0.0),),
+        "path_pose_count": 2,
+        "action_succeeded": True,
+        "max_scene_collision_count": 0,
+        "collision_sample_count": 0,
+        "zero_latency_sec": 0.1,
+        "settle_latency_sec": 0.1,
+        "stopped_hold_sec": 1.0,
+        "simulated_duration_sec": 10.0,
+        "wall_duration_sec": 10.0,
+        "graph_approved": True,
+        "map_approved": True,
+        "all_use_sim_time": True,
+        "limits": Stage4Limits(),
+    }
+
+    result = evaluate_stage4(**kwargs)
+
+    assert result["status"] == "FAIL"
+    assert result["first_failing_gate"] == "collision_stream"
+    assert result["gates"]["collision_stream"] is False
+    assert result["gates"]["collision_free"] is False

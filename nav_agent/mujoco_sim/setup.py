@@ -33,6 +33,7 @@ setup(
             "stage4_fixture = holoagent_mujoco.stage4_fixture:main",
             "stage4_eval = holoagent_mujoco.stage4_eval:main",
             "stage4_prepare = holoagent_mujoco.stage4_prepare:main",
+            "stage4_activate = holoagent_mujoco.stage4_activate:main",
         ]
     },
 )

@@ -7,9 +7,11 @@ config_path="${1:-${repo_root}/nav_agent/mujoco_sim/config/stage2.yaml}"
 python_bin="/home/jihun/work/GR00T-WholeBodyControl/.venv_sim/bin/python"
 container_name="${HOLOAGENT_STAGE3_CONTAINER:-holoagent-stages234}"
 container_root="/workspace/HoloAgent"
-vikit_install="${HOLOAGENT_STAGE3_VIKIT_INSTALL:-/tmp/holoagent-stage3-build-20260724a/install}"
-fastlivo_install="${HOLOAGENT_STAGE3_FASTLIVO_INSTALL:-/tmp/holoagent-stage3-build-20260724b/install}"
 run_id="$(date -u +%Y%m%dT%H%M%SZ)"
+stage3_build_root="/tmp/holoagent-stage3-build-${run_id}"
+stage3_source_root="/tmp/holoagent-stage3-source-${run_id}"
+vikit_install="${stage3_build_root}/vikit/install"
+fastlivo_install="${stage3_build_root}/fastlivo/install"
 run_dir="${repo_root}/outputs/mujoco_holoagent/${run_id}"
 container_run_dir="${container_root}/outputs/mujoco_holoagent/${run_id}"
 converter_build="/tmp/holoagent-stage3-converter-${run_id}"
@@ -123,11 +125,45 @@ cp -- "${config_path}" "${run_dir}/stage3.yaml"
   >"${run_dir}/calibration.log" 2>&1
 
 docker exec "${container_name}" bash -lc "
-  test -x ${fastlivo_install}/fast_livo/lib/fast_livo/fastlivo_mapping
-  sha256sum ${fastlivo_install}/fast_livo/lib/fast_livo/fastlivo_mapping
-  sha256sum ${container_root}/agentic_robot/core/src/fast_livo/CMakeLists.txt
-  sha256sum ${container_root}/nav_agent/mujoco_sim/overlays/fast_livo_generated_interface.patch
-" >"${run_dir}/fastlivo_artifacts.sha256"
+  set -e
+  test ! -e ${stage3_build_root}
+  test ! -e ${stage3_source_root}
+  mkdir -p ${stage3_source_root}
+  cp -a ${container_root}/agentic_robot/core/src/fast_livo ${stage3_source_root}/fast_livo
+  cd ${stage3_source_root}/fast_livo
+  patch -p1 --batch --forward \
+    -i ${container_root}/nav_agent/mujoco_sim/overlays/fast_livo_generated_interface.patch
+  set +u
+  source /opt/ros/humble/setup.bash
+  source /livox/livox_ws/install/setup.bash
+  set -u
+  cd ${container_root}
+  colcon --log-base ${stage3_build_root}/vikit/log build \
+    --base-paths agentic_robot/thirdparty/src/rpg_vikit-ros2 \
+    --packages-select vikit_common vikit_ros \
+    --build-base ${stage3_build_root}/vikit/build \
+    --install-base ${stage3_build_root}/vikit/install \
+    --parallel-workers 1 --cmake-args -DCMAKE_BUILD_TYPE=Release
+  set +u
+  source ${stage3_build_root}/vikit/install/setup.bash
+  set -u
+  colcon --log-base ${stage3_build_root}/fastlivo/log build \
+    --base-paths ${stage3_source_root}/fast_livo \
+    --packages-select fast_livo \
+    --build-base ${stage3_build_root}/fastlivo/build \
+    --install-base ${stage3_build_root}/fastlivo/install \
+    --parallel-workers 1 --cmake-args -DCMAKE_BUILD_TYPE=Release
+" >"${run_dir}/stage3_build.log" 2>&1
+
+docker exec "${container_name}" bash -lc "
+  export PYTHONPATH=${container_root}/nav_agent/mujoco_sim
+  python3 -m holoagent_mujoco.stage3_build \
+    --workspace ${container_root} \
+    --build-root ${stage3_build_root} \
+    --source-overlay ${stage3_source_root} \
+    --build-log ${container_run_dir}/stage3_build.log \
+    --output ${container_run_dir}/stage3_build_manifest.json
+" >"${run_dir}/stage3_build_manifest.log" 2>&1
 
 docker exec "${container_name}" bash -lc "
   set -e
@@ -216,7 +252,7 @@ converter_container_pid="$(<"${run_dir}/converter.container.pid")"
 fastlivo_container_pid="$(<"${run_dir}/fastlivo.container.pid")"
 evaluator_container_pid="$(<"${run_dir}/evaluator.container.pid")"
 
-graph_command="printf '=== NODES ===\\n'; ros2 node list --no-daemon | sort; printf '=== TOPICS ===\\n'; ros2 topic list --no-daemon -t | sort; printf '=== SERVICES ===\\n'; ros2 service list --no-daemon -t | sort; printf '=== ACTIONS ===\\n'"
+graph_command="printf '=== NODES ===\\n'; ros2 node list --no-daemon | sort; printf '=== TOPICS ===\\n'; ros2 topic list --no-daemon -t | sort; printf '=== SERVICES ===\\n'; ros2 service list --no-daemon -t | sort; printf '=== ACTIONS ===\\n'; ros2 action list -t | sort"
 bash -lc "source /opt/ros/humble/setup.bash; ${graph_command}" >"${run_dir}/host_graph.txt"
 docker exec --env ROS_DOMAIN_ID=77 --env ROS_LOCALHOST_ONLY=1 \
   --env ROS2CLI_DISABLE_DAEMON=1 --env RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \

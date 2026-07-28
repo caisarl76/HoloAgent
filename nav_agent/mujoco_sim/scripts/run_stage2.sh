@@ -223,7 +223,7 @@ fi
 converter_container_pid="$(<"${run_dir}/converter.container.pid")"
 evaluator_container_pid="$(<"${run_dir}/evaluator.container.pid")"
 
-graph_command="printf '=== NODES ===\\n'; ros2 node list --no-daemon | sort; printf '=== TOPICS ===\\n'; ros2 topic list --no-daemon -t | sort; printf '=== SERVICES ===\\n'; ros2 service list --no-daemon -t | sort; printf '=== ACTIONS ===\\n'"
+graph_command="printf '=== NODES ===\\n'; ros2 node list --no-daemon | sort; printf '=== TOPICS ===\\n'; ros2 topic list --no-daemon -t | sort; printf '=== SERVICES ===\\n'; ros2 service list --no-daemon -t | sort; printf '=== ACTIONS ===\\n'; ros2 action list -t | sort"
 bash -lc "source /opt/ros/humble/setup.bash; ${graph_command}" \
   >"${run_dir}/host_graph.txt"
 docker exec \

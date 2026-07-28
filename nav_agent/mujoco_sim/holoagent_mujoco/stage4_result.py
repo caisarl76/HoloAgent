@@ -23,6 +23,7 @@ from holoagent_mujoco.stage2_result import (
     _pid_alive,
     _typed_lines,
     _write_json,
+    collect_source_provenance,
     validate_container_contract,
 )
 from holoagent_mujoco.stage4_config import load_stage4_config
@@ -184,6 +185,28 @@ def validate_stage4_node_names(nodes: set[str]) -> dict[str, list[str]]:
     return {"static": static, "transform_listeners": generated}
 
 
+def validate_endpoint_ownership(
+    *,
+    publishers: set[str],
+    subscribers: set[str],
+    expected_publishers: set[str],
+    expected_subscribers: set[str],
+    topic: str,
+) -> dict[str, Any]:
+    if publishers != expected_publishers or subscribers != expected_subscribers:
+        raise PreflightError(
+            f"Stage 4 endpoint ownership mismatch for {topic}: "
+            f"publishers={sorted(publishers)}, subscribers={sorted(subscribers)}"
+        )
+    return {
+        "topic": topic,
+        "publishers": sorted(publishers),
+        "subscribers": sorted(subscribers),
+        "publisher_count": len(publishers),
+        "subscriber_count": len(subscribers),
+    }
+
+
 def _require_exact(
     actual: dict[str, str], expected: dict[str, str], *, label: str
 ) -> None:
@@ -206,6 +229,8 @@ def validate_stage4_graph(host: str, container: str) -> dict[str, Any]:
     if host != container:
         raise PreflightError("host and container Stage 4 graphs differ")
     sections = _parse_snapshot(host)
+    if len(sections["nodes"]) != len(set(sections["nodes"])):
+        raise PreflightError("duplicate Stage 4 nodes are forbidden")
     nodes = set(sections["nodes"])
     node_contract = validate_stage4_node_names(nodes)
     topics = _typed_lines(sections["topics"])
@@ -366,6 +391,9 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "PASS",
                 "gate": "postflight",
                 "container": container,
+                "provenance": collect_source_provenance(
+                    args.workspace_source, container
+                ),
                 "host_pids": args.host_pid,
                 "container_pids": args.container_pid,
                 "forbidden_processes": forbidden,

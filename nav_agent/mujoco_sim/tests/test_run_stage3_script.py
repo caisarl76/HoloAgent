@@ -19,6 +19,7 @@ def test_stage3_graph_serialization_uses_the_same_c_locale_on_both_sides():
     text = SCRIPT.read_text(encoding="utf-8")
     assert "export LC_ALL=C" in text
     assert "--env LC_ALL=C" in text
+    assert "ros2 action list -t | sort" in text
 
 
 def test_stage3_launcher_isolates_perfect_odom_and_gates_before_motion():
@@ -28,6 +29,19 @@ def test_stage3_launcher_isolates_perfect_odom_and_gates_before_motion():
     assert "stage3_graph_approved.sha256" in text
     assert "graph_preflight.log" in text
     assert "result.pending.json" in text and "result.json" in text
+
+
+def test_stage3_launcher_builds_fastlivo_from_a_unique_clean_source_overlay():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "holoagent-stage3-build-20260724" not in text
+    assert 'stage3_build_root="/tmp/holoagent-stage3-build-${run_id}"' in text
+    assert 'stage3_source_root="/tmp/holoagent-stage3-source-${run_id}"' in text
+    assert "cp -a ${container_root}/agentic_robot/core/src/fast_livo" in text
+    assert "patch -p1 --batch --forward" in text
+    assert "--packages-select vikit_common vikit_ros" in text
+    assert "--packages-select fast_livo" in text
+    assert "holoagent_mujoco.stage3_build" in text
+    assert "stage3_build_manifest.json" in text
 
 
 def test_stage3_cleanup_uses_only_recorded_exact_pids():

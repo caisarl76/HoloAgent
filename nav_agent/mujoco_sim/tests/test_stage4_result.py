@@ -10,6 +10,7 @@ from holoagent_mujoco.stage4_result import (
     EXPECTED_TOPIC_TYPES,
     parse_stage4_processes,
     validate_empty_graph,
+    validate_endpoint_ownership,
     validate_evaluator_status,
     validate_nav2_versions,
     validate_stage4_graph,
@@ -51,6 +52,14 @@ def test_stage4_graph_rejects_wrong_transform_listener_count():
         validate_stage4_graph(altered, altered)
 
 
+def test_stage4_graph_rejects_duplicate_node_rows():
+    altered = _snapshot().replace(
+        "=== TOPICS ===", "/controller_server\n=== TOPICS ==="
+    )
+    with pytest.raises(PreflightError, match="duplicate Stage 4 nodes"):
+        validate_stage4_graph(altered, altered)
+
+
 def test_stage4_process_parser_tracks_only_exact_simulation_components():
     output = """
 12 /opt/ros/humble/lib/nav2_controller/controller_server --ros-args
@@ -58,6 +67,38 @@ def test_stage4_process_parser_tracks_only_exact_simulation_components():
 14 /usr/bin/python3 unrelated.py
 """
     assert [item["pid"] for item in parse_stage4_processes(output)] == [12, 13]
+
+
+def test_stage4_endpoint_ownership_is_exact_and_serializable():
+    evidence = validate_endpoint_ownership(
+        publishers={"/controller_server"},
+        subscribers={"/holoagent_mujoco_bridge", "/holoagent_stage4_eval"},
+        expected_publishers={"/controller_server"},
+        expected_subscribers={
+            "/holoagent_mujoco_bridge",
+            "/holoagent_stage4_eval",
+        },
+        topic="/cmd_vel",
+    )
+    assert evidence == {
+        "topic": "/cmd_vel",
+        "publishers": ["/controller_server"],
+        "subscribers": [
+            "/holoagent_mujoco_bridge",
+            "/holoagent_stage4_eval",
+        ],
+        "publisher_count": 1,
+        "subscriber_count": 2,
+    }
+
+    with pytest.raises(PreflightError, match="ownership mismatch"):
+        validate_endpoint_ownership(
+            publishers=set(),
+            subscribers={"/holoagent_stage4_eval"},
+            expected_publishers={"/holoagent_mujoco_bridge"},
+            expected_subscribers={"/holoagent_stage4_eval"},
+            topic="/holoagent_sim/collision_count",
+        )
 
 
 def test_stage4_evaluator_exit_status_preserves_pass_or_failure():

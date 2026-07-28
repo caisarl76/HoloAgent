@@ -8,21 +8,32 @@ import time
 from typing import Any
 
 from geometry_msgs.msg import Twist
+from livox_ros_driver2.msg import CustomMsg
 from nav_msgs.msg import Odometry
+import numpy as np
 import rclpy
 from rcl_interfaces.srv import GetParameters
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from rosgraph_msgs.msg import Clock
+from sensor_msgs.msg import Image, Imu, PointCloud2
+
+from holoagent_livox_converter.converter_core import (
+    ConversionOptions,
+    decode_pointcloud,
+)
+from holoagent_livox_converter.stage2_collector import Stage2Collector
 
 from holoagent_livox_converter.stage2_eval import (
     EvalConfig,
     _endpoint_name,
+    _limits,
     _stamp_ns,
     load_eval_config,
     validate_calibration_evidence,
 )
+from holoagent_livox_converter.stage2_metrics import evaluate_stage2
 from holoagent_livox_converter.stage3_metrics import (
     PoseSample,
     Stage3Limits,
@@ -78,10 +89,22 @@ class Stage3Evaluator(Node):
         self.collect_end_ns: int | None = None
         self.ground_truth: list[PoseSample] = []
         self.estimates: list[PoseSample] = []
+        self.sensor_collector: Stage2Collector | None = None
         self.message_errors: list[str] = []
         self.graph_evidence: dict[str, Any] = {}
         self.active_gate = "graph"
         self._wall_deadline = time.monotonic() + 4.0 * 34.0 + 30.0
+        self._raw_options = ConversionOptions(
+            acquisition_mode=config.lidar.acquisition_mode,
+            scan_period_ns=round(config.lidar.scan_period_sec * 1_000_000_000),
+            min_finite_points=config.lidar.min_finite_points,
+            noise_std_m=0.0,
+            dropout_probability=0.0,
+            random_seed=config.lidar.random_seed,
+            reflectivity_override=None,
+            tag_override=None,
+            line_override=None,
+        )
 
         self._command = self.create_publisher(Twist, "/cmd_vel", 10)
         self.create_subscription(
@@ -92,6 +115,22 @@ class Stage3Evaluator(Node):
         )
         self.create_subscription(
             Odometry, "/aft_mapped_to_init", self._estimate_callback, 20
+        )
+        self.create_subscription(Imu, "/livox/imu", self._imu, qos_profile_sensor_data)
+        self.create_subscription(
+            Image,
+            "/camera/color/image_raw",
+            self._camera,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            PointCloud2,
+            "/holoagent_sim/lidar_points",
+            self._raw_lidar,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            CustomMsg, "/livox/lidar", self._custom_lidar, qos_profile_sensor_data
         )
         self._parameter_clients = {
             "bridge": self.create_client(
@@ -120,6 +159,10 @@ class Stage3Evaluator(Node):
         )
         perfect_odom_isolated = self._perfect_odom_isolated()
 
+        self.sensor_collector = Stage2Collector(
+            warmup_sec=self.config.thresholds.warmup_sec,
+            rate_window_sec=self.config.thresholds.rate_window_sec,
+        )
         self.collect_start_ns = int(self.current_clock_ns)
         self.collect_end_ns = self.collect_start_ns + 30_000_000_000
         last_publish = -math.inf
@@ -132,6 +175,12 @@ class Stage3Evaluator(Node):
                 last_publish = now
             rclpy.spin_once(self, timeout_sec=0.01)
         self._publish_command((0.0, 0.0, 0.0))
+        sensor_observations = self.sensor_collector.observations(
+            use_sim_time=uses_sim_time,
+            graph_approved=True,
+            calibration_match=calibration_match,
+        )
+        sensor_contract = evaluate_stage2(sensor_observations, _limits(self.config))
         result = evaluate_stage3(
             tuple(self.ground_truth),
             tuple(self.estimates),
@@ -140,6 +189,7 @@ class Stage3Evaluator(Node):
             use_sim_time=uses_sim_time,
             calibration_match=calibration_match,
             perfect_odom_isolated=perfect_odom_isolated,
+            sensor_contract=sensor_contract,
             message_errors=tuple(self.message_errors),
         )
         result["graph"] = self.graph_evidence
@@ -185,17 +235,37 @@ class Stage3Evaluator(Node):
         }
         if any(topics.get(name) != [kind] for name, kind in required.items()):
             return False, "required Stage 3 topic/type mismatch"
-        publishers = {
-            _endpoint_name(item) for item in self.get_publishers_info_by_topic("/cmd_vel")
+        ownership = {
+            "/cmd_vel": (
+                {"/holoagent_stage3_eval"},
+                {"/holoagent_mujoco_bridge"},
+            ),
+            "/holoagent_sim/lidar_points": (
+                {"/holoagent_mujoco_bridge"},
+                {"/holoagent_livox_converter", "/holoagent_stage3_eval"},
+            ),
+            "/livox/lidar": (
+                {"/holoagent_livox_converter"},
+                {"/holoagent_stage3_eval", "/laserMapping"},
+            ),
         }
-        subscribers = {
-            _endpoint_name(item)
-            for item in self.get_subscriptions_info_by_topic("/cmd_vel")
-        }
-        if publishers != {"/holoagent_stage3_eval"} or subscribers != {
-            "/holoagent_mujoco_bridge"
-        }:
-            return False, "Stage 3 command ownership mismatch"
+        endpoint_evidence = {}
+        for topic, (expected_publishers, expected_subscribers) in ownership.items():
+            publishers = {
+                _endpoint_name(item)
+                for item in self.get_publishers_info_by_topic(topic)
+            }
+            subscribers = {
+                _endpoint_name(item)
+                for item in self.get_subscriptions_info_by_topic(topic)
+            }
+            endpoint_evidence[topic] = {
+                "publishers": sorted(publishers),
+                "subscribers": sorted(subscribers),
+            }
+            if publishers != expected_publishers or subscribers != expected_subscribers:
+                return False, f"Stage 3 endpoint ownership mismatch for {topic}"
+        self.graph_evidence["endpoint_ownership"] = endpoint_evidence
         return True, "ok"
 
     def _perfect_odom_isolated(self) -> bool:
@@ -253,6 +323,55 @@ class Stage3Evaluator(Node):
 
     def _clock_callback(self, message: Clock) -> None:
         self.current_clock_ns = _stamp_ns(message.clock)
+        if self.sensor_collector is not None:
+            self.sensor_collector.record_clock(
+                self.current_clock_ns, wall_time=time.monotonic()
+            )
+
+    def _imu(self, message: Imu) -> None:
+        if self.sensor_collector is not None:
+            self.sensor_collector.record_imu(_stamp_ns(message.header.stamp))
+
+    def _camera(self, message: Image) -> None:
+        if self.sensor_collector is not None:
+            self.sensor_collector.record_camera(_stamp_ns(message.header.stamp))
+
+    def _raw_lidar(self, message: PointCloud2) -> None:
+        if self.sensor_collector is None:
+            return
+        try:
+            cloud = decode_pointcloud(message, self._raw_options)
+            if cloud.frame_id != self.config.frames.lidar:
+                raise ValueError("raw lidar frame mismatch")
+            self.sensor_collector.record_raw_lidar(cloud.timebase, cloud.point_num)
+        except Exception as exc:
+            self.sensor_collector.add_error(f"raw lidar: {exc}")
+
+    def _custom_lidar(self, message: CustomMsg) -> None:
+        if self.sensor_collector is None:
+            return
+        try:
+            stamp = _stamp_ns(message.header.stamp)
+            if message.header.frame_id != self.config.frames.lidar:
+                raise ValueError("custom lidar frame mismatch")
+            if int(message.timebase) != stamp:
+                raise ValueError("CustomMsg timebase differs from header stamp")
+            if int(message.point_num) != len(message.points):
+                raise ValueError("CustomMsg point_num differs from points length")
+            xyz = np.asarray(
+                [(point.x, point.y, point.z) for point in message.points],
+                dtype=np.float32,
+            )
+            if xyz.shape != (len(message.points), 3) or not np.isfinite(xyz).all():
+                raise ValueError("CustomMsg coordinates are not finite")
+            offsets = np.asarray(
+                [point.offset_time for point in message.points], dtype=np.uint32
+            )
+            self.sensor_collector.record_custom_lidar(
+                stamp, len(message.points), offsets
+            )
+        except Exception as exc:
+            self.sensor_collector.add_error(f"custom lidar: {exc}")
 
     def _ground_truth_callback(self, message: Odometry) -> None:
         if self.collect_start_ns is None or self.collect_end_ns is None:

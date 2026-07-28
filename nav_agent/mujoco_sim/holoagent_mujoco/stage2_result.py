@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,53 @@ EXPECTED_NODES = (
     "/holoagent_mujoco_bridge",
     "/holoagent_stage2_eval",
 )
+
+
+def collect_source_provenance(
+    workspace_source: Path,
+    container: dict[str, Any],
+    *,
+    runner: Any = subprocess.run,
+) -> dict[str, Any]:
+    workspace = Path(workspace_source).expanduser().resolve()
+
+    def git(*arguments: str) -> str:
+        result = runner(
+            ["git", "-C", str(workspace), *arguments],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise PreflightError(
+                f"cannot collect source provenance ({' '.join(arguments)}): "
+                f"{result.stderr.strip()}"
+            )
+        return result.stdout
+
+    commit = git("rev-parse", "HEAD").strip()
+    tree = git("rev-parse", "HEAD^{tree}").strip()
+    if not all(
+        len(value) == 40 and all(character in "0123456789abcdef" for character in value)
+        for value in (commit, tree)
+    ):
+        raise PreflightError("source commit/tree provenance is malformed")
+    status = git("status", "--porcelain", "--untracked-files=no")
+    dirty = bool(status.strip())
+    diff_sha256 = None
+    if dirty:
+        diff = git("diff", "--binary", "--no-ext-diff", "HEAD", "--")
+        diff_sha256 = hashlib.sha256(diff.encode("utf-8")).hexdigest()
+    return {
+        "source_commit": commit,
+        "source_tree": tree,
+        "tracked_worktree_dirty": dirty,
+        "tracked_diff_sha256": diff_sha256,
+        "workspace_source": str(workspace),
+        "container_id": container.get("id"),
+        "container_image_id": container.get("image_id"),
+    }
 
 
 def validate_container_contract(
@@ -267,6 +315,9 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "PASS",
                 "gate": "postflight",
                 "container": container,
+                "provenance": collect_source_provenance(
+                    args.workspace_source, container
+                ),
                 "host_pids": args.host_pid,
                 "container_pids": args.container_pid,
                 "forbidden_processes": forbidden,

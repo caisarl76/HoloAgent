@@ -30,6 +30,7 @@ class Stage4Limits:
     stop_settle_sec: float = 2.0
     stopped_hold_sec: float = 1.0
     min_realtime_factor: float = 0.25
+    min_collision_hz: float = 50.0
 
 
 def evaluate_stage4(
@@ -41,6 +42,7 @@ def evaluate_stage4(
     path_pose_count: int,
     action_succeeded: bool,
     max_scene_collision_count: int,
+    collision_sample_count: int,
     zero_latency_sec: float,
     settle_latency_sec: float,
     stopped_hold_sec: float,
@@ -87,6 +89,12 @@ def evaluate_stage4(
     realtime_factor = (
         simulated_duration_sec / wall_duration_sec if wall_duration_sec > 0.0 else 0.0
     )
+    collision_hz = (
+        collision_sample_count / simulated_duration_sec
+        if simulated_duration_sec > 0.0
+        else 0.0
+    )
+    collision_stream = collision_hz >= limits.min_collision_hz
     gates = {
         "graph": bool(graph_approved),
         "map": bool(map_approved),
@@ -95,7 +103,8 @@ def evaluate_stage4(
         "sim_fixture": fixture_position_error <= 1e-6 and fixture_yaw_error <= 1e-6,
         "path": path_pose_count >= 2,
         "command_bounds": command_bounds and commanded_motion,
-        "collision_free": max_scene_collision_count == 0,
+        "collision_stream": collision_stream,
+        "collision_free": collision_stream and max_scene_collision_count == 0,
         "action_succeeded": bool(action_succeeded),
         "goal_position": position_error <= limits.position_tolerance_m,
         "goal_yaw": yaw_error <= limits.yaw_tolerance_deg,
@@ -130,6 +139,8 @@ def evaluate_stage4(
                 (abs(sample.yaw) for sample in commands), default=0.0
             ),
             "max_scene_collision_count": int(max_scene_collision_count),
+            "collision_sample_count": int(collision_sample_count),
+            "collision_hz": collision_hz,
             "zero_latency_sec": zero_latency_sec,
             "settle_latency_sec": settle_latency_sec,
             "stopped_hold_sec": stopped_hold_sec,

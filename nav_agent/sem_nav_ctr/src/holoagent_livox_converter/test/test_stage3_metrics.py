@@ -25,6 +25,15 @@ def _truth() -> tuple[PoseSample, ...]:
     return tuple(samples)
 
 
+def _sensor_pass() -> dict[str, object]:
+    return {
+        "status": "PASS",
+        "label": "PASS_SYNTHETIC_LIVOX",
+        "gates": {"imu_rate": True, "lidar_density": True},
+        "metrics": {"imu_hz": 200.0, "custom_lidar_hz": 10.0},
+    }
+
+
 def test_first_pose_alignment_removes_only_rigid_frame_offset():
     truth = _truth()
     rotation = math.radians(-30)
@@ -47,6 +56,7 @@ def test_first_pose_alignment_removes_only_rigid_frame_offset():
         use_sim_time={"bridge": True, "converter": True, "fast_livo": True, "eval": True},
         calibration_match=True,
         perfect_odom_isolated=True,
+        sensor_contract=_sensor_pass(),
     )
     assert result["status"] == "PASS"
     assert result["qualified_pass"] == "PASS_LIO_ONLY"
@@ -68,6 +78,7 @@ def test_drifting_estimator_records_fail_estimator_without_overclaim():
         use_sim_time={"all": True},
         calibration_match=True,
         perfect_odom_isolated=True,
+        sensor_contract=_sensor_pass(),
     )
     assert result["status"] == "FAIL"
     assert result["label"] == "FAIL_ESTIMATOR"
@@ -85,5 +96,33 @@ def test_perfect_odometry_isolation_is_a_hard_gate():
         use_sim_time={"all": True},
         calibration_match=True,
         perfect_odom_isolated=False,
+        sensor_contract=_sensor_pass(),
     )
     assert result["first_failing_gate"] == "perfect_odom_isolated"
+
+
+def test_stage2_sensor_contract_is_a_hard_gate_during_stage3():
+    truth = _truth()
+    sensor_failure = {
+        "status": "FAIL",
+        "label": None,
+        "first_failing_gate": "lidar_density",
+        "gates": {"lidar_density": False},
+        "metrics": {"min_points_per_scan": 0},
+    }
+
+    result = evaluate_stage3(
+        truth,
+        truth,
+        limits=Stage3Limits(),
+        graph_approved=True,
+        use_sim_time={"all": True},
+        calibration_match=True,
+        perfect_odom_isolated=True,
+        sensor_contract=sensor_failure,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["first_failing_gate"] == "sensor_contract"
+    assert result["gates"]["sensor_contract"] is False
+    assert result["metrics"]["sensor_contract"] == sensor_failure

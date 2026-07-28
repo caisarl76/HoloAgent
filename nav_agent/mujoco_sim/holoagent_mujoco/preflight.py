@@ -516,6 +516,10 @@ def merge_postflight_result(
         raise PreflightError("evaluator result root must be an object")
     passed = postflight.get("status") == "PASS"
     result["postflight_pass"] = passed
+    for key in ("provenance", "build_provenance"):
+        evidence = postflight.get(key)
+        if isinstance(evidence, Mapping):
+            result[key] = dict(evidence)
     if not passed:
         if result.get("status") == "PASS":
             result["status"] = "FAIL"

@@ -225,10 +225,25 @@ docker exec \
     printf '%s\\n' \"\$\$\" >${container_run_dir}/nav.container.pid
     exec ros2 launch holoagent_mujoco stage4_nav2.launch.py \\
       params_file:=${container_run_dir}/stage4_nav2_runtime.yaml \\
-      map:=${container_run_dir}/sim_map.yaml use_sim_time:=true autostart:=true
+      map:=${container_run_dir}/sim_map.yaml use_sim_time:=true autostart:=false
   " >"${run_dir}/nav2.log" 2>&1 &
 nav_host_pid=$!
 recorded_nav_host_pid="${nav_host_pid}"
+
+docker exec \
+  --env ROS_DOMAIN_ID=77 --env ROS_LOCALHOST_ONLY=1 \
+  --env ROS2CLI_DISABLE_DAEMON=1 --env RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+  --env ROS_LOG_DIR="${container_run_dir}/ros_logs" --env LC_ALL=C \
+  "${container_name}" bash -lc "
+    set +u
+    source /opt/ros/humble/setup.bash
+    source ${build_root}/install/setup.bash
+    set -u
+    exec ${build_root}/install/holoagent_mujoco/lib/holoagent_mujoco/stage4_activate \
+      --config ${container_root}/nav_agent/mujoco_sim/config/stage4.yaml \
+      --manifest ${container_run_dir}/stage4_manifest.json \
+      --output ${container_run_dir}/stage4_activation.json
+  " >"${run_dir}/stage4_activation.log" 2>&1
 
 docker exec \
   --env ROS_DOMAIN_ID=77 --env ROS_LOCALHOST_ONLY=1 \
@@ -243,6 +258,7 @@ docker exec \
     exec ${build_root}/install/holoagent_mujoco/lib/holoagent_mujoco/stage4_eval \\
       --config ${container_root}/nav_agent/mujoco_sim/config/stage4.yaml \\
       --manifest ${container_run_dir}/stage4_manifest.json \\
+      --activation ${container_run_dir}/stage4_activation.json \\
       --output ${container_run_dir}/result.pending.json \\
       --ready-file ${container_run_dir}/stage4_graph_ready.json \\
       --approval-file ${container_run_dir}/stage4_graph_approved.sha256

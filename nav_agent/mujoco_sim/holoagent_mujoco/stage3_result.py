@@ -22,6 +22,7 @@ from holoagent_mujoco.stage2_result import (
     _pid_alive,
     _typed_lines,
     _write_json,
+    collect_source_provenance,
     validate_container_contract,
 )
 from holoagent_mujoco.stage2_result_topics import STAGE2_TOPIC_TYPES
@@ -165,10 +166,25 @@ def main(argv: list[str] | None = None) -> int:
                 raise PreflightError("Stage 3 postflight result paths are required")
             pending = json.loads(args.result_file.read_text(encoding="utf-8"))
             validate_evaluator_status(pending, args.evaluator_exit_status)
+            build_manifest_path = run_dir / "stage3_build_manifest.json"
+            build_provenance = json.loads(
+                build_manifest_path.read_text(encoding="utf-8")
+            )
+            binary = build_provenance.get("binary", {})
+            if (
+                build_provenance.get("kind") != "holoagent_stage3_clean_build"
+                or not isinstance(binary, dict)
+                or len(str(binary.get("sha256", ""))) != 64
+            ):
+                raise PreflightError("Stage 3 clean-build manifest is invalid")
             result = {
                 "status": "PASS",
                 "gate": "postflight",
                 "container": container,
+                "provenance": collect_source_provenance(
+                    args.workspace_source, container
+                ),
+                "build_provenance": build_provenance,
                 "host_pids": args.host_pid,
                 "container_pids": args.container_pid,
                 "forbidden_processes": forbidden,

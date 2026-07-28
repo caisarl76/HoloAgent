@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from holoagent_mujoco.preflight import PARAMETER_SERVICE_TYPES, PreflightError
 from holoagent_mujoco.stage2_result import (
     EXPECTED_NODES,
+    collect_source_provenance,
     parse_container_stage_processes,
     validate_container_contract,
     validate_graph_parity,
@@ -105,3 +107,35 @@ def test_container_process_parser_finds_wrappers_and_direct_nodes():
         1224,
         1363,
     ]
+
+
+def test_source_provenance_records_commit_tree_cleanliness_and_container(tmp_path):
+    responses = {
+        ("rev-parse", "HEAD"): "a" * 40 + "\n",
+        ("rev-parse", "HEAD^{tree}"): "b" * 40 + "\n",
+        ("status", "--porcelain", "--untracked-files=no"): "",
+    }
+
+    def runner(command, **kwargs):
+        key = tuple(command[3:])
+        return subprocess.CompletedProcess(command, 0, responses[key], "")
+
+    evidence = collect_source_provenance(
+        tmp_path,
+        {
+            "id": "container-id",
+            "image_id": "sha256:image-id",
+            "workspace_source": str(tmp_path),
+        },
+        runner=runner,
+    )
+
+    assert evidence == {
+        "source_commit": "a" * 40,
+        "source_tree": "b" * 40,
+        "tracked_worktree_dirty": False,
+        "tracked_diff_sha256": None,
+        "workspace_source": str(tmp_path.resolve()),
+        "container_id": "container-id",
+        "container_image_id": "sha256:image-id",
+    }

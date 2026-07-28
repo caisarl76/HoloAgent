@@ -369,3 +369,38 @@ def test_postflight_atomically_promotes_pending_result(tmp_path):
     assert promoted["status"] == "PASS"
     assert promoted["postflight_pass"] is True
     assert json.loads(pending.read_text(encoding="utf-8"))["status"] == "PASS"
+
+
+def test_postflight_promotion_persists_reproducibility_provenance(tmp_path):
+    pending = tmp_path / "result.pending.json"
+    final = tmp_path / "result.json"
+    pending.write_text(
+        json.dumps({"status": "PASS", "metrics": {}}), encoding="utf-8"
+    )
+    provenance = {
+        "source_commit": "a" * 40,
+        "source_tree": "b" * 40,
+        "tracked_worktree_dirty": False,
+        "tracked_diff_sha256": None,
+        "container_id": "container-id",
+        "container_image_id": "sha256:image-id",
+    }
+    build_provenance = {
+        "kind": "holoagent_stage3_clean_build",
+        "binary": {"sha256": "c" * 64},
+    }
+
+    merge_postflight_result(
+        pending,
+        {
+            "status": "PASS",
+            "gate": "postflight",
+            "provenance": provenance,
+            "build_provenance": build_provenance,
+        },
+        final_path=final,
+    )
+
+    promoted = json.loads(final.read_text(encoding="utf-8"))
+    assert promoted["provenance"] == provenance
+    assert promoted["build_provenance"] == build_provenance

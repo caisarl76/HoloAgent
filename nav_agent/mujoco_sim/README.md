@@ -114,11 +114,13 @@ and navigation gate do not consume Stage 3 output.
 
 ## View results
 
-Set a run directory explicitly so failed exploratory runs are not confused
-with the authoritative result:
+Select the newest promoted Stage 4 pass instead of relying on a machine-local
+timestamp:
 
 ```bash
-stage4_run=outputs/mujoco_holoagent/20260728T035826Z
+stage4_result="$(rg -l '"label": "PASS_SIM_SEMANTIC_PLUMBING"' outputs/mujoco_holoagent/*/result.json | sort | tail -1)"
+test -n "$stage4_result"
+stage4_run="${stage4_result%/result.json}"
 ```
 
 Show the qualified label, every gate, and motion metrics:
@@ -131,7 +133,7 @@ The Stage 4 motion evidence is numeric and headless. Inspect the planned path
 size, final error, command envelope, collision count, and stop behavior with:
 
 ```bash
-python3 -c 'import json,sys; m=json.load(open(sys.argv[1]))["metrics"]; keys=("path_pose_count","position_error_m","yaw_error_deg","max_abs_cmd_x","max_abs_cmd_y","max_abs_cmd_yaw","max_scene_collision_count","zero_latency_sec","settle_latency_sec"); [print(f"{k}: {m[k]}") for k in keys]' "$stage4_run/result.json"
+python3 -c 'import json,sys; m=json.load(open(sys.argv[1]))["metrics"]; keys=("path_pose_count","position_error_m","yaw_error_deg","max_abs_cmd_x","max_abs_cmd_y","max_abs_cmd_yaw","max_scene_collision_count","collision_sample_count","collision_hz","zero_latency_sec","settle_latency_sec"); [print(f"{k}: {m[k]}") for k in keys]' "$stage4_run/result.json"
 rg 'Received a goal|Reached the goal|Goal succeeded' "$stage4_run/nav2.log"
 ```
 
@@ -161,14 +163,18 @@ cat "$stage4_run/postflight_container_graph.txt"
 For Stage 2 sensor rates and point density:
 
 ```bash
-stage2_run=outputs/mujoco_holoagent/20260724T055647Z
+stage2_result="$(rg -l '"label": "PASS_SYNTHETIC_LIVOX"' outputs/mujoco_holoagent/*/result.json | sort | tail -1)"
+test -n "$stage2_result"
+stage2_run="${stage2_result%/result.json}"
 python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["label"]); print(json.dumps(r["metrics"],indent=2,sort_keys=True))' "$stage2_run/result.json"
 ```
 
 For the Stage 3 estimator error and its qualified or failed label:
 
 ```bash
-stage3_run=outputs/mujoco_holoagent/20260727T023738Z
+stage3_result="$(rg -l '"stage": 3' outputs/mujoco_holoagent/*/result.json | sort | tail -1)"
+test -n "$stage3_result"
+stage3_run="${stage3_result%/result.json}"
 python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["status"],r["label"],r["first_failing_gate"]); print(json.dumps(r["metrics"],indent=2,sort_keys=True))' "$stage3_run/result.json"
 ```
 

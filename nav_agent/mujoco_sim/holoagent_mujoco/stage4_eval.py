@@ -36,7 +36,10 @@ from holoagent_mujoco.stage4_metrics import (
     evaluate_stage4,
 )
 from holoagent_mujoco.stage4_nav import validate_nav2_parameters
-from holoagent_mujoco.stage4_result import validate_stage4_node_names
+from holoagent_mujoco.stage4_result import (
+    validate_endpoint_ownership,
+    validate_stage4_node_names,
+)
 
 
 def _endpoint_name(endpoint: Any) -> str:
@@ -50,6 +53,7 @@ class Stage4Evaluator(Node):
         config: Stage4Config,
         *,
         manifest_path: Path,
+        activation_path: Path,
         ready_file: Path,
         approval_file: Path,
     ) -> None:
@@ -60,6 +64,7 @@ class Stage4Evaluator(Node):
         )
         self.config = config
         self.manifest_path = manifest_path.resolve()
+        self.activation_path = activation_path.resolve()
         self.ready_file = ready_file.resolve()
         self.approval_file = approval_file.resolve()
         self.current_clock_ns: int | None = None
@@ -71,8 +76,10 @@ class Stage4Evaluator(Node):
         self.commands: list[VelocitySample] = []
         self.applied_commands: list[VelocitySample] = []
         self.max_scene_collision_count = 0
+        self.collision_stamps_ns: list[int] = []
         self.graph_evidence: dict[str, Any] = {}
         self.all_use_sim_time = False
+        self.activation_evidence: dict[str, Any] = {}
         self.active_gate = "graph"
         wall_limit = (
             config.gates.wall_time_multiplier * config.gates.goal_timeout_sim_sec
@@ -115,6 +122,8 @@ class Stage4Evaluator(Node):
                 "planner_server",
                 "controller_server",
                 "bt_navigator",
+                "bt_navigator_navigate_to_pose_rclcpp_node",
+                "bt_navigator_navigate_through_poses_rclcpp_node",
                 "global_costmap/global_costmap",
                 "local_costmap/local_costmap",
                 "lifecycle_manager_stage4",
@@ -124,12 +133,12 @@ class Stage4Evaluator(Node):
         }
 
     def run(self) -> dict[str, object]:
-        wall_start = time.monotonic()
         self._wait_for_clock()
         self._wait_for_exact_graph()
         manifest = self._validate_assets_and_runtime_parameters()
         self._write_ready_and_wait_for_approval(manifest)
         self._wait_for_exact_graph()
+        measurement_wall_start = time.monotonic()
         collect_start_ns = int(self.current_clock_ns)
         expected = next(iter(self.config.fixtures.values()))
         self.active_gate = "sim_fixture"
@@ -169,6 +178,10 @@ class Stage4Evaluator(Node):
         stop = self._observe_stop(action_done_ns)
         final_pose = self.latest_pose
         simulated_duration = (int(self.current_clock_ns) - collect_start_ns) / 1e9
+        collision_sample_count = sum(
+            collect_start_ns <= stamp <= int(self.current_clock_ns)
+            for stamp in self.collision_stamps_ns
+        )
         result = evaluate_stage4(
             expected_fixture=Pose2D(expected.x, expected.y, expected.yaw),
             observed_fixture=self.observed_fixture,
@@ -177,11 +190,12 @@ class Stage4Evaluator(Node):
             path_pose_count=self.path_pose_count,
             action_succeeded=action_succeeded,
             max_scene_collision_count=self.max_scene_collision_count,
+            collision_sample_count=collision_sample_count,
             zero_latency_sec=stop["zero_latency_sec"],
             settle_latency_sec=stop["settle_latency_sec"],
             stopped_hold_sec=stop["stopped_hold_sec"],
             simulated_duration_sec=simulated_duration,
-            wall_duration_sec=time.monotonic() - wall_start,
+            wall_duration_sec=time.monotonic() - measurement_wall_start,
             graph_approved=True,
             map_approved=True,
             all_use_sim_time=self.all_use_sim_time,
@@ -199,6 +213,7 @@ class Stage4Evaluator(Node):
         )
         result["graph"] = self.graph_evidence
         result["map_manifest"] = manifest
+        result["pre_activation"] = self.activation_evidence
         result["sim_fixture"] = {
             "query": expected.query,
             "frame_id": self.observed_fixture_frame,
@@ -247,23 +262,54 @@ class Stage4Evaluator(Node):
         }
         if any(topics.get(name) != [kind] for name, kind in required.items()):
             return False, "required Stage 4 topic/type mismatch"
-        publishers = {
-            _endpoint_name(item)
-            for item in self.get_publishers_info_by_topic("/cmd_vel")
-        }
-        subscribers = {
-            _endpoint_name(item)
-            for item in self.get_subscriptions_info_by_topic("/cmd_vel")
-        }
-        if publishers != {"/controller_server"} or subscribers != {
-            "/holoagent_mujoco_bridge",
-            "/holoagent_stage4_eval",
-        }:
-            return False, "Stage 4 command ownership mismatch"
+        endpoint_contracts = {}
+        for topic, expected_publishers, expected_subscribers in (
+            (
+                "/cmd_vel",
+                {"/controller_server"},
+                {"/holoagent_mujoco_bridge", "/holoagent_stage4_eval"},
+            ),
+            (
+                "/holoagent_sim/collision_count",
+                {"/holoagent_mujoco_bridge"},
+                {"/holoagent_stage4_eval"},
+            ),
+        ):
+            publishers = {
+                _endpoint_name(item)
+                for item in self.get_publishers_info_by_topic(topic)
+            }
+            subscribers = {
+                _endpoint_name(item)
+                for item in self.get_subscriptions_info_by_topic(topic)
+            }
+            try:
+                endpoint_contracts[topic] = validate_endpoint_ownership(
+                    publishers=publishers,
+                    subscribers=subscribers,
+                    expected_publishers=expected_publishers,
+                    expected_subscribers=expected_subscribers,
+                    topic=topic,
+                )
+            except Exception as exc:
+                return False, str(exc)
+        self.graph_evidence["endpoint_ownership"] = endpoint_contracts
         return True, "ok"
 
     def _validate_assets_and_runtime_parameters(self) -> dict[str, object]:
         manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        activation = json.loads(self.activation_path.read_text(encoding="utf-8"))
+        if (
+            activation.get("status") != "PRE_ACTIVATION_APPROVED"
+            or activation.get("lifecycle_active") is not True
+            or activation.get("manifest_sha256") != file_sha256(self.manifest_path)
+        ):
+            raise RuntimeError("Stage 4 pre-activation evidence is invalid")
+        self.activation_evidence = {
+            **activation,
+            "evidence_path": str(self.activation_path),
+            "evidence_sha256": file_sha256(self.activation_path),
+        }
         map_evidence = manifest.get("map", {})
         loaded_path = Path(self._remote_parameter("map_server", "yaml_filename"))
         verify_loaded_map(
@@ -420,9 +466,10 @@ class Stage4Evaluator(Node):
             for name in self._parameter_clients
         }
         values["eval"] = bool(self.get_parameter("use_sim_time").value)
-        values["configured/bt_navigator_navigate_to_pose_rclcpp_node"] = True
-        values["configured/bt_navigator_navigate_through_poses_rclcpp_node"] = True
-        values["inherited/transform_listener_nodes"] = True
+        values["inherited/transform_listener_nodes"] = bool(
+            values["global_costmap/global_costmap"]
+            and values["local_costmap/local_costmap"]
+        )
         self.graph_evidence["use_sim_time"] = values
         return all(values.values())
 
@@ -484,6 +531,8 @@ class Stage4Evaluator(Node):
         self.max_scene_collision_count = max(
             self.max_scene_collision_count, int(message.data)
         )
+        if self.current_clock_ns is not None:
+            self.collision_stamps_ns.append(int(self.current_clock_ns))
 
     def _check_deadline(self) -> None:
         if time.monotonic() > self._wall_deadline:
@@ -561,6 +610,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--activation", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ready-file", type=Path, required=True)
     parser.add_argument("--approval-file", type=Path, required=True)
@@ -574,6 +624,7 @@ def main(argv: list[str] | None = None) -> int:
         node = Stage4Evaluator(
             config,
             manifest_path=arguments.manifest,
+            activation_path=arguments.activation,
             ready_file=arguments.ready_file,
             approval_file=arguments.approval_file,
         )
@@ -593,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
                     "applied_command_samples": len(node.applied_commands),
                     "path_pose_count": node.path_pose_count,
                     "max_scene_collision_count": node.max_scene_collision_count,
+                    "collision_sample_count": len(node.collision_stamps_ns),
                 }
             )
     finally:
