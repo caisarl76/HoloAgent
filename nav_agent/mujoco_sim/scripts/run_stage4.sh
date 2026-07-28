@@ -48,6 +48,18 @@ export LC_ALL=C
 export ROS_LOG_DIR="${run_dir}/ros_logs"
 export PYTHONPATH="${repo_root}/nav_agent/mujoco_sim:/home/jihun/work/GR00T-WholeBodyControl/.venv_data_collection/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages:/opt/ros/humble/lib/python3.10/site-packages"
 
+stop_cli_daemons() {
+  ros2 daemon stop >/dev/null 2>&1 || true
+  docker exec \
+    --env ROS_DOMAIN_ID=77 \
+    --env ROS_LOCALHOST_ONLY=1 \
+    --env RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+    "${container_name}" bash -lc \
+    "source /opt/ros/humble/setup.bash; ros2 daemon stop" \
+    >/dev/null 2>&1 || true
+  sleep 1
+}
+
 container_pid_alive() {
   docker exec "${container_name}" kill -0 "$1" >/dev/null 2>&1
 }
@@ -120,6 +132,7 @@ capture_postflight_graphs() {
   done
   capture_host_graph >"${run_dir}/postflight_host_graph.txt"
   capture_container_graph >"${run_dir}/postflight_container_graph.txt"
+  stop_cli_daemons
 }
 
 cleanup() {
@@ -162,6 +175,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "${repo_root}/outputs/mujoco_holoagent"
+stop_cli_daemons
 docker exec "${container_name}" dpkg-query -W '-f=${Package}=${Version}\n' \
   ros-humble-navigation2 ros-humble-nav2-bringup ros-humble-nav2-controller \
   ros-humble-nav2-lifecycle-manager ros-humble-nav2-map-server \
@@ -285,6 +299,7 @@ fi
 
 capture_host_graph >"${run_dir}/host_graph.txt"
 capture_container_graph >"${run_dir}/container_graph.txt"
+stop_cli_daemons
 "${python_bin}" -m holoagent_mujoco.stage4_result \
   --config "${config_path}" --run-dir "${run_dir}" \
   --container "${container_name}" --workspace-source "${repo_root}" \

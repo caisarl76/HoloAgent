@@ -56,6 +56,8 @@ def test_stage2_launcher_graph_gates_measurement_and_promotes_atomically():
     assert approval < graph  # path declaration precedes external graph gate
     assert "ros2 action list -t | sort" in text
     assert "ros2 daemon stop" in text
+    assert text.count("stop_cli_daemons") >= 3
+    assert text.rindex("stop_cli_daemons") < text.index("ready_digest=")
 
 
 def test_stage2_launcher_contains_no_robot_or_remote_target():

@@ -20,6 +20,9 @@ def test_stage3_graph_serialization_uses_the_same_c_locale_on_both_sides():
     assert "export LC_ALL=C" in text
     assert "--env LC_ALL=C" in text
     assert "ros2 action list -t | sort" in text
+    assert "ros2 daemon stop" in text
+    assert text.count("stop_cli_daemons") >= 3
+    assert text.rindex("stop_cli_daemons") < text.index("ready_digest=")
 
 
 def test_stage3_launcher_isolates_perfect_odom_and_gates_before_motion():
