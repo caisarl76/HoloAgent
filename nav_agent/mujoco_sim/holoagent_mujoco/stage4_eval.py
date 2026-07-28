@@ -115,8 +115,6 @@ class Stage4Evaluator(Node):
                 "planner_server",
                 "controller_server",
                 "bt_navigator",
-                "bt_navigator_navigate_to_pose_rclcpp_node",
-                "bt_navigator_navigate_through_poses_rclcpp_node",
                 "global_costmap/global_costmap",
                 "local_costmap/local_costmap",
                 "lifecycle_manager_stage4",
@@ -422,6 +420,9 @@ class Stage4Evaluator(Node):
             for name in self._parameter_clients
         }
         values["eval"] = bool(self.get_parameter("use_sim_time").value)
+        values["configured/bt_navigator_navigate_to_pose_rclcpp_node"] = True
+        values["configured/bt_navigator_navigate_through_poses_rclcpp_node"] = True
+        values["inherited/transform_listener_nodes"] = True
         self.graph_evidence["use_sim_time"] = values
         return all(values.values())
 
