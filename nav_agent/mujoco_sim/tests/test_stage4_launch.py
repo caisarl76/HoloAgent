@@ -78,9 +78,11 @@ def test_stage4_runner_has_no_physical_transport_or_broad_cleanup():
 
 def test_stage4_evaluator_queries_helper_clocks_and_times_only_approved_motion():
     text = EVALUATOR.read_text(encoding="utf-8")
-    assert '"bt_navigator_navigate_to_pose_rclcpp_node"' in text
-    assert '"bt_navigator_navigate_through_poses_rclcpp_node"' in text
+    assert '"/bt_navigator_navigate_to_pose_rclcpp_node"' in text
+    assert '"/bt_navigator_navigate_through_poses_rclcpp_node"' in text
     assert 'values["configured/bt_navigator_navigate_to_pose_rclcpp_node"] = True' not in text
+    assert 'get_subscriptions_info_by_topic("/clock")' in text
+    assert "validate_clock_subscriptions" in text
     assert "measurement_wall_start = time.monotonic()" in text
     assert "wall_duration_sec=time.monotonic() - measurement_wall_start" in text
 

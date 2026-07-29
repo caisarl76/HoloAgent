@@ -252,10 +252,12 @@ command timeout:   0.50 simulated seconds, then force zero
 
 The bridge starts stationary and returns to zero on timeout, shutdown, invalid
 input, or simulation error. MuJoCo model time is the only ROS clock authority.
-All consuming nodes, including Nav2 and FastLIVO, must report
-`use_sim_time=true` before activation. The orchestrator records the real-time
-factor so slow policy inference changes wall-clock duration without changing
-controller semantics.
+All queryable consuming nodes, including Nav2 and FastLIVO, must report
+`use_sim_time=true` before activation. Nav2 Humble's internal BT client nodes do
+not service their advertised parameter APIs, so they are verified by their live
+`/clock` subscription endpoints plus the pinned runtime configuration instead.
+The orchestrator records the real-time factor so slow policy inference changes
+wall-clock duration without changing controller semantics.
 
 Default publication rates are IMU 200 Hz, odometry 50 Hz, camera 15 Hz, and
 lidar 10 Hz in simulated time.

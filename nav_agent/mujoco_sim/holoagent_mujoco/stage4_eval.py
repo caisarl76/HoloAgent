@@ -37,9 +37,16 @@ from holoagent_mujoco.stage4_metrics import (
 )
 from holoagent_mujoco.stage4_nav import validate_nav2_parameters
 from holoagent_mujoco.stage4_result import (
+    validate_clock_subscriptions,
     validate_endpoint_ownership,
     validate_stage4_node_names,
 )
+
+
+BT_HELPER_NODES = {
+    "/bt_navigator_navigate_to_pose_rclcpp_node",
+    "/bt_navigator_navigate_through_poses_rclcpp_node",
+}
 
 
 def _endpoint_name(endpoint: Any) -> str:
@@ -122,8 +129,6 @@ class Stage4Evaluator(Node):
                 "planner_server",
                 "controller_server",
                 "bt_navigator",
-                "bt_navigator_navigate_to_pose_rclcpp_node",
-                "bt_navigator_navigate_through_poses_rclcpp_node",
                 "global_costmap/global_costmap",
                 "local_costmap/local_costmap",
                 "lifecycle_manager_stage4",
@@ -466,11 +471,26 @@ class Stage4Evaluator(Node):
             for name in self._parameter_clients
         }
         values["eval"] = bool(self.get_parameter("use_sim_time").value)
+        clock_subscribers = {
+            _endpoint_name(item)
+            for item in self.get_subscriptions_info_by_topic("/clock")
+        }
+        helper_clock_evidence = validate_clock_subscriptions(
+            subscribers=clock_subscribers,
+            required_nodes=BT_HELPER_NODES,
+        )
+        values.update(
+            {
+                f"clock_subscription{name}": name in clock_subscribers
+                for name in sorted(BT_HELPER_NODES)
+            }
+        )
         values["inherited/transform_listener_nodes"] = bool(
             values["global_costmap/global_costmap"]
             and values["local_costmap/local_costmap"]
         )
         self.graph_evidence["use_sim_time"] = values
+        self.graph_evidence["clock_subscription_evidence"] = helper_clock_evidence
         return all(values.values())
 
     def _remote_parameter(self, client_name: str, parameter: str) -> Any:

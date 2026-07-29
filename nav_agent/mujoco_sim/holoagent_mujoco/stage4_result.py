@@ -207,6 +207,21 @@ def validate_endpoint_ownership(
     }
 
 
+def validate_clock_subscriptions(
+    *, subscribers: set[str], required_nodes: set[str]
+) -> dict[str, list[str]]:
+    missing = sorted(required_nodes - subscribers)
+    if missing:
+        raise PreflightError(
+            "Stage 4 helper clock subscriptions are incomplete: "
+            f"missing={missing}, subscribers={sorted(subscribers)}"
+        )
+    return {
+        "required_nodes": sorted(required_nodes),
+        "subscribers": sorted(subscribers),
+    }
+
+
 def _require_exact(
     actual: dict[str, str], expected: dict[str, str], *, label: str
 ) -> None:

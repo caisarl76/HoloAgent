@@ -9,6 +9,7 @@ from holoagent_mujoco.stage4_result import (
     EXPECTED_SERVICE_TYPES,
     EXPECTED_TOPIC_TYPES,
     parse_stage4_processes,
+    validate_clock_subscriptions,
     validate_empty_graph,
     validate_endpoint_ownership,
     validate_evaluator_status,
@@ -98,6 +99,27 @@ def test_stage4_endpoint_ownership_is_exact_and_serializable():
             expected_publishers={"/holoagent_mujoco_bridge"},
             expected_subscribers={"/holoagent_stage4_eval"},
             topic="/holoagent_sim/collision_count",
+        )
+
+
+def test_bt_helper_clock_subscriptions_are_live_sim_time_evidence():
+    required = {
+        "/bt_navigator_navigate_to_pose_rclcpp_node",
+        "/bt_navigator_navigate_through_poses_rclcpp_node",
+    }
+    evidence = validate_clock_subscriptions(
+        subscribers={*required, "/holoagent_stage4_eval"},
+        required_nodes=required,
+    )
+    assert evidence == {
+        "required_nodes": sorted(required),
+        "subscribers": sorted({*required, "/holoagent_stage4_eval"}),
+    }
+
+    with pytest.raises(PreflightError, match="clock subscriptions"):
+        validate_clock_subscriptions(
+            subscribers={"/bt_navigator_navigate_to_pose_rclcpp_node"},
+            required_nodes=required,
         )
 
 
