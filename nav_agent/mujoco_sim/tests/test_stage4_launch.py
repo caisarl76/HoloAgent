@@ -8,6 +8,7 @@ THROUGH_POSES_TREE = (
     PACKAGE_ROOT / "behavior_trees" / "stage4_navigate_through_poses.xml"
 )
 EVALUATOR = PACKAGE_ROOT / "holoagent_mujoco" / "stage4_eval.py"
+ACTIVATOR = PACKAGE_ROOT / "holoagent_mujoco" / "stage4_activate.py"
 
 
 def test_stage4_launch_is_minimal_nav2_without_localization_or_robot_drivers():
@@ -58,6 +59,10 @@ def test_stage4_runner_is_fail_closed_before_query_motion():
     assert "ros2 action list -t" in text
     assert "ros2 daemon stop" in text
     assert text.count("stop_cli_daemons") >= 3
+    assert "recover_container_pids" in text
+    assert text.index("recover_container_pids") < text.index(
+        'stop_container_pid "${evaluator_container_pid}"'
+    )
     assert "result.pending.json" in text
     assert "result.json" in text
 
@@ -78,3 +83,17 @@ def test_stage4_evaluator_queries_helper_clocks_and_times_only_approved_motion()
     assert 'values["configured/bt_navigator_navigate_to_pose_rclcpp_node"] = True' not in text
     assert "measurement_wall_start = time.monotonic()" in text
     assert "wall_duration_sec=time.monotonic() - measurement_wall_start" in text
+
+
+def test_stage4_activation_configures_before_live_costmap_validation():
+    text = ACTIVATOR.read_text(encoding="utf-8")
+
+    assert "TRANSITION_CONFIGURE" in text
+    assert "ManageLifecycleNodes.Request.RESUME" in text
+    assert "ManageLifecycleNodes.Request.STARTUP" not in text
+    assert text.index("node.configure_managed_nodes()") < text.index(
+        "node.read_live_parameters()"
+    )
+    assert text.index("validate_pre_activation_contract(") < text.index(
+        "node.activate_managed_nodes()"
+    )

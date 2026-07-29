@@ -316,6 +316,15 @@ or otherwise non-holonomic motion model. A controller configuration capable of
 commanding lateral motion is a hard failure rather than something the adapter
 silently clamps.
 
+ROS 2 Humble does not service the embedded global/local costmap parameter
+requests until their parent planner/controller lifecycle nodes are configured.
+Stage 4 therefore configures—but does not activate—the four managed Nav2 nodes,
+live-queries the map path and `use_sim_time` from every top-level and costmap
+node, validates the pinned map/runtime digests, and only then asks the lifecycle
+manager to `RESUME` the configured stack. The semantic evaluator is not started
+until that activation evidence has been written, so no navigation command can
+precede the live contract check.
+
 ### 6. Orchestration and Isolation
 
 Provide scripts that:

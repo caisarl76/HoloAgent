@@ -99,6 +99,11 @@ YAML and PGM hashes before approval. The fixed `sim_fixture` pose is checked
 against inflated free space. This proves frame-consistent HoloAgent navigation
 plumbing, not FSR-VLN semantic accuracy in the synthetic scene.
 
+On ROS 2 Humble, Stage 4 first configures the managed lifecycle nodes without
+activating them, live-validates every top-level and embedded-costmap parameter
+contract, and only then activates the stack through the lifecycle manager. The
+semantic evaluator starts after that evidence is durable.
+
 Run later stages only in the dedicated no-device container described by the
 commissioning design:
 

@@ -91,6 +91,18 @@ stop_host_pid() {
   wait "${pid}" 2>/dev/null || true
 }
 
+recover_container_pids() {
+  if [[ -z "${fixture_container_pid}" && -f "${run_dir}/fixture.container.pid" ]]; then
+    fixture_container_pid="$(<"${run_dir}/fixture.container.pid")"
+  fi
+  if [[ -z "${nav_container_pid}" && -f "${run_dir}/nav.container.pid" ]]; then
+    nav_container_pid="$(<"${run_dir}/nav.container.pid")"
+  fi
+  if [[ -z "${evaluator_container_pid}" && -f "${run_dir}/evaluator.container.pid" ]]; then
+    evaluator_container_pid="$(<"${run_dir}/evaluator.container.pid")"
+  fi
+}
+
 capture_host_graph() {
   printf '=== NODES ===\n'
   ros2 node list --no-daemon | sort
@@ -138,6 +150,7 @@ capture_postflight_graphs() {
 cleanup() {
   if [[ ${cleanup_done} -eq 1 ]]; then return; fi
   cleanup_done=1
+  recover_container_pids
   stop_container_pid "${evaluator_container_pid}" || true
   stop_container_pid "${nav_container_pid}" || true
   stop_container_pid "${fixture_container_pid}" || true

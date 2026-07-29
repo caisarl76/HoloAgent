@@ -26,6 +26,13 @@ MANAGED_PARAMETER_NODES = (
     "lifecycle_manager_stage4",
 )
 
+MANAGED_LIFECYCLE_NODES = (
+    "map_server",
+    "planner_server",
+    "controller_server",
+    "bt_navigator",
+)
+
 
 def validate_pre_activation_contract(
     *,
@@ -96,6 +103,8 @@ def activate_stage4(
     *, config_path: Path, manifest_path: Path, output_path: Path
 ) -> dict[str, object]:
     import rclpy
+    from lifecycle_msgs.msg import Transition
+    from lifecycle_msgs.srv import ChangeState
     from nav2_msgs.srv import ManageLifecycleNodes
     from rcl_interfaces.msg import ParameterType
     from rcl_interfaces.srv import GetParameters
@@ -116,21 +125,48 @@ def activate_stage4(
                 name: self.create_client(GetParameters, f"/{name}/get_parameters")
                 for name in MANAGED_PARAMETER_NODES
             }
+            self.configure_clients = {
+                name: self.create_client(ChangeState, f"/{name}/change_state")
+                for name in MANAGED_LIFECYCLE_NODES
+            }
             self.manage = self.create_client(
                 ManageLifecycleNodes, "/lifecycle_manager_stage4/manage_nodes"
             )
             self.active = self.create_client(
                 Trigger, "/lifecycle_manager_stage4/is_active"
             )
-            self.deadline = time.monotonic() + 60.0
+            self.deadline = time.monotonic() + 120.0
 
-        def wait_future(self, future: Any, *, timeout_sec: float) -> Any:
+        def wait_future(
+            self, future: Any, *, timeout_sec: float, context: str
+        ) -> Any:
             deadline = min(self.deadline, time.monotonic() + timeout_sec)
             while not future.done() and time.monotonic() < deadline:
                 rclpy.spin_once(self, timeout_sec=0.05)
             if not future.done() or future.exception() is not None:
-                raise Stage4ActivationError("pre-activation ROS request timed out")
+                raise Stage4ActivationError(
+                    f"pre-activation ROS request timed out: {context}"
+                )
             return future.result()
+
+        def configure_managed_nodes(self) -> list[str]:
+            configured: list[str] = []
+            for name, client in self.configure_clients.items():
+                if not client.wait_for_service(timeout_sec=15.0):
+                    raise Stage4ActivationError(
+                        f"{name} lifecycle service unavailable before activation"
+                    )
+                request = ChangeState.Request()
+                request.transition.id = Transition.TRANSITION_CONFIGURE
+                response = self.wait_future(
+                    client.call_async(request),
+                    timeout_sec=30.0,
+                    context=f"configure {name}",
+                )
+                if response is None or not response.success:
+                    raise Stage4ActivationError(f"{name} lifecycle configure failed")
+                configured.append(name)
+            return configured
 
         def read_live_parameters(self) -> dict[str, dict[str, Any]]:
             values: dict[str, dict[str, Any]] = {}
@@ -144,7 +180,8 @@ def activate_stage4(
                     names.append("yaml_filename")
                 response = self.wait_future(
                     client.call_async(GetParameters.Request(names=names)),
-                    timeout_sec=5.0,
+                    timeout_sec=10.0,
+                    context=f"read parameters from {name}",
                 )
                 if response is None or len(response.values) != len(names):
                     raise Stage4ActivationError(f"{name} parameters unavailable")
@@ -161,20 +198,24 @@ def activate_stage4(
                 values[name] = parameters
             return values
 
-        def startup(self) -> None:
+        def activate_managed_nodes(self) -> None:
             if not self.manage.wait_for_service(timeout_sec=10.0):
                 raise Stage4ActivationError("Nav2 lifecycle manager is unavailable")
             request = ManageLifecycleNodes.Request()
-            request.command = ManageLifecycleNodes.Request.STARTUP
+            request.command = ManageLifecycleNodes.Request.RESUME
             response = self.wait_future(
-                self.manage.call_async(request), timeout_sec=30.0
+                self.manage.call_async(request),
+                timeout_sec=60.0,
+                context="activate configured Nav2 nodes",
             )
             if response is None or not response.success:
-                raise Stage4ActivationError("Nav2 lifecycle startup failed")
+                raise Stage4ActivationError("Nav2 lifecycle activation failed")
             if not self.active.wait_for_service(timeout_sec=5.0):
                 raise Stage4ActivationError("Nav2 active-state service is unavailable")
             active = self.wait_future(
-                self.active.call_async(Trigger.Request()), timeout_sec=5.0
+                self.active.call_async(Trigger.Request()),
+                timeout_sec=5.0,
+                context="verify Nav2 active state",
             )
             if active is None or not active.success:
                 raise Stage4ActivationError("Nav2 did not report active after startup")
@@ -182,13 +223,16 @@ def activate_stage4(
     rclpy.init()
     node = ActivationNode()
     try:
+        configured_nodes = node.configure_managed_nodes()
         live = node.read_live_parameters()
         evidence = validate_pre_activation_contract(
             config_path=config_path,
             manifest_path=manifest_path,
             live_parameters=live,
         )
-        node.startup()
+        evidence["configured_nodes"] = configured_nodes
+        node.activate_managed_nodes()
+        evidence["lifecycle_activation_command"] = "RESUME"
         evidence["lifecycle_active"] = True
         _write_json(output_path, evidence)
         return evidence
