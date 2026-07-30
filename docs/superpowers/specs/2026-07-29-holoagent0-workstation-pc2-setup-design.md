@@ -68,8 +68,11 @@ setup cannot prove that an unrelated privileged actor never ran a motion
 client. Its narrower, auditable claim is:
 
 > The approved automation invoked only hashed, allowlisted sensor/readiness
-> commands, and its continuous `/proc` monitor did not observe a prohibited or
-> Unitree-SDK-linked executable during the recorded action window.
+> commands; its continuous monitor did not observe a control-specific
+> signature during the recorded action window and recorded the identity
+> classification of every sensor candidate. Active camera/full-stream profiles
+> additionally required every sensor candidate to match its approved identity
+> and ROS-graph allowlist.
 
 The result must use exactly that wording or a stricter claim supported by a
 future enforceable sandbox. It must never shorten the claim to "PC2 ran no
@@ -199,12 +202,28 @@ Plans are UTF-8 JSON, at most 65,536 bytes, and validate against tracked
 - `additionalProperties: false` at every object level.
 
 The normal text-to-LLM path remains available but is not used by an offline
-profile. Unit tests inject transport spies for `socket.connect`,
-`socket.create_connection`, `requests`, and the OpenAI client factories. The
-integration gate also runs the offline process under
-`strace -f -e trace=connect,sendto,sendmsg` and requires an empty syscall trace.
-Blocking the network is defense in depth; zero attempted transport syscalls is
-the actual gate.
+profile. The zero-side-effect proof has three independent guards:
+
+1. Unit tests inject failing spies for `socket.connect`,
+   `socket.create_connection`, `requests`, OpenAI client factories,
+   `subprocess.Popen/run/call/check_call/check_output`, `os.system`, all
+   available `os.exec*`, `os.spawn*`, `os.fork`, and
+   `multiprocessing.Process.start`.
+2. A Python audit hook fails and records any socket, subprocess, fork, exec, or
+   spawn event. An import guard fails and records any attempted import of
+   `rclpy`, `rosidl_runtime_py`, `std_msgs`, or `geometry_msgs`; fake `rclpy`
+   publisher/node objects also raise if reached in unit tests.
+3. The integration process runs under `strace`. The transport trace
+   (`connect`, `sendto`, `sendmsg`) must be empty. The process trace may contain
+   only the one initial `execve` of the resolved approved Python interpreter;
+   it must contain no subsequent `execve`, `execveat`, `fork`, `vfork`,
+   `clone`, or `clone3`. ROS graph snapshots in an isolated, daemon-disabled
+   domain must be identical before and after the run, excluding the bounded
+   snapshot CLI helper itself.
+
+Blocking the network and removing ROS configuration are defense in depth; zero
+attempted transport, process-spawn, and ROS-publication side effects is the
+actual gate.
 
 ### 2. HoloAgent-0 Readiness Runner
 
@@ -266,11 +285,55 @@ the exact SHA-256, then invoked with the equivalent of:
 
 An upstream digest or integrity change requires a reviewed pin update; the
 runner never accepts `latest`. Installation does not start or refresh a
-gateway. The automated health gate is the documented read-only
-`openclaw doctor --lint --json`, with exit 0 required. The official installer
-and doctor behavior are defined at
+gateway.
+
+After installation, provisioning creates a dedicated configuration only when
+`~/.openclaw-holoagent0` does not already exist. Any pre-existing non-identical
+file or directory fails without mutation. The tracked template
+`scripts/holoagent0_setup/config/openclaw-local-v1.json` has exactly this
+security-relevant content:
+
+```json
+{
+  "gateway": {
+    "mode": "local",
+    "bind": "loopback",
+    "port": 18789,
+    "auth": {
+      "mode": "token",
+      "token": "${OPENCLAW_GATEWAY_TOKEN}"
+    }
+  }
+}
+```
+
+The provisioner records the tracked template's Git blob and SHA-256, copies it
+atomically to `~/.openclaw-holoagent0/openclaw.json` with mode `0600`, and uses
+`OPENCLAW_CONFIG_PATH=$HOME/.openclaw-holoagent0/openclaw.json` and
+`OPENCLAW_STATE_DIR=$HOME/.openclaw-holoagent0/state`. An identical existing
+directory is reusable only when its permissions, file set, template digest, and
+absence of service/listener state all match; extra or changed state fails
+without mutation. The provisioner generates an ephemeral token of at least 32
+random bytes for validation and optional smoke-test environments; the token is
+never persisted, printed, or hashed into evidence.
+
+With that environment set, the required non-service checks are exact:
+
+1. `openclaw config validate --json` exits 0 and reports a valid active schema.
+2. `openclaw doctor --lint --only core/doctor/gateway-config --severity-min warning --json`
+   exits 0, reports `checksRun: 1`, and has an empty `findings` array.
+3. `openclaw doctor --lint --severity-min error --json` exits 0, reports at
+   least one check run, and has no error finding. Warning/info findings below
+   the selected threshold are not acceptance failures.
+4. The service/process/socket preflight is repeated and proves that configuring
+   and linting did not start a gateway or listener.
+
+The commands use the documented read-only lint posture; no `doctor --fix`,
+onboarding, or service command is allowed. The official configuration and
+doctor behavior are defined at
 <https://docs.openclaw.ai/install/installer> and
-<https://docs.openclaw.ai/cli/doctor>.
+<https://docs.openclaw.ai/cli/doctor>, with configuration fields defined at
+<https://docs.openclaw.ai/gateway/configuration-reference>.
 
 An optional gateway smoke test is a separate explicitly authorized action. It
 uses an unused port, loopback bind, authentication, and an owned session. It
@@ -394,6 +457,20 @@ is `READY_MUJOCO_STAGE4_ESTIMATOR_FAILED`, status `QUALIFIED`, exit 10. It is
 never `PASS_HOLOAGENT0_MUJOCO`. `PASS_HOLOAGENT0_MUJOCO` requires fresh Stage
 1, 2, 3, and 4 passes.
 
+For every reused Stage 1-4 script, the consolidated runner treats the child exit
+code as one input rather than the final classification. After the child exits,
+it requires a final result with `postflight_pass: true`. A false or missing
+postflight value is `FAIL_SAFETY`, exit 30, even when the evaluator already
+returned nonzero; later stages are `NOT_RUN`. This supplies safety-first result
+precedence above the existing scripts' shell exit-code selection without
+claiming that their internal cleanup implementation changed.
+
+The stronger PID/PGID/start-time/executable ownership contract below applies
+only to newly implemented PC2 actions and the optional OpenClaw smoke gateway.
+The reused Stage 1-4 scripts retain their already validated PID/container
+cleanup in this milestone. Hardening all four stage scripts against PID reuse is
+separate future work and is not an acceptance claim of this design.
+
 ### 7. PC2 Sensor-Only Action and Owned Cleanup
 
 A Bash script under `robots/unitree/scripts/` is safe to copy to PC2. It uses
@@ -404,17 +481,51 @@ Unitree SDK command, and accepts exactly one profile:
 Before a sensor action, the script:
 
 1. verifies its own local and remote SHA-256 against the reviewed digest;
-2. inventories executable files under the Unitree repository and overlays;
-3. uses ELF dynamic-section inspection to find executables linked to Unitree
-   SDK, DDS, or known control libraries, recording canonical path and SHA-256;
-4. scans `/proc/*/exe`, `/proc/*/cmdline`, and `/proc/*/maps` for those paths,
-   hashes, libraries, the three known G1 executables, and prohibited scripts;
-5. starts a continuous monitor before any sensor launch or sample action.
+2. inventories executable files under the Unitree repository and overlays and
+   classifies them as reviewed control, reviewed sensor, or unknown;
+3. records ELF dependencies as evidence, but treats generic ROS/DDS libraries
+   such as CycloneDDS, Fast DDS, and `rmw_*` as neutral because both legitimate
+   sensor and control processes use them;
+4. loads tracked `robots/unitree/config/pc2_sensor_allowlist_v1.json`, whose
+   entries require hostname, canonical executable path and SHA-256, owner UID,
+   exact or anchored argv pattern, parent executable or systemd unit, expected
+   ROS node/namespace, and allowed publishers/subscribers/services/actions;
+5. scans `/proc/*/exe`, `/proc/*/cmdline`, and `/proc/*/maps` and the ROS graph
+   for control-specific signatures and verifies every active sensor candidate
+   against the full identity allowlist;
+6. starts a continuous monitor before any sensor launch or sample action.
 
-The monitor samples at 20 Hz through cleanup, records monotonic timestamps and
-every match, and causes a safety failure if it exits early or observes a match.
-Because `/proc` inspection has race limits, evidence says "not observed during
-the window," not "impossible."
+A control-specific signature is one of:
+
+- an executable path/hash in the reviewed control denylist, including the
+  three G1 command binaries;
+- a prohibited control script or HTTP bridge path/argv;
+- a process exposing a known control ROS endpoint, including a `/cmd_vel`
+  subscription or Unitree arm/base command service/action; such an endpoint
+  always disqualifies a sensor allowlist entry;
+- a Unitree SDK/control-library dependency together with a control argv,
+  executable, or ROS-graph signature.
+
+DDS linkage alone, or a neutral ROS node with sensor publishers, is never a
+control match. Conversely, naming a process "sensor" is insufficient: every
+allowlisted sensor must match all recorded identity fields and must expose only
+its allowed sensor graph. The owned D435i entry is derived from the resolved
+installed package version, executable hash, exact launch argv, owned PGID, and
+camera-only topic set. A pre-existing native Mid360 publisher needs a reviewed
+host-specific allowlist entry before `camera` or `full-streams`; `inventory`
+may collect an unknown candidate for review but cannot bless or write the
+allowlist automatically. In `inventory`, an unknown SDK-linked candidate with
+no control-specific signature is diagnostic reason
+`UNCLASSIFIED_SENSOR_CANDIDATE`; in `camera` or `full-streams`, the same
+unapproved identity is a safety preflight failure.
+
+The `/proc` monitor samples at 20 Hz through cleanup. The ROS graph guard runs
+before the action, after each sensor becomes ready, at 1 Hz during the bounded
+measurement window, and during postflight. Both record monotonic timestamps and
+every classification change. A safety failure occurs if either monitor exits
+early, observes a control signature, or sees an active sensor cease matching
+its full allowlist identity. Because `/proc` inspection has race limits,
+evidence says "not observed during the window," not "impossible."
 
 The script installs `EXIT`, `INT`, `TERM`, and `HUP` traps before starting any
 child. Every owned child records PID, PGID, canonical executable, SHA-256, and
@@ -423,10 +534,11 @@ new session with PGID equal to PID. Cleanup sends a signal to its process group
 only if PID, PGID, start time, and executable still match the recorded values;
 otherwise it records an ownership mismatch and does not kill the reused PID.
 Cleanup performs a bounded TERM/wait/KILL sequence, then runs the final `/proc`
-denylist scan inside the `EXIT` trap. When postflight passes, signal traps
-preserve exits 129 for HUP, 130 for INT, and 143 for TERM. A trap-observed
-safety failure upgrades any prior outcome to exit 30. The evidence finalizer
-also runs in the trap, so an early `set -e` failure cannot bypass postflight.
+denylist scan inside the `EXIT` trap. When postflight and final evidence-schema
+validation pass, signal traps preserve exits 129 for HUP, 130 for INT, and 143
+for TERM. A trap-observed safety failure upgrades any prior outcome to exit 30;
+otherwise an invalid final result exits 40. The evidence finalizer also runs in
+the trap, so an early `set -e` failure cannot bypass postflight.
 
 `camera` starts only the resolved `realsense2_camera` launch executable in its
 owned session, validates the topic, and cleans it up. `inventory` starts no
@@ -461,17 +573,21 @@ Draft 2020-12, schema ID `holoagent0.result.v1`. The result requires:
   SHA-256 digests;
 - redacted environment posture and exact prohibited-command inventory;
 - every gate for the selected mode in fixed order, including gates not run;
-- gate ID, status, required/diagnostic role, fixed reason code, measurements,
-  thresholds, bounded log paths, and nullable child command exit code;
+- gate ID, status, role from `required`, `diagnostic`, `qualification`, or
+  `finalizer`, fixed reason code, measurements, thresholds, bounded log paths,
+  and nullable child command exit code;
 - nullable `first_blocking_gate` and an ordered `qualifications` array;
 - PC2 action-window timestamps, monitor samples, observed matches, and owned
   process identities when applicable.
 
 Gate status is one of `PASS`, `FAIL`, `QUALIFIED`, `SKIPPED`, or `NOT_RUN`:
 
-- `SKIPPED` means policy explicitly permits a diagnostic not to execute.
-- `NOT_RUN` means an earlier blocking failure or interruption prevented it.
-- Every later gate is materialized as `NOT_RUN`; it is never omitted.
+- `SKIPPED` means a reached diagnostic is policy-disabled or a reached
+  conditional gate has no nonblocking prerequisite.
+- `NOT_RUN` means an earlier blocking failure or interruption prevented a
+  sequenced action gate from running.
+- Later action gates become `NOT_RUN`; mandatory finalizers still execute and
+  record their terminal state.
 - A diagnostic failure is recorded but cannot become a blocking failure.
 
 Top-level exit codes are fixed:
@@ -513,7 +629,7 @@ run-specific IDs:
 | --- | --- |
 | Source/runtime | `source.repository`, `source.semantic_blobs`, `source.pc2_script`, `runtime.workstation`, `runtime.pc2`, `offline.reference` |
 | Safety | `safety.workstation_preflight`, `safety.workstation_postflight`, `safety.pc2_preflight`, `safety.pc2_runtime_monitor`, `safety.pc2_postflight` |
-| OpenClaw | `openclaw.preexisting`, `openclaw.version_pin`, `openclaw.doctor_lint` |
+| OpenClaw | `openclaw.preexisting`, `openclaw.version_pin`, `openclaw.config_pin`, `openclaw.config_validate`, `openclaw.doctor_lint` |
 | Skills | `skills.registry`, `skills.dry_run` |
 | AgentOS | `agentos.plan_schema`, `agentos.offline_execution`, `agentos.network_attempts` |
 | Semantic | `semantic.asset_lock`, `semantic.fixture_graph`, `semantic.fixture_query`, `semantic.natural_language_parser` |
@@ -525,9 +641,10 @@ run-specific IDs:
 
 ### Required-Gate Decision Table
 
-`R` is required, `D` is diagnostic, and `-` is policy `NOT_RUN` or `SKIPPED`.
-The schema contains the complete fixed gate-ID enum; this table defines the
-profile decision boundary.
+`R` is required, `D` is diagnostic, `Q` is a qualification gate, `F` is a
+mandatory finalizer, and `-` means the gate is not a member of that profile and
+is absent from its result. The schema contains the complete fixed gate-ID enum;
+this table defines the profile decision boundary.
 
 | Exact gate IDs | workstation offline | workstation MuJoCo | PC2 inventory | PC2 camera | PC2 full streams |
 | --- | --- | --- | --- | --- | --- |
@@ -535,19 +652,22 @@ profile decision boundary.
 | `source.pc2_script` | - | - | R | R | R |
 | `runtime.workstation` | R | R | - | - | - |
 | `runtime.pc2` | - | - | R | R | R |
-| `safety.workstation_preflight`, `safety.workstation_postflight` | R | R | - | - | - |
-| `safety.pc2_preflight`, `safety.pc2_runtime_monitor`, `safety.pc2_postflight` | - | - | R | R | R |
+| `safety.workstation_preflight` | R | R | - | - | - |
+| `safety.workstation_postflight` | F | F | - | - | - |
+| `safety.pc2_preflight` | - | - | R | R | R |
+| `safety.pc2_runtime_monitor`, `safety.pc2_postflight` | - | - | F | F | F |
 | `offline.reference` | - | R | - | - | - |
-| `openclaw.preexisting`, `openclaw.version_pin`, `openclaw.doctor_lint` | R | D through offline result reference | - | - | - |
-| `skills.registry`, `skills.dry_run` | R | D through offline result reference | - | - | - |
-| `agentos.plan_schema`, `agentos.offline_execution`, `agentos.network_attempts` | R | D through offline result reference | - | - | - |
-| `source.semantic_blobs`, `semantic.asset_lock`, `semantic.fixture_graph`, `semantic.fixture_query` | R | D through offline result reference | - | - | - |
+| `openclaw.preexisting`, `openclaw.version_pin`, `openclaw.config_pin`, `openclaw.config_validate`, `openclaw.doctor_lint` | R | - (covered by `offline.reference`) | - | - | - |
+| `skills.registry`, `skills.dry_run` | R | - (covered by `offline.reference`) | - | - | - |
+| `agentos.plan_schema`, `agentos.offline_execution`, `agentos.network_attempts` | R | - (covered by `offline.reference`) | - | - | - |
+| `source.semantic_blobs`, `semantic.asset_lock`, `semantic.fixture_graph`, `semantic.fixture_query` | R | - (covered by `offline.reference`) | - | - | - |
 | `semantic.natural_language_parser` | D, default SKIPPED | - | - | - | - |
-| `chatbot.dependencies`, `chatbot.configuration` | R | D through offline result reference | - | - | - |
-| `chatbot.credentials`, `chatbot.audio_hardware` | qualification | D through offline result reference | - | - | - |
+| `chatbot.dependencies`, `chatbot.configuration` | R | - (covered by `offline.reference`) | - | - | - |
+| `chatbot.credentials`, `chatbot.audio_hardware` | Q | - (covered by `offline.reference`) | - | - | - |
 | `mujoco.stage1`, `mujoco.stage2`, `mujoco.stage3`, `mujoco.stage4` | - | R, subject to Stage 3 qualified rule | - | - | - |
 | `pc2.inventory`, `pc2.camera_inventory` | - | - | R | R | R |
-| `pc2.camera_sample`, `pc2.camera_rate`, `pc2.camera_cleanup` | - | - | - | R | R |
+| `pc2.camera_sample`, `pc2.camera_rate` | - | - | - | R | R |
+| `pc2.camera_cleanup` | - | - | - | F | F |
 | `pc2.lidar_advertisement`, `pc2.lidar_sample`, `pc2.lidar_rate`, `pc2.lidar_schema` | - | - | D | D | R |
 | `pc2.imu_advertisement`, `pc2.imu_sample`, `pc2.imu_rate` | - | - | D | D | R |
 
@@ -557,13 +677,127 @@ which returns `FAIL_PC2_STREAMS` rather than a free-form
 `FAIL_LIDAR_INACTIVE` label; the fixed lidar gate ID and reason code carry that
 detail.
 
+### `offline.reference` Acceptance
+
+`workstation_mujoco` does not accept an arbitrary result path. It runs
+`workstation_offline` as an immediately preceding child of the same parent run
+and records the child result's SHA-256 and run ID. `offline.reference` passes
+only when all of these are true:
+
+- the child result validates against the exact result-schema digest recorded by
+  the parent;
+- its label is `PASS_HOLOAGENT0_OFFLINE`, `READY_CREDENTIALS_REQUIRED`,
+  `READY_AUDIO_HARDWARE_REQUIRED`, or
+  `READY_CREDENTIALS_AND_AUDIO_REQUIRED`;
+- its status is respectively `PASS` or `QUALIFIED`, and its process exit is
+  respectively 0 or 10;
+- `first_blocking_gate` is null, every required offline gate is `PASS`, and no
+  gate has blocking status `FAIL`;
+- its only qualifications, if any, are the credential/audio gates represented
+  by its allowed top-level label;
+- its source commit, 74-blob manifest digest, asset-lock digest, graph/dataset/
+  checkpoint digests, AgentOS plan-schema digest, OpenClaw configuration
+  template digest, evidence-schema digest, and gate-policy digest exactly match
+  the parent run;
+- it completed after the parent preflight and before Stage 1 began.
+
+An externally supplied or older offline result can be inspected as a
+diagnostic, but cannot satisfy `offline.reference` or permit a MuJoCo pass.
+
+### Total Gate Order and Terminal-State Rules
+
+Each profile result contains its exact ordered sequence below. Initialization
+materializes every member as `NOT_RUN`; evaluation replaces statuses in order.
+Gates not in the selected sequence are absent, not `SKIPPED`.
+
+`workstation_offline` order:
+
+1. `source.repository`
+2. `runtime.workstation`
+3. `safety.workstation_preflight`
+4. `openclaw.preexisting`
+5. `openclaw.version_pin`
+6. `openclaw.config_pin`
+7. `openclaw.config_validate`
+8. `openclaw.doctor_lint`
+9. `skills.registry`
+10. `skills.dry_run`
+11. `agentos.plan_schema`
+12. `agentos.offline_execution`
+13. `agentos.network_attempts`
+14. `source.semantic_blobs`
+15. `semantic.asset_lock`
+16. `semantic.fixture_graph`
+17. `semantic.fixture_query`
+18. `semantic.natural_language_parser`
+19. `chatbot.dependencies`
+20. `chatbot.configuration`
+21. `chatbot.credentials`
+22. `chatbot.audio_hardware`
+23. `safety.workstation_postflight` (mandatory finalizer)
+
+`workstation_mujoco` order:
+
+1. `source.repository`
+2. `runtime.workstation`
+3. `safety.workstation_preflight`
+4. `offline.reference`
+5. `mujoco.stage1`
+6. `mujoco.stage2`
+7. `mujoco.stage3`
+8. `mujoco.stage4`
+9. `safety.workstation_postflight` (mandatory finalizer)
+
+All PC2 profiles begin with this prefix:
+
+1. `source.repository`
+2. `source.pc2_script`
+3. `runtime.pc2`
+4. `safety.pc2_preflight`
+5. `pc2.inventory`
+6. `pc2.camera_inventory`
+
+`pc2_inventory` then evaluates, in order,
+`pc2.lidar_advertisement`, `pc2.lidar_sample`, `pc2.lidar_rate`,
+`pc2.lidar_schema`, `pc2.imu_advertisement`, `pc2.imu_sample`,
+`pc2.imu_rate`, `safety.pc2_runtime_monitor`, and
+`safety.pc2_postflight`.
+
+`pc2_camera` and `pc2_full_streams` continue after the prefix with
+`pc2.camera_sample`, `pc2.camera_rate`, `pc2.lidar_advertisement`,
+`pc2.lidar_sample`, `pc2.lidar_rate`, `pc2.lidar_schema`,
+`pc2.imu_advertisement`, `pc2.imu_sample`, `pc2.imu_rate`,
+`pc2.camera_cleanup`, `safety.pc2_runtime_monitor`, and
+`safety.pc2_postflight`. The lidar/IMU gates are diagnostic in `pc2_camera` and
+required in `pc2_full_streams` as defined above.
+
+Status transitions are deterministic:
+
+- A reached required or diagnostic gate that executes is `PASS` or `FAIL`.
+- A reached qualification gate is `PASS` or `QUALIFIED`.
+- `SKIPPED` is used only for a reached policy-disabled diagnostic (the offline
+  natural-language parser) or a conditional gate whose nonblocking prerequisite
+  is absent. In a diagnostic PC2 chain, a missing advertisement makes sample,
+  rate, and schema gates `SKIPPED`; an advertised topic with no sample records a
+  diagnostic sample `FAIL` and makes its rate/schema gates `SKIPPED`. The same
+  missing required advertisement or sample in `pc2_full_streams` is blocking
+  and leaves later action gates `NOT_RUN`. The IMU chain follows the same rule
+  without a schema gate.
+- `NOT_RUN` is used for a sequenced action gate bypassed after an earlier
+  blocking failure or interruption.
+- Mandatory finalizers always run after a block or signal. A camera cleanup is
+  `SKIPPED` with fixed reason `NO_OWNED_CAMERA` if no camera child was created;
+  otherwise it is `PASS` or `FAIL`. Safety postflight is always `PASS` or
+  `FAIL`. The runtime-monitor finalizer is `SKIPPED` with fixed reason
+  `MONITOR_NOT_STARTED` only when preflight failed before it could start.
+
 ### Label Precedence
 
 The runner evaluates labels in this fixed order:
 
 1. any safety failure, including a trap-owned postflight failure;
-2. interruption when postflight passes;
-3. evidence/schema/harness failure;
+2. evidence/schema/harness failure when safety postflight passed;
+3. interruption only when safety postflight and final schema validation passed;
 4. first required functional failure in profile gate order, mapped to its fixed
    domain failure label;
 5. allowed qualification, including the combined audio/credential table and
@@ -579,6 +813,10 @@ same-directory temporary file, flush and `fsync` it, `os.replace` to
 `result.json`, then `fsync` the directory. A partial result is never accepted.
 If final schema validation fails, the process writes a bounded emergency text
 record and exits 40 without publishing a JSON result that claims readiness.
+On HUP, INT, or TERM, the trap first marks unfinished action gates `NOT_RUN`,
+runs all finalizers, builds the `INTERRUPTED` result, and validates it. A safety
+failure therefore exits 30; otherwise a schema failure exits 40; only a
+schema-valid, postflight-safe interruption preserves exit 129, 130, or 143.
 
 ## Safety Contract
 
@@ -595,10 +833,11 @@ The following are hard failures:
 5. A PC2 command is outside the hashed allowlist or contains a publisher,
    control script, HTTP bridge, Nav2 launch, tmux/FIFO/daemon action, or Unitree
    SDK executable.
-6. The PC2 continuous monitor stops early or observes a prohibited/SDK-linked
-   process during the action window.
-7. A cleanup target does not match its recorded PID, PGID, start time, and
-   executable identity.
+6. The PC2 continuous monitor stops early, observes a control-specific
+   signature, or observes an allowlisted sensor identity/graph mismatch during
+   the action window. Generic DDS linkage alone is neutral.
+7. A PC2 or optional OpenClaw cleanup target does not match its recorded PID,
+   PGID, start time, and executable identity.
 8. OpenClaw provisioning finds a pre-existing gateway/service/listener, a pin
    mismatch, or any automatic service start.
 9. An OpenClaw smoke gateway binds outside loopback or lacks authentication.
@@ -606,10 +845,14 @@ The following are hard failures:
     subprocess, or physical execution.
 11. A secret value appears in stdout, logs, evidence, or a Git-tracked file.
 
-On failure, an orchestrator stops only identity-matched processes it started,
-terminates MuJoCo with a final zero command, runs trap-owned postflight, marks
-remaining gates `NOT_RUN`, records the first blocking gate, and exits according
-to the fixed table. It never tries a less isolated fallback.
+On PC2 and in an optional OpenClaw smoke action, the orchestrator stops only
+identity-matched processes it started. Reused Stage 1-4 scripts own their
+existing PID/container cleanup; the consolidated runner waits for its direct
+stage-script child, requires the stage's final postflight evidence, and applies
+safety-first classification independently of that child's exit code. All
+orchestrators run their scoped postflight, mark remaining action gates
+`NOT_RUN`, record the first blocking gate, and exit according to the fixed
+table. They never try a less isolated fallback.
 
 ## Testing Strategy
 
@@ -618,34 +861,44 @@ Implementation follows test-driven development.
 ### Unit tests
 
 - AgentOS plan schema, size limit, unknown-field rejection, CLI mutual
-  constraints, DAG validation, and proof that live dependency factories/imports
-  are not reached.
+  constraints, DAG validation, and failing network/process/ROS guards proving
+  that live dependency factories/imports and side-effect surfaces are not
+  reached.
 - Evidence JSON Schema, closed label/gate enums, mode table, status/exit-code
-  consistency, precedence, atomic writes, redaction, and interruption states.
+  consistency, exact per-profile ordering, `SKIPPED`/`NOT_RUN` transitions,
+  atomic writes, redaction, and safety/schema/interruption precedence.
 - Stage 3 pass, qualified continuation, prerequisite failure, malformed result,
-  and Stage 4 `NOT_RUN` behavior.
-- OpenClaw pins, pre-existing lifecycle detection, read-only doctor argv, socket
-  ownership, and refusal to mutate/upgrade.
+  Stage 4 `NOT_RUN` behavior, and postflight safety overriding every evaluator
+  exit code.
+- `offline.reference` allowed labels/exits, required-gate closure, parent/child
+  timing, and every source/config/asset digest mismatch.
+- OpenClaw pins, pre-existing lifecycle detection, exact minimal configuration,
+  schema validation, focused/full lint thresholds, socket ownership, and
+  refusal to mutate/upgrade.
 - Semantic 74-blob verification, canonical asset manifests, exact fixture
   identity/pose, and parser `SKIPPED` behavior.
 - Chatbot dependency failure and all four credential/audio classifications.
-- PC2 static command allowlist, ELF inventory parsing, `/proc` observations,
+- PC2 static command allowlist, neutral DDS classification, control-signature
+  conjunctions, full sensor identity/graph matching, `/proc` observations,
   PID-reuse defense, signal/early-error trap cleanup, and profile gate roles.
 
 ### Integration tests
 
-- Run AgentOS offline with transport spies and syscall tracing; require zero
-  transport attempts and the expected artifacts.
+- Run AgentOS offline with transport/process/ROS spies, an audit hook, syscall
+  tracing, and graph snapshots; require zero transport, child-process, and ROS
+  publication attempts and the expected artifacts.
 - Run workstation offline checks in a network-disabled unprivileged container.
-- Verify exact OpenClaw/Node artifacts and `doctor --lint --json` without a
-  gateway process or listener.
+- Verify exact OpenClaw/Node artifacts, the pinned local configuration,
+  `config validate`, both exact lint commands, and the absence of a gateway
+  process/service/listener.
 - Run the structured HMSG fixture and assert graph, object, room, pose, frame,
   and ROS endpoint counts.
 - Re-run the tracked MuJoCo test manifest and require every selected test to
   exist, at least one test to be collected, and zero failures. No test-count
   equality is used.
 - Re-run Stages 1-4 under localhost DDS and validate both Stage 3 decision
-  branches and consolidated evidence.
+  branches, the exact offline child reference, postflight-over-exit precedence,
+  and consolidated evidence.
 - Run PC2 inventory and camera profiles while the continuous monitor remains
   active through trap cleanup.
 
@@ -667,28 +920,36 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
   counts, the wrong object, and a second `/object_pose`.
 - Reject wildcard gateway binds, an existing service/listener, installer hash
   drift, and unredacted credential-shaped values.
-- Launch or race a fake SDK-linked executable during the PC2 sensor window and
-  require the monitor/trap result to fail safely.
+- Show that a DDS-linked camera process is neutral; then launch or race a fake
+  control-signature process during the PC2 window and require failure. Change
+  one path/hash/UID/argv/parent/ROS-graph field of an allowed sensor and require
+  the identity monitor to fail safely.
 - Reuse a recorded PID with a different start time and prove cleanup does not
   signal it.
 - Interrupt each PC2 phase with HUP, INT, and TERM and verify identity-safe
-  cleanup, final monitoring, atomic evidence, and the correct exit code.
+  cleanup, final monitoring, atomic evidence, and the correct exit code. Inject
+  an invalid result during interruption and require exit 40 rather than a
+  schema-invalid `INTERRUPTED` result.
 
 ## Rollout and Acceptance
 
 ### Phase A: Workstation provisioning and offline profile
 
-Provision exact OpenClaw artifacts only after pre-existing lifecycle checks.
-Then run `workstation_offline` with networking disabled. Required source,
-runtime, skill, AgentOS, semantic, chatbot dependency/configuration, OpenClaw
-lint, and safety gates must pass. Credentials/audio produce only the fixed
-qualified labels in their decision table.
+Provision exact OpenClaw artifacts and the pinned minimal configuration only
+after pre-existing lifecycle checks. Validate the configuration and exact lint
+contracts without starting a gateway. Then run `workstation_offline` with
+networking disabled. Required source, runtime, skill, AgentOS, semantic, chatbot
+dependency/configuration, OpenClaw, and safety gates must pass.
+Credentials/audio produce only the fixed qualified labels in their decision
+table.
 
 ### Phase B: Workstation MuJoCo profile
 
-Require a fresh, schema-valid offline reference and fresh Stages 1-4. The result
-is `PASS_HOLOAGENT0_MUJOCO` only if all four stages pass. A qualifying estimator
-failure may continue to independent Stage 4 and yields only
+Run the offline child inside the same parent and require the full
+`offline.reference` acceptance contract above, then run fresh Stages 1-4. The
+result is `PASS_HOLOAGENT0_MUJOCO` only if all four stages and every stage
+postflight pass. A qualifying estimator failure may continue to independent
+Stage 4 and yields only
 `READY_MUJOCO_STAGE4_ESTIMATOR_FAILED` with exit 10. Any Stage 3 prerequisite
 failure stops the workflow and marks Stage 4 `NOT_RUN`.
 
@@ -696,10 +957,12 @@ failure stops the workflow and marks Stage 4 `NOT_RUN`.
 
 Run `pc2_inventory` first. Inactive lidar/IMU is diagnostic, so the observed
 PC2 can still reach `PASS_PC2_SENSOR_INVENTORY`. An explicit bounded D435i
-action may then reach `PASS_PC2_CAMERA_ONLY`; inactive lidar/IMU remains
-diagnostic. `PASS_PC2_SENSOR_STREAMS` requires the camera, native lidar, and
-native IMU required gates and quantitative thresholds. Each action runs the
-continuous monitor and trap-owned postflight.
+action may then reach `PASS_PC2_CAMERA_ONLY` only after every pre-existing
+sensor process is covered by the reviewed host allowlist; inactive lidar/IMU
+remains diagnostic. `PASS_PC2_SENSOR_STREAMS` requires the same identity
+closure plus camera, native lidar, and native IMU required gates and
+quantitative thresholds. Each action runs the continuous monitor and trap-owned
+postflight.
 
 ### Phase D: Handoff
 
