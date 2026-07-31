@@ -227,26 +227,69 @@ attempted transport, process-spawn, and ROS-publication side effects is the
 actual gate.
 
 Those three guards cover the AgentOS execution boundary. The broader
-`workstation_offline` zero-network claim has a separate
-`offline.network_attempts` gate over the complete `workstation_offline` runner
-process and all descendants—not merely the AgentOS child. An external evidence
-supervisor execs that runner as the trace root under `strace -ff -qq -yy` with
-`socket`, `connect`, `bind`, `sendto`, `sendmsg`, and `sendmmsg` captured per
-PID. The traced runner performs every offline functional gate and writes only a
-provisional result; after its entire descendant tree has exited, the supervisor
-parses the closed trace set and finalizes the authoritative result.
+`workstation_offline` contract is zero **unapproved or external** network
+traffic, not zero IP syscalls. The required ROS semantic endpoint fixture uses
+DDS, and ROS 2 derives UDP discovery and communication ports from the domain
+ID. `ROS_LOCALHOST_ONLY=1` confines discovery scope but does not remove those
+IP sockets. This behavior is documented at
+<https://docs.ros.org/en/lyrical/Concepts/Intermediate/About-Domain-ID.html>.
 
-Any `AF_INET` or `AF_INET6` socket creation, bind, connect, or send operation,
-including DNS and loopback, fails `offline.network_attempts` with reason
-`OFFLINE_NETWORK_ATTEMPT`. `AF_UNIX` and `AF_NETLINK` operations used for local
-service/socket inspection are recorded but are not network attempts. Missing
-trace files, an unclosed traced PID, ptrace loss, parser failure, or inability
-to prove descendant coverage is `FAIL_HARNESS`, never a pass. The supervisor's
-only role is external trace control, provisional-result validation, and final
-atomic evidence assembly; it is outside the explicitly identified profile
-action boundary and may not execute a profile gate. The result records the
-trace-root PID and the complete descendant PID set. The network-disabled
-container remains defense in depth, not the proof of zero attempts.
+An external evidence supervisor owns two mandatory finalizers over the complete
+`workstation_offline` runner and every descendant:
+`offline.trace_integrity` and `offline.network_policy`. It starts the runner as
+the trace root in an owned session under `strace -ff -qq -yy`, capturing
+`socket`, `setsockopt`, `connect`, `bind`, `sendto`, `sendmsg`, and `sendmmsg`
+per PID. The runner performs every functional gate, runs
+`safety.workstation_postflight`, closes a provisional gate ledger, and exits.
+Only after the traced process tree and `strace` have closed does the supervisor
+evaluate trace integrity, then network policy, compute the winning outcome,
+atomically write the authoritative `result.json`, and return the authoritative
+process exit. The runner never writes a readiness result or chooses the final
+exit.
+
+The supervisor itself performs no functional or action gate; its only profile
+gates are the two finalizers it owns, and it needs no IP socket. From process
+start, a Python audit hook rejects and records any internet-family socket
+construction. After spawning `strace` and the runner, the supervisor installs
+a non-inherited seccomp filter on itself that denies new
+`AF_INET`/`AF_INET6` sockets; failure to install that filter is
+`offline.trace_integrity: FAIL`. The trace tool and traced runner do not inherit
+this supervisor-only filter, so the semantic DDS allowance remains usable and
+observable.
+
+The complete traced runner executes in a dedicated network namespace whose
+only interface and route are loopback. The namespace state is recorded before
+and after; `ROS_DOMAIN_ID=77`, `ROS_LOCALHOST_ONLY=1`,
+`ROS2CLI_DISABLE_DAEMON=1`, and `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` are
+mandatory. `AF_UNIX` and `AF_NETLINK` operations used for local inspection are
+allowed. The only allowed `AF_INET`/`AF_INET6` operations are UDP DDS operations
+during the measured `semantic.fixture_query` interval, issued by the recorded
+fixture participant PIDs, with endpoints limited to the domain-77 DDS port set:
+multicast ports 26650/26651 and participant unicast ports
+`26660 + 2*p`/`26661 + 2*p` for the recorded participant indices `p`.
+Loopback/wildcard binds and the middleware's recorded DDS multicast destinations
+are allowed only because the namespace has no non-loopback interface or route.
+
+TCP, DNS, an IP operation outside the semantic-fixture interval or participant
+set, a UDP endpoint outside that DDS port policy, or any non-loopback route or
+interface fails `offline.network_policy` with
+`UNEXPECTED_NETWORK_ATTEMPT`. Every allowed DDS syscall is retained in evidence
+with PID, timestamp, address, port, and fixture interval. Missing trace shards,
+an unclosed traced PID, ptrace loss, parser failure, or incomplete descendant
+coverage fails `offline.trace_integrity` as `FAIL_HARNESS`; in that case
+`offline.network_policy` is `SKIPPED` with `DEPENDENCY_NOT_AVAILABLE`, never
+reported as a pass.
+
+The supervisor installs `HUP`, `INT`, and `TERM` handlers before launch and
+records the first signal. If the identity-matched runner session is live, it
+forwards that signal exactly once to the runner PGID while leaving `strace`
+alive to observe runner cleanup and postflight. It then performs a bounded
+wait, followed by identity-checked TERM and KILL escalation only if needed.
+Repeated signals are recorded but do not bypass finalization. After the runner
+and trace close, the supervisor always evaluates its two finalizers and applies
+safety-over-harness-over-interruption precedence. Only a schema-valid result
+with runner postflight, trace integrity, and network policy satisfied preserves
+exit 129, 130, or 143.
 
 ### 2. HoloAgent-0 Readiness Runner
 
@@ -264,8 +307,9 @@ It exposes explicit modes rather than a single ambiguous workflow:
 - `pc2_camera`
 - `pc2_full_streams`
 
-`workstation_offline` never starts a service and makes zero network attempts as
-proven by the complete-profile trace contract above.
+`workstation_offline` never starts a service or permits external network
+traffic. Its sole IP allowance is the traced, namespace-confined DDS loopback
+traffic required by `semantic.fixture_query`.
 OpenClaw provisioning is a separate explicit action. `workstation_mujoco`
 delegates only to the existing Stage 1-4 scripts after rechecking localhost DDS
 and the graph allowlist.
@@ -508,6 +552,23 @@ publisher, zero persistent object-pose subscribers, no Nav2 nodes, and no
 `/cmd_vel`. The capture adds one temporary subscriber and must receive exactly
 one pose.
 
+This gate is the sole offline IP exception. It publishes its monotonic start/
+end timestamps and exact ROS process identities to the trace supervisor. Its
+DDS window includes only the exact query publisher, result subscriber, fixture
+node, and bounded graph-inspection helper identities. All must exit and close
+their DDS sockets before the interval ends. Their UDP activity must satisfy the
+namespace, PID, domain-77 port, and timing allowance in
+`offline.network_policy`; passing the semantic result alone cannot bless
+additional traffic.
+
+In `workstation_offline`, safety preflight and postflight must not create a ROS
+participant. Preflight uses process, namespace, and socket inspection; the
+semantic gate performs the one bounded ROS graph proof inside its allowed
+window; postflight verifies those recorded PIDs and DDS sockets are gone using
+`/proc` and local socket state. The MuJoCo profile may use its separate
+localhost-DDS graph checks because it is not governed by the offline network
+policy.
+
 The existing natural-language parser is known to call an external
 chat-completion API even when `NAV_AGENT_USE_GPT=0`; room label generation may
 also call externally. Therefore `semantic.natural_language_parser` is an
@@ -699,7 +760,8 @@ closed policy artifacts are authoritative:
 - `scripts/holoagent0_setup/policies/holoagent0-gate-policy-v1.json` defines
   exact profile membership and order, gate roles, finalizer classes, the
   top-level status enum, exact label/status/exit-class/process-exit tuples, and
-  same-precedence tie breaking;
+  closed per-mode winner/qualification-to-label mappings, and same-precedence
+  tie breaking;
 - `scripts/holoagent0_setup/policies/holoagent0-reason-codes-v1.json` defines
   the allowed reason-code enum and the allowed reason codes for each
   gate/status pair.
@@ -752,8 +814,8 @@ The v1 reason-code policy is a closed enum containing:
   `DEPENDENCY_NOT_AVAILABLE`, `NO_OWNED_CAMERA`, and
   `MONITOR_NOT_STARTED`;
 - source/runtime/evidence: `SOURCE_MISMATCH`, `RUNTIME_MISMATCH`,
-  `DIGEST_MISMATCH`, `EVIDENCE_SCHEMA_INVALID`, `TOOL_RUNTIME_ERROR`, and
-  `ATOMIC_WRITE_FAILED`;
+  `DIGEST_MISMATCH`, `EVIDENCE_SCHEMA_INVALID`, `TRACE_INCOMPLETE`,
+  `TOOL_RUNTIME_ERROR`, and `ATOMIC_WRITE_FAILED`;
 - safety/process/graph: `UNEXPECTED_CONTROL_PROCESS`,
   `PROCESS_ALLOWLIST_MISMATCH`, `GRAPH_ALLOWLIST_MISMATCH`,
   `MONITOR_EXITED`, `OWNERSHIP_MISMATCH`, `CLEANUP_INCOMPLETE`,
@@ -764,7 +826,7 @@ The v1 reason-code policy is a closed enum containing:
   `OPENCLAW_VERSION_MISMATCH`, `OPENCLAW_CONFIG_MISMATCH`,
   `OPENCLAW_CONFIG_INVALID`, and `OPENCLAW_LINT_FINDING`;
 - AgentOS/semantic/chatbot: `PLAN_INVALID`,
-  `OFFLINE_SIDE_EFFECT_ATTEMPT`, `OFFLINE_NETWORK_ATTEMPT`,
+  `OFFLINE_SIDE_EFFECT_ATTEMPT`, `UNEXPECTED_NETWORK_ATTEMPT`,
   `SEMANTIC_BLOB_MISMATCH`, `SEMANTIC_ASSET_MISMATCH`,
   `SEMANTIC_FIXTURE_MISMATCH`,
   `CHATBOT_DEPENDENCY_MISSING`, `CHATBOT_CONFIG_INVALID`,
@@ -833,6 +895,64 @@ The result schema encodes these tuples with closed conditional branches and
 class, or process exit. A safety or harness failure observed during signal
 finalization uses its higher-precedence `FAIL_*` tuple, not `INTERRUPTED`.
 
+### Authoritative Mode-to-Outcome Mapping
+
+Tuple validity is necessary but not sufficient. The gate policy contains a
+closed lookup from `(mode, primary_blocking_gate)` to failure label and from
+`(mode, exact qualification-gate set)` to qualification/pass label. The result
+schema requires the reported label to equal that lookup. A label from another
+profile or domain is invalid even if its status and exit tuple are otherwise
+valid. The selected primary gate must be a member of that mode, appear in
+`blocking_gates`, and have blocking `FAIL`; the qualification set must exactly
+equal the result's `QUALIFIED` gates. The policy validator rejects missing,
+extra, diagnostic, or wrong-mode selectors.
+
+When there is no blocking gate and no interruption, these are the only
+mappings:
+
+| Mode | Exact qualification condition after every required/finalizer gate passes | Required label |
+| --- | --- | --- |
+| `workstation_offline` | none | `PASS_HOLOAGENT0_OFFLINE` |
+| `workstation_offline` | only `chatbot.credentials` | `READY_CREDENTIALS_REQUIRED` |
+| `workstation_offline` | only `chatbot.audio_hardware` | `READY_AUDIO_HARDWARE_REQUIRED` |
+| `workstation_offline` | exactly `chatbot.credentials` and `chatbot.audio_hardware` | `READY_CREDENTIALS_AND_AUDIO_REQUIRED` |
+| `workstation_mujoco` | none | `PASS_HOLOAGENT0_MUJOCO` |
+| `workstation_mujoco` | only the allowed `mujoco.stage3` estimator qualification, with Stage 4 passed | `READY_MUJOCO_STAGE4_ESTIMATOR_FAILED` |
+| `pc2_inventory` | none; diagnostic lidar/IMU failures do not create qualifications | `PASS_PC2_SENSOR_INVENTORY` |
+| `pc2_camera` | none; diagnostic lidar/IMU failures do not create qualifications | `PASS_PC2_CAMERA_ONLY` |
+| `pc2_full_streams` | none | `PASS_PC2_SENSOR_STREAMS` |
+
+An offline child's credential/audio qualification remains in that child result
+and does not create a new combined qualification in its MuJoCo parent.
+When interruption wins precedence, every mode uses only `INTERRUPTED` with the
+matching HUP/INT/TERM tuple defined above.
+
+When a gate wins precedence, these are the only failure mappings:
+
+| Mode | Precedence-winning fixed gate(s) | Required label |
+| --- | --- | --- |
+| any profile containing the gate | `source.repository`, `source.semantic_blobs`, or `source.pc2_script` | `FAIL_SOURCE` |
+| any profile containing the gate | `runtime.workstation` or `runtime.pc2` | `FAIL_RUNTIME` |
+| any profile containing the gate | any `safety.*` gate, `pc2.camera_cleanup`, or `offline.network_policy` | `FAIL_SAFETY` |
+| `workstation_offline` | `offline.trace_integrity` | `FAIL_HARNESS` |
+| `workstation_offline` | any `openclaw.*` gate | `FAIL_OPENCLAW` |
+| `workstation_offline` | `skills.registry`, `skills.dry_run`, or any `agentos.*` gate | `FAIL_AGENTOS` |
+| `workstation_offline` | `semantic.asset_lock`, `semantic.fixture_graph`, or `semantic.fixture_query` | `FAIL_SEMANTIC` |
+| `workstation_offline` | `chatbot.dependencies` or `chatbot.configuration` | `FAIL_CHATBOT` |
+| `workstation_mujoco` | `offline.reference` or any `mujoco.*` gate in blocking `FAIL` state | `FAIL_MUJOCO` |
+| `pc2_inventory` | `pc2.inventory` or `pc2.camera_inventory` | `FAIL_PC2_INVENTORY` |
+| `pc2_camera` | `pc2.inventory`, `pc2.camera_inventory`, `pc2.camera_sample`, or `pc2.camera_rate` | `FAIL_PC2_CAMERA` |
+| `pc2_full_streams` | any required `pc2.*` functional lidar/IMU/inventory/camera gate other than `pc2.camera_cleanup` | `FAIL_PC2_STREAMS` |
+
+Diagnostic gates cannot become `primary_blocking_gate`. Qualification gates
+cannot select a failure label unless they enter a separately defined blocking
+`FAIL` state, such as a non-qualifying Stage 3 failure. Evidence serialization,
+schema-validation, or atomic-write failure that prevents a trustworthy JSON
+result produces only the bounded emergency record and exit 40; it cannot use a
+tuple-valid but unmapped `FAIL_HARNESS` JSON result. Consequently,
+`FAIL_HARNESS` is schema-valid only for `workstation_offline` with
+`offline.trace_integrity` as its primary blocker.
+
 No dynamically constructed `FAIL_*` label is allowed.
 `primary_blocking_gate` supplies the precedence-winning fixed gate ID;
 `blocking_gates` preserves every blocking gate in observation/evaluation time
@@ -847,7 +967,7 @@ run-specific IDs:
 | --- | --- |
 | Source/runtime | `source.repository`, `source.semantic_blobs`, `source.pc2_script`, `runtime.workstation`, `runtime.pc2`, `offline.reference` |
 | Safety | `safety.workstation_preflight`, `safety.workstation_postflight`, `safety.pc2_preflight`, `safety.pc2_runtime_monitor`, `safety.pc2_postflight` |
-| Offline profile | `offline.network_attempts` |
+| Offline profile | `offline.trace_integrity`, `offline.network_policy` |
 | OpenClaw | `openclaw.preexisting`, `openclaw.version_pin`, `openclaw.registry_integrity`, `openclaw.config_pin`, `openclaw.config_validate`, `openclaw.doctor_lint` |
 | Skills | `skills.registry`, `skills.dry_run` |
 | AgentOS | `agentos.plan_schema`, `agentos.offline_execution`, `agentos.network_attempts` |
@@ -876,7 +996,7 @@ this table defines the profile decision boundary.
 | `safety.pc2_preflight` | - | - | R | R | R |
 | `safety.pc2_runtime_monitor`, `safety.pc2_postflight` | - | - | F | F | F |
 | `offline.reference` | - | R | - | - | - |
-| `offline.network_attempts` | F | - (covered by `offline.reference`) | - | - | - |
+| `offline.trace_integrity`, `offline.network_policy` | F | - (covered by `offline.reference`) | - | - | - |
 | `openclaw.preexisting`, `openclaw.version_pin`, `openclaw.registry_integrity`, `openclaw.config_pin`, `openclaw.config_validate`, `openclaw.doctor_lint` | R | - (covered by `offline.reference`) | - | - | - |
 | `skills.registry`, `skills.dry_run` | R | - (covered by `offline.reference`) | - | - | - |
 | `agentos.plan_schema`, `agentos.offline_execution`, `agentos.network_attempts` | R | - (covered by `offline.reference`) | - | - | - |
@@ -927,7 +1047,9 @@ parent/nonce fields and therefore cannot satisfy this gate.
 - its status is respectively `PASS` or `QUALIFIED`, and its process exit is
   respectively 0 or 10;
 - `primary_blocking_gate` is null, `blocking_gates` is empty, every required
-  offline gate is `PASS`, and no gate has blocking status `FAIL`;
+  offline gate is `PASS`, `safety.workstation_postflight`,
+  `offline.trace_integrity`, and `offline.network_policy` are all `PASS`, and
+  no gate has blocking status `FAIL`;
 - its only qualifications, if any, are the credential/audio gates represented
   by its allowed top-level label;
 - its source commit, 74-blob manifest digest, asset-lock digest, graph/dataset/
@@ -974,8 +1096,14 @@ Gates not in the selected sequence are absent, not `SKIPPED`.
 21. `chatbot.configuration`
 22. `chatbot.credentials`
 23. `chatbot.audio_hardware`
-24. `offline.network_attempts` (mandatory finalizer)
-25. `safety.workstation_postflight` (mandatory finalizer)
+24. `safety.workstation_postflight` (runner-owned mandatory finalizer)
+25. `offline.trace_integrity` (supervisor-owned mandatory finalizer)
+26. `offline.network_policy` (supervisor-owned mandatory finalizer)
+
+Gate 24 completes and is sealed into the provisional ledger before the traced
+runner exits. Only then can the supervisor close the trace and evaluate gates
+25 and 26. No authoritative label, JSON result, or process exit is selected
+before that sequence completes.
 
 `workstation_mujoco` order:
 
@@ -1031,19 +1159,21 @@ Status transitions are deterministic:
   otherwise it is `PASS` or `FAIL`. Safety postflight is always `PASS` or
   `FAIL`. The runtime-monitor finalizer is `SKIPPED` with fixed reason
   `MONITOR_NOT_STARTED` only when preflight failed before it could start. The
-  offline network-trace finalizer is always `PASS` or `FAIL`; it is never
-  `SKIPPED` or `NOT_RUN`, even after an earlier functional failure or signal.
+  trace-integrity finalizer is always `PASS` or `FAIL`; it is never `SKIPPED`
+  or `NOT_RUN`, even after an earlier functional failure or signal. The network-
+  policy finalizer is `PASS` or `FAIL` after trace integrity passes, or
+  `SKIPPED` with `DEPENDENCY_NOT_AVAILABLE` when trace integrity fails.
 
 Finalizer failure mappings are closed and precedence-aware:
 
 | Finalizer | `FAIL` condition | Fixed result mapping |
 | --- | --- | --- |
-| `offline.network_attempts` | an observed `AF_INET`/`AF_INET6` operation | `FAIL_SAFETY`, exit 30 |
-| `offline.network_attempts` | missing/unclosed trace coverage or trace-parser/tool failure, with no observed safety violation | `FAIL_HARNESS`, exit 40 |
+| `offline.trace_integrity` | missing/unclosed trace coverage or trace-parser/tool failure; reason `TRACE_INCOMPLETE` | `FAIL_HARNESS`, exit 40 |
+| `offline.network_policy` | any IP operation outside the exact namespace-confined semantic DDS allowance; reason `UNEXPECTED_NETWORK_ATTEMPT` | `FAIL_SAFETY`, exit 30 |
 | `pc2.camera_cleanup` | an owned camera PID/PGID/start-time/executable identity mismatch, bounded TERM/wait/KILL exhaustion, or inability to prove that the owned process group terminated | `FAIL_SAFETY`, exit 30 |
 | `safety.pc2_runtime_monitor` | monitor exit, `CONTROL_VIOLATION` in any profile, a transition away from `EXACT_MATCH` in camera/full-stream profiles, or an incomplete terminal sample | `FAIL_SAFETY`, exit 30 |
 | `safety.pc2_postflight` | final control-signature checks fail in any profile, exact process/graph closure fails in camera/full-stream profiles, or the required profile-specific safety state cannot be established | `FAIL_SAFETY`, exit 30 |
-| `safety.workstation_postflight` | localhost-DDS/graph/process checks fail, or a reused Stage 1-4 result has false/missing postflight proof | `FAIL_SAFETY`, exit 30 |
+| `safety.workstation_postflight` | offline recorded-PID/socket teardown fails; MuJoCo localhost-DDS/graph/process checks fail; or a reused Stage 1-4 result has false/missing postflight proof | `FAIL_SAFETY`, exit 30 |
 
 The optional OpenClaw smoke action uses the same rule: an owned gateway cleanup
 identity mismatch or incomplete termination is `FAIL_SAFETY`, exit 30. These
@@ -1055,12 +1185,14 @@ offline syscall trace is the explicitly mapped harness-class exception above.
 
 ### Label Precedence
 
-The runner evaluates labels in this fixed order:
+The authoritative result owner—the trace supervisor for
+`workstation_offline`, and the mode runner otherwise—evaluates labels in this
+fixed order:
 
-1. any safety failure, including an offline network attempt, camera cleanup,
-   runtime-monitor, and trap-owned postflight failure;
+1. any safety failure, including an unexpected offline network operation,
+   camera cleanup, runtime-monitor, and trap-owned postflight failure;
 2. evidence/schema/harness failure when no safety-class failure was observed;
-3. interruption only when every applicable safety finalizer passed or was
+3. interruption only when every applicable mandatory finalizer passed or was
    validly skipped and final schema validation passed;
 4. first required functional failure in profile gate order, mapped to its fixed
    domain failure label;
@@ -1082,18 +1214,29 @@ label is `FAIL_SAFETY`, and the exit is 30. Thus the primary blocker always
 names the gate that determined the reported label/exit when that decision is
 gate-attributable.
 
-The result is written atomically in its new, non-reused run directory: write a
-same-directory temporary file, flush and `fsync` it, `os.replace` to
-`result.json`, then `fsync` the directory. A partial result is never accepted.
-If final schema validation fails and no safety-class finalizer failed, the process
-writes a bounded emergency text record and exits 40 without publishing a JSON
-result that claims readiness. If any safety-class finalizer failed as well, the
-emergency record names both the safety gate(s) and the schema defect, suppresses
-the invalid JSON readiness result, and exits 30; safety outranks schema failure.
-On HUP, INT, or TERM, the trap first marks unfinished action gates `NOT_RUN`,
-runs all finalizers, builds the `INTERRUPTED` result, and validates it. A safety
-failure therefore exits 30; otherwise a schema failure exits 40; only a
-schema-valid, postflight-safe interruption preserves exit 129, 130, or 143.
+The authoritative result owner writes the result atomically in its new,
+non-reused run directory: write a same-directory temporary file, flush and
+`fsync` it, `os.replace` to `result.json`, then `fsync` the directory. A partial
+result is never accepted. For `workstation_offline`, the traced runner can
+write only the schema-validated provisional gate ledger; the supervisor alone
+writes `result.json` and returns the command's exit.
+
+If final schema validation fails and no safety-class finalizer failed, the
+process writes a bounded emergency text record and exits 40 without publishing
+a JSON result that claims readiness. If any safety-class finalizer failed as
+well, the emergency record names both the safety gate(s) and the schema defect,
+suppresses the invalid JSON readiness result, and exits 30; safety outranks
+schema failure.
+
+On HUP, INT, or TERM in `workstation_offline`, the supervisor follows the
+identity-checked forwarding and bounded-wait contract above; the runner marks
+unfinished action gates `NOT_RUN`, executes its postflight, seals the
+provisional ledger, and exits. The supervisor then closes the trace, executes
+its finalizers, builds the authoritative result, and validates it. Other modes
+perform the analogous sequence in their owned traps. A safety failure exits 30;
+otherwise a harness/schema failure exits 40; only a schema-valid interruption
+with every applicable finalizer passed or validly skipped preserves exit 129,
+130, or 143.
 
 ## Safety Contract
 
@@ -1123,9 +1266,10 @@ The following are hard failures:
 9. An OpenClaw smoke gateway binds outside loopback or lacks authentication.
 10. An offline AgentOS or skill helper attempts network, ROS publish,
     subprocess, or physical execution.
-11. Any process in the complete `workstation_offline` action tree attempts an
-    internet-family socket operation, or complete trace coverage cannot be
-    established.
+11. The offline namespace exposes a non-loopback interface/route, any process
+    in the complete `workstation_offline` tree performs an IP operation outside
+    the exact semantic-fixture DDS allowance, or complete trace coverage cannot
+    be established.
 12. A secret value appears in stdout, logs, evidence, or a Git-tracked file.
 
 On PC2 and in an optional OpenClaw smoke action, the orchestrator stops only
@@ -1149,9 +1293,14 @@ Implementation follows test-driven development.
   reached.
 - Evidence JSON Schema, closed label/gate/top-level-status enums, every exact
   label/status/exit-class/process-exit tuple, rejection of every cross-product
-  mismatch, mode table, exact per-profile ordering, `SKIPPED`/`NOT_RUN`
+  mismatch, authoritative `(mode, primary gate/qualification set)` label
+  lookup, mode table, exact per-profile ordering, `SKIPPED`/`NOT_RUN`
   transitions, atomic writes, redaction, and safety/schema/interruption
-  precedence.
+  precedence. Every label is tested in its allowed and wrong-mode cases.
+- Offline trace parsing, complete descendant closure, domain-77 DDS port
+  calculation, semantic-fixture PID/time scoping, namespace-interface/route
+  validation, supervisor audit/seccomp enforcement,
+  postflight-before-trace ordering, and supervisor signal/exit precedence.
 - Stage 3 pass, qualified continuation, prerequisite failure, malformed result,
   Stage 4 `NOT_RUN` behavior, and postflight safety overriding every evaluator
   exit code.
@@ -1178,15 +1327,17 @@ Implementation follows test-driven development.
   tracing, and graph snapshots; require zero transport, child-process, and ROS
   publication attempts and the expected artifacts.
 - Run the complete workstation offline action and every descendant under the
-  specified per-PID syscall trace in a network-disabled unprivileged container;
-  require `offline.network_attempts: PASS`, a closed trace tree, and zero
-  `AF_INET`/`AF_INET6` socket/bind/connect/send operations.
+  specified per-PID syscall trace in an unprivileged namespace containing only
+  loopback; require `offline.trace_integrity: PASS`,
+  `offline.network_policy: PASS`, exact allowance of the semantic fixture's DDS
+  UDP operations, and zero other IP operations.
 - Verify exact OpenClaw/Node artifacts, the pinned local configuration,
   successful provisioning-schema validation, identical expected/installed
   payload manifests, `config validate`, both exact lint commands, and the
   absence of a gateway process/service/listener.
 - Run the structured HMSG fixture and assert graph, object, room, pose, frame,
-  and ROS endpoint counts.
+  and ROS endpoint counts, then match every resulting DDS syscall to the exact
+  PID/time/domain-77 allowance.
 - Re-run the tracked MuJoCo test manifest and require every selected test to
   exist, at least one test to be collected, and zero failures. No test-count
   equality is used.
@@ -1220,10 +1371,21 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
   only the verified local `file:` package; alter one installed payload byte or
   add an unexpected payload path and require quarantine plus
   `INSTALLED_PAYLOAD_MISMATCH`.
-- From a descendant at each offline phase, attempt TCP, UDP/DNS, and loopback
-  traffic and require `offline.network_attempts: FAIL`; drop a trace shard or
-  simulate an unclosed PID and require `FAIL_HARNESS`, never a zero-attempt
-  pass.
+- From a descendant outside the semantic gate, attempt TCP, UDP/DNS, and
+  loopback traffic and require `offline.network_policy: FAIL`. During the gate,
+  vary PID, interval, protocol, destination, and DDS port independently and
+  require failure; the exact namespace-confined DDS trace must pass. Drop a
+  trace shard or simulate an unclosed PID and require
+  `offline.trace_integrity: FAIL`, `offline.network_policy: SKIPPED`, and
+  `FAIL_HARNESS`.
+- Send HUP, INT, and TERM during early, semantic, postflight, and trace-close
+  phases. Require one identity-checked forward to the runner PGID, runner
+  postflight before trace closure, both supervisor finalizers afterward, one
+  authoritative result, and the precedence-defined exit.
+- For every mode, pair each valid failure/qualification tuple with a label from
+  another mode or domain and require schema rejection—for example, a
+  workstation OpenClaw failure labeled `FAIL_PC2_STREAMS`, a PC2 lidar failure
+  labeled `FAIL_OPENCLAW`, and a PC2 result using a workstation qualification.
 - Show that a DDS-linked camera process is neutral; then launch or race a fake
   control-signature process during the PC2 window and require failure. Change
   one path/hash/UID/argv/parent field in the process allowlist or one independent
@@ -1249,9 +1411,11 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
 Provision exact OpenClaw artifacts and the pinned minimal configuration only
 after pre-existing lifecycle checks. Validate the configuration and exact lint
 contracts without starting a gateway. Then run `workstation_offline` with
-networking disabled and complete-process-tree tracing. Required source, runtime,
-skill, AgentOS, semantic, chatbot dependency/configuration, OpenClaw,
-`offline.network_attempts`, and safety gates must pass.
+an isolated loopback-only namespace and complete-process-tree tracing. Required
+source, runtime, skill, AgentOS, semantic, chatbot dependency/configuration,
+OpenClaw, safety, `offline.trace_integrity`, and `offline.network_policy` gates
+must pass. Only the exact semantic-fixture DDS allowance may contain IP
+operations.
 Credentials/audio produce only the fixed qualified labels in their decision
 table.
 
