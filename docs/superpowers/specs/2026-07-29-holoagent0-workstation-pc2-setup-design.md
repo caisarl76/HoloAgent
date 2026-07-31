@@ -69,10 +69,11 @@ client. Its narrower, auditable claim is:
 
 > The approved automation invoked only hashed, allowlisted sensor/readiness
 > commands; its continuous monitor did not observe a control-specific
-> signature during the recorded action window. It independently matched the
-> observed process inventory and aggregate ROS graph against their reviewed
-> allowlists. It makes no PID-to-DDS-participant or PID-to-ROS-node ownership
-> claim.
+> signature during the recorded action window. It independently compared the
+> observed process inventory and aggregate ROS graph with their reviewed
+> allowlists. Inventory-only unknown, non-control observations were retained as
+> triage diagnostics; camera and full-stream profiles required exact allowlist
+> closure. It makes no PID-to-DDS-participant or PID-to-ROS-node ownership claim.
 
 The result must use exactly that wording or a stricter claim supported by a
 future enforceable sandbox. It must never shorten the claim to "PC2 ran no
@@ -225,6 +226,28 @@ Blocking the network and removing ROS configuration are defense in depth; zero
 attempted transport, process-spawn, and ROS-publication side effects is the
 actual gate.
 
+Those three guards cover the AgentOS execution boundary. The broader
+`workstation_offline` zero-network claim has a separate
+`offline.network_attempts` gate over the complete `workstation_offline` runner
+process and all descendants—not merely the AgentOS child. An external evidence
+supervisor execs that runner as the trace root under `strace -ff -qq -yy` with
+`socket`, `connect`, `bind`, `sendto`, `sendmsg`, and `sendmmsg` captured per
+PID. The traced runner performs every offline functional gate and writes only a
+provisional result; after its entire descendant tree has exited, the supervisor
+parses the closed trace set and finalizes the authoritative result.
+
+Any `AF_INET` or `AF_INET6` socket creation, bind, connect, or send operation,
+including DNS and loopback, fails `offline.network_attempts` with reason
+`OFFLINE_NETWORK_ATTEMPT`. `AF_UNIX` and `AF_NETLINK` operations used for local
+service/socket inspection are recorded but are not network attempts. Missing
+trace files, an unclosed traced PID, ptrace loss, parser failure, or inability
+to prove descendant coverage is `FAIL_HARNESS`, never a pass. The supervisor's
+only role is external trace control, provisional-result validation, and final
+atomic evidence assembly; it is outside the explicitly identified profile
+action boundary and may not execute a profile gate. The result records the
+trace-root PID and the complete descendant PID set. The network-disabled
+container remains defense in depth, not the proof of zero attempts.
+
 ### 2. HoloAgent-0 Readiness Runner
 
 A focused Python runner under `scripts/holoagent0_setup/` coordinates checks
@@ -241,7 +264,8 @@ It exposes explicit modes rather than a single ambiguous workflow:
 - `pc2_camera`
 - `pc2_full_streams`
 
-`workstation_offline` never starts a service and makes zero network attempts.
+`workstation_offline` never starts a service and makes zero network attempts as
+proven by the complete-profile trace contract above.
 OpenClaw provisioning is a separate explicit action. `workstation_mujoco`
 delegates only to the existing Stage 1-4 scripts after rechecking localhost DDS
 and the graph allowlist.
@@ -295,28 +319,78 @@ independently computes its SRI SHA-512 value; the computed value must equal
 both the registry `dist.integrity` value and the reviewed pin. Any mismatch
 returns `FAIL_OPENCLAW` before the installer is executed. The registry response
 SHA-256, tarball URL, computed SRI value, and tarball SHA-256 are evidence, not
-installer inputs that may float.
+installer inputs that may float. The verified tarball remains at a resolved
+absolute path until the installer and installed-payload verification complete.
 
 The installer is downloaded to a fresh temporary directory, verified against
-the exact SHA-256, then invoked with the equivalent of:
+the exact SHA-256, then invoked with the verified local package as its npm
+package spec:
 
 ```text
---prefix ~/.openclaw --version 2026.7.1-2 --node-version 24.15.0
+--prefix ~/.openclaw
+--version file:/absolute/path/to/verified/openclaw-2026.7.1-2.tgz
+--node-version 24.15.0
 --no-onboard --json
 ```
 
-An upstream digest or integrity change requires a reviewed pin update; the
-runner never accepts `latest`. Installation does not start or refresh a
-gateway.
+The pinned installer passes that value to npm as
+`openclaw@file:/absolute/path/...tgz`; it must not be invoked with the registry
+version string, a tag, or `latest`. Thus npm's OpenClaw package input is the
+already verified artifact rather than a second registry resolution. The
+installer output and installed `package.json` must still report version
+`2026.7.1-2`. An upstream digest or integrity change requires a reviewed pin
+update. Installation does not start or refresh a gateway.
 
-Provisioning atomically writes a schema-valid
-`openclaw-provisioning-v1.json` in its unique provisioning run directory. It
-records the installer, registry-response, package-tarball, Node-tarball,
-installed CLI, target-prefix manifest, and configuration-template digests. It
-contains no token or credential. A later `workstation_offline` run does not
-query the registry: `openclaw.registry_integrity` verifies this immutable
-provisioning record, the installed prefix manifest, and all reviewed pins. A
-missing, malformed, or mismatched record is blocking.
+Before accepting the prefix, provisioning builds two canonical OpenClaw
+payload manifests. The expected manifest comes from the verified tarball after
+stripping its single `package/` prefix; the actual manifest comes from the
+installed `lib/node_modules/openclaw` package. Tar validation rejects absolute
+or parent-traversing paths, duplicate normalized paths, device/FIFO entries,
+escaping symlinks, and any type other than directory, regular file, or safe
+relative symlink. Each manifest is RFC 8785 canonical JSON sorted by normalized
+UTF-8 path and records entry type, regular-file SHA-256, relative symlink
+target, and executable bit. Every expected path must match exactly, including
+`package.json`; any extra actual path outside the top-level `node_modules/`
+dependency subtree is rejected. The dependency subtree is recorded separately
+in the prefix manifest and is not misrepresented as tarball payload.
+
+The expected and actual payload-manifest SHA-256 values must be identical, and
+the generated CLI launcher must resolve to the verified payload's declared bin
+entry. A mismatch returns `FAIL_OPENCLAW`, never marks the fresh prefix usable,
+and never creates configuration. For a prefix created by this run, it moves
+only that provisioner-owned prefix to the evidence directory as quarantined
+input; a pre-existing prefix fails verification without being moved,
+overwritten, or removed. This post-install comparison is defense in depth; the
+local `file:` package spec is the primary byte-binding control.
+
+Provisioning evidence validates against tracked JSON Schema Draft 2020-12 file
+`scripts/holoagent0_setup/schemas/openclaw-provisioning-v1.schema.json`, schema
+ID `holoagent0.openclaw.provisioning.v1`. The schema has
+`additionalProperties: false` at every object, status enum `PASS` or `FAIL`,
+and a reason-code enum limited to `OK`, `PREEXISTING_OPENCLAW`,
+`INSTALLER_PIN_MISMATCH`, `REGISTRY_INTEGRITY_MISMATCH`,
+`INSTALLED_PAYLOAD_MISMATCH`, `OPENCLAW_VERSION_MISMATCH`,
+`OPENCLAW_CONFIG_MISMATCH`, `OPENCLAW_CONFIG_INVALID`,
+`OPENCLAW_LINT_FINDING`, `TOOL_RUNTIME_ERROR`, or `ATOMIC_WRITE_FAILED`. It
+requires `PASS` with `OK` and `FAIL` with a non-`OK` code through closed
+conditional branches. It also requires schema version and SHA-256, run/
+timestamp/host/architecture, all reviewed pins, registry-response digest and
+exact `dist` fields, package
+tarball SHA-256/SRI, expected and actual payload-manifest digests and match
+decision, installer/Node/CLI identities, target-prefix manifest, configuration
+template digest, and before/after service/process/socket observations.
+
+The provisioner resolves and records the tracked provisioning-schema digest
+before network or mutation. After the installation, configuration, lint, and
+lifecycle-postflight steps below, it validates the final record against that
+exact schema and atomically writes `openclaw-provisioning-v1.json` in its
+unique provisioning run directory. It contains no token or credential. A later
+`workstation_offline` run does not query the registry:
+`openclaw.registry_integrity` requires a successful record, validates it
+against the recorded schema digest, requires that digest to equal the current
+tracked schema, and rechecks the installed payload and target-prefix manifests
+against the record and reviewed pins. A missing, malformed, failed, stale-
+schema, or mismatched record is blocking.
 
 After installation, provisioning creates a dedicated configuration only when
 `~/.openclaw-holoagent0` does not already exist. Any pre-existing non-identical
@@ -534,9 +608,12 @@ Before a sensor action, the script:
 
 Linux `/proc` identity and the ROS 2 graph do not establish which PID owns a
 DDS participant, ROS node, or endpoint. This design therefore makes no such
-correlation claim. The process and graph checks are independent conjunctive
-gates: both must pass, and evidence records separate allowlist digests,
-observations, and `process_allowlist_pass`/`graph_allowlist_pass` decisions.
+correlation claim. The process and graph checks are always run independently,
+and each records its allowlist digest, observations, and a policy state from
+the closed enum `EXACT_MATCH`, `TRIAGE_UNKNOWN`, or `CONTROL_VIOLATION`.
+`camera` and `full-streams` require `EXACT_MATCH` on both planes. `inventory`
+is observation-only and also accepts `TRIAGE_UNKNOWN`; no profile accepts
+`CONTROL_VIOLATION`.
 
 A control-specific signature is one of:
 
@@ -546,8 +623,7 @@ A control-specific signature is one of:
 - on the process plane, a Unitree SDK/control-library dependency together with
   a control argv or executable signature;
 - on the graph plane, any known control endpoint, including a `/cmd_vel`
-  subscription or Unitree arm/base command service/action, or any node/topic/
-  service/action outside the profile's aggregate graph allowlist.
+  subscription or Unitree arm/base command service/action.
 
 DDS linkage alone is neutral on the process plane because legitimate sensor
 and control processes both use it. Conversely, naming a process "sensor" is
@@ -560,19 +636,25 @@ endpoints live only in the separate graph allowlist. A pre-existing native
 Mid360 process and the aggregate graph each need reviewed host-specific entries
 before `camera` or `full-streams`; `inventory` may collect unknown observations
 for review but cannot bless or write either allowlist automatically. In
-`inventory`, an unknown SDK-linked process with no control-specific signature
-is diagnostic reason `UNCLASSIFIED_SENSOR_CANDIDATE`; in `camera` or
-`full-streams`, an unapproved process or graph is a safety preflight failure.
+`inventory`, an unknown SDK-linked process or non-control graph addition yields
+`TRIAGE_UNKNOWN`; `pc2.inventory` remains nonblocking and retains a diagnostic
+candidate record with reason `UNCLASSIFIED_SENSOR_CANDIDATE`, exact observed
+identity/endpoint fields, and timestamps. A process or endpoint with a known
+control signature is `CONTROL_VIOLATION` and a safety failure in every profile.
+In `camera` or `full-streams`, any unapproved process or aggregate-graph
+divergence is a safety preflight failure even when it has no known control
+signature.
 
 The `/proc` monitor samples at 20 Hz through cleanup. The ROS graph guard runs
 before the action, after each sensor becomes ready, at 1 Hz during the bounded
 measurement window, and during postflight. Both record monotonic timestamps and
 every classification change. A safety failure occurs if either monitor exits
-early, observes a control signature, sees the process set diverge from its
-process allowlist, or sees the aggregate graph diverge from its graph
-allowlist. Because `/proc` inspection and graph sampling have race limits,
-evidence says "not observed during the window," not "impossible," and never
-attributes a graph endpoint to a PID.
+early or observes `CONTROL_VIOLATION`. In `camera` and `full-streams`, any
+transition away from `EXACT_MATCH` is also a safety failure. In `inventory`, a
+transition between `EXACT_MATCH` and `TRIAGE_UNKNOWN` updates the diagnostic
+record but does not become a safety failure. Because `/proc` inspection and
+graph sampling have race limits, evidence says "not observed during the
+window," not "impossible," and never attributes a graph endpoint to a PID.
 
 The script installs `EXIT`, `INT`, `TERM`, and `HUP` traps before starting any
 child. Every owned child records PID, PGID, canonical executable, SHA-256, and
@@ -615,8 +697,9 @@ Draft 2020-12, schema ID `holoagent0.result.v1`. Two additional tracked,
 closed policy artifacts are authoritative:
 
 - `scripts/holoagent0_setup/policies/holoagent0-gate-policy-v1.json` defines
-  exact profile membership and order, gate roles, finalizer classes, label/
-  exit mappings, and same-precedence tie breaking;
+  exact profile membership and order, gate roles, finalizer classes, the
+  top-level status enum, exact label/status/exit-class/process-exit tuples, and
+  same-precedence tie breaking;
 - `scripts/holoagent0_setup/policies/holoagent0-reason-codes-v1.json` defines
   the allowed reason-code enum and the allowed reason codes for each
   gate/status pair.
@@ -626,7 +709,8 @@ and reviewed SHA-256 digests. An unknown gate, status, reason code, or invalid
 gate/status/reason combination is an evidence-schema failure; implementations
 cannot improvise a reason string. The result requires:
 
-- schema version, mode, fixed top-level label, top-level status, and exit class;
+- schema version, mode, fixed top-level label, top-level status, exit class,
+  and process exit code;
 - UTC start/end timestamps, monotonic duration, hostname, architecture, and
   source commit;
 - relevant command, configuration, script, graph, dataset, and checkpoint
@@ -638,12 +722,18 @@ cannot improvise a reason string. The result requires:
   and nullable child command exit code;
 - nullable `primary_blocking_gate`, an ordered `blocking_gates` array, and an
   ordered `qualifications` array;
-- result-schema, gate-policy, and reason-code-policy digests;
+- result-schema, applicable provisioning-schema, gate-policy, and
+  reason-code-policy digests;
 - `invocation_role` from `standalone`, `parent`, or `child`; a child additionally
   requires non-null `parent_run_id` and `lineage_nonce`, while those fields are
   null for every non-child result;
 - PC2 action-window timestamps, monitor samples, observed matches, and owned
   process identities when applicable.
+
+`openclaw_provisioning_schema_sha256` is required for
+`workstation_offline` and `workstation_mujoco` results and absent from PC2
+results. In the MuJoCo parent it must equal the referenced offline child's
+value as well as the current tracked schema digest.
 
 Gate status is one of `PASS`, `FAIL`, `QUALIFIED`, `SKIPPED`, or `NOT_RUN`:
 
@@ -670,12 +760,13 @@ The v1 reason-code policy is a closed enum containing:
   `UNEXPECTED_DDS_PARTICIPANT`, `UNEXPECTED_ROS_ENDPOINT`, and
   `POSTFLIGHT_FAILED`;
 - OpenClaw: `PREEXISTING_OPENCLAW`, `INSTALLER_PIN_MISMATCH`,
-  `REGISTRY_INTEGRITY_MISMATCH`, `OPENCLAW_VERSION_MISMATCH`,
-  `OPENCLAW_CONFIG_MISMATCH`, `OPENCLAW_CONFIG_INVALID`, and
-  `OPENCLAW_LINT_FINDING`;
+  `REGISTRY_INTEGRITY_MISMATCH`, `INSTALLED_PAYLOAD_MISMATCH`,
+  `OPENCLAW_VERSION_MISMATCH`, `OPENCLAW_CONFIG_MISMATCH`,
+  `OPENCLAW_CONFIG_INVALID`, and `OPENCLAW_LINT_FINDING`;
 - AgentOS/semantic/chatbot: `PLAN_INVALID`,
-  `OFFLINE_SIDE_EFFECT_ATTEMPT`, `SEMANTIC_BLOB_MISMATCH`,
-  `SEMANTIC_ASSET_MISMATCH`, `SEMANTIC_FIXTURE_MISMATCH`,
+  `OFFLINE_SIDE_EFFECT_ATTEMPT`, `OFFLINE_NETWORK_ATTEMPT`,
+  `SEMANTIC_BLOB_MISMATCH`, `SEMANTIC_ASSET_MISMATCH`,
+  `SEMANTIC_FIXTURE_MISMATCH`,
   `CHATBOT_DEPENDENCY_MISSING`, `CHATBOT_CONFIG_INVALID`,
   `CREDENTIALS_MISSING`, and `AUDIO_HARDWARE_MISSING`;
 - sensors/stages: `TOPIC_NOT_ADVERTISED`, `TOPIC_NO_SAMPLE`,
@@ -687,6 +778,15 @@ The v1 reason-code policy is a closed enum containing:
 `PASS` uses `OK`. Each non-pass gate/status pair maps to one of the listed
 codes in the policy file. Adding a code or changing a mapping requires review
 of the policy artifact and its digest.
+
+`UNCLASSIFIED_SENSOR_CANDIDATE` is additionally allowed only on nested
+inventory candidate records whose policy state is `TRIAGE_UNKNOWN`; it is not
+the reason for a passing gate. An observation-only inventory gate that contains
+such records remains `PASS` with gate reason `OK`. The reason-code policy
+closes this nested context as well as gate/status contexts.
+
+Top-level `status` is a separate closed enum: `PASS`, `QUALIFIED`, `FAIL`, or
+`INTERRUPTED`. It must not reuse the gate-status enum.
 
 Top-level exit codes are fixed:
 
@@ -715,6 +815,24 @@ Allowed top-level labels are a closed enum:
   `FAIL_PC2_INVENTORY`, `FAIL_PC2_CAMERA`, `FAIL_PC2_STREAMS`,
   `FAIL_SAFETY`, `FAIL_HARNESS`, and `INTERRUPTED`.
 
+The gate policy and result schema allow only these exact top-level tuples:
+
+| Exact label set | Top-level status | Exit class | Process exit |
+| --- | --- | --- | --- |
+| `PASS_HOLOAGENT0_OFFLINE`, `PASS_HOLOAGENT0_MUJOCO`, `PASS_PC2_SENSOR_INVENTORY`, `PASS_PC2_CAMERA_ONLY`, `PASS_PC2_SENSOR_STREAMS` | `PASS` | `PASS` | 0 |
+| `READY_CREDENTIALS_REQUIRED`, `READY_AUDIO_HARDWARE_REQUIRED`, `READY_CREDENTIALS_AND_AUDIO_REQUIRED`, `READY_MUJOCO_STAGE4_ESTIMATOR_FAILED` | `QUALIFIED` | `QUALIFIED` | 10 |
+| `FAIL_SOURCE`, `FAIL_RUNTIME`, `FAIL_OPENCLAW`, `FAIL_AGENTOS`, `FAIL_SEMANTIC`, `FAIL_CHATBOT`, `FAIL_MUJOCO`, `FAIL_PC2_INVENTORY`, `FAIL_PC2_CAMERA`, `FAIL_PC2_STREAMS` | `FAIL` | `GATE_FAILURE` | 20 |
+| `FAIL_SAFETY` | `FAIL` | `SAFETY_FAILURE` | 30 |
+| `FAIL_HARNESS` | `FAIL` | `HARNESS_FAILURE` | 40 |
+| `INTERRUPTED` after HUP | `INTERRUPTED` | `HUP` | 129 |
+| `INTERRUPTED` after INT | `INTERRUPTED` | `INT` | 130 |
+| `INTERRUPTED` after TERM | `INTERRUPTED` | `TERM` | 143 |
+
+The result schema encodes these tuples with closed conditional branches and
+`additionalProperties: false`; no label may appear with another status, exit
+class, or process exit. A safety or harness failure observed during signal
+finalization uses its higher-precedence `FAIL_*` tuple, not `INTERRUPTED`.
+
 No dynamically constructed `FAIL_*` label is allowed.
 `primary_blocking_gate` supplies the precedence-winning fixed gate ID;
 `blocking_gates` preserves every blocking gate in observation/evaluation time
@@ -729,6 +847,7 @@ run-specific IDs:
 | --- | --- |
 | Source/runtime | `source.repository`, `source.semantic_blobs`, `source.pc2_script`, `runtime.workstation`, `runtime.pc2`, `offline.reference` |
 | Safety | `safety.workstation_preflight`, `safety.workstation_postflight`, `safety.pc2_preflight`, `safety.pc2_runtime_monitor`, `safety.pc2_postflight` |
+| Offline profile | `offline.network_attempts` |
 | OpenClaw | `openclaw.preexisting`, `openclaw.version_pin`, `openclaw.registry_integrity`, `openclaw.config_pin`, `openclaw.config_validate`, `openclaw.doctor_lint` |
 | Skills | `skills.registry`, `skills.dry_run` |
 | AgentOS | `agentos.plan_schema`, `agentos.offline_execution`, `agentos.network_attempts` |
@@ -757,6 +876,7 @@ this table defines the profile decision boundary.
 | `safety.pc2_preflight` | - | - | R | R | R |
 | `safety.pc2_runtime_monitor`, `safety.pc2_postflight` | - | - | F | F | F |
 | `offline.reference` | - | R | - | - | - |
+| `offline.network_attempts` | F | - (covered by `offline.reference`) | - | - | - |
 | `openclaw.preexisting`, `openclaw.version_pin`, `openclaw.registry_integrity`, `openclaw.config_pin`, `openclaw.config_validate`, `openclaw.doctor_lint` | R | - (covered by `offline.reference`) | - | - | - |
 | `skills.registry`, `skills.dry_run` | R | - (covered by `offline.reference`) | - | - | - |
 | `agentos.plan_schema`, `agentos.offline_execution`, `agentos.network_attempts` | R | - (covered by `offline.reference`) | - | - | - |
@@ -812,9 +932,9 @@ parent/nonce fields and therefore cannot satisfy this gate.
   by its allowed top-level label;
 - its source commit, 74-blob manifest digest, asset-lock digest, graph/dataset/
   checkpoint digests, AgentOS plan-schema digest, OpenClaw configuration
-  template digest, OpenClaw provisioning-record digest, evidence-schema digest,
-  gate-policy digest, and reason-code-policy digest exactly match the parent
-  run;
+  template digest, OpenClaw provisioning-record and provisioning-schema
+  digests, evidence-schema digest, gate-policy digest, and reason-code-policy
+  digest exactly match the parent run;
 - the child-side parent run ID and nonce exactly match the request, the child
   result digest matches the parent observation, and the recomputed canonical
   lineage binding matches `lineage_binding_sha256`;
@@ -854,7 +974,8 @@ Gates not in the selected sequence are absent, not `SKIPPED`.
 21. `chatbot.configuration`
 22. `chatbot.credentials`
 23. `chatbot.audio_hardware`
-24. `safety.workstation_postflight` (mandatory finalizer)
+24. `offline.network_attempts` (mandatory finalizer)
+25. `safety.workstation_postflight` (mandatory finalizer)
 
 `workstation_mujoco` order:
 
@@ -909,32 +1030,36 @@ Status transitions are deterministic:
   `SKIPPED` with fixed reason `NO_OWNED_CAMERA` if no camera child was created;
   otherwise it is `PASS` or `FAIL`. Safety postflight is always `PASS` or
   `FAIL`. The runtime-monitor finalizer is `SKIPPED` with fixed reason
-  `MONITOR_NOT_STARTED` only when preflight failed before it could start.
+  `MONITOR_NOT_STARTED` only when preflight failed before it could start. The
+  offline network-trace finalizer is always `PASS` or `FAIL`; it is never
+  `SKIPPED` or `NOT_RUN`, even after an earlier functional failure or signal.
 
-Finalizer failure mappings are closed and safety-first:
+Finalizer failure mappings are closed and precedence-aware:
 
 | Finalizer | `FAIL` condition | Fixed result mapping |
 | --- | --- | --- |
+| `offline.network_attempts` | an observed `AF_INET`/`AF_INET6` operation | `FAIL_SAFETY`, exit 30 |
+| `offline.network_attempts` | missing/unclosed trace coverage or trace-parser/tool failure, with no observed safety violation | `FAIL_HARNESS`, exit 40 |
 | `pc2.camera_cleanup` | an owned camera PID/PGID/start-time/executable identity mismatch, bounded TERM/wait/KILL exhaustion, or inability to prove that the owned process group terminated | `FAIL_SAFETY`, exit 30 |
-| `safety.pc2_runtime_monitor` | monitor exit, an observed process/control signature, process-allowlist divergence, aggregate graph-allowlist divergence, or an incomplete terminal sample | `FAIL_SAFETY`, exit 30 |
-| `safety.pc2_postflight` | final denylist/process/graph checks fail or cannot establish the required safety state | `FAIL_SAFETY`, exit 30 |
+| `safety.pc2_runtime_monitor` | monitor exit, `CONTROL_VIOLATION` in any profile, a transition away from `EXACT_MATCH` in camera/full-stream profiles, or an incomplete terminal sample | `FAIL_SAFETY`, exit 30 |
+| `safety.pc2_postflight` | final control-signature checks fail in any profile, exact process/graph closure fails in camera/full-stream profiles, or the required profile-specific safety state cannot be established | `FAIL_SAFETY`, exit 30 |
 | `safety.workstation_postflight` | localhost-DDS/graph/process checks fail, or a reused Stage 1-4 result has false/missing postflight proof | `FAIL_SAFETY`, exit 30 |
 
 The optional OpenClaw smoke action uses the same rule: an owned gateway cleanup
 identity mismatch or incomplete termination is `FAIL_SAFETY`, exit 30. These
 are never remapped to a functional failure. A serializer, schema-validator, or
-atomic-writer defect is `FAIL_HARNESS`, exit 40 only when no safety finalizer
-has failed; lack of trustworthy final safety evidence itself is the relevant
-safety finalizer failure, not a harness escape hatch.
+atomic-writer defect is `FAIL_HARNESS`, exit 40 only when no safety-class
+finalizer has failed. Failure to prove owned-process cleanup or the terminal
+process/graph safety state is safety-class; inability to complete the passive
+offline syscall trace is the explicitly mapped harness-class exception above.
 
 ### Label Precedence
 
 The runner evaluates labels in this fixed order:
 
-1. any safety failure, including camera cleanup, runtime-monitor, and
-   trap-owned postflight failure;
-2. evidence/schema/harness failure when every applicable safety finalizer
-   passed or was validly skipped;
+1. any safety failure, including an offline network attempt, camera cleanup,
+   runtime-monitor, and trap-owned postflight failure;
+2. evidence/schema/harness failure when no safety-class failure was observed;
 3. interruption only when every applicable safety finalizer passed or was
    validly skipped and final schema validation passed;
 4. first required functional failure in profile gate order, mapped to its fixed
@@ -960,9 +1085,9 @@ gate-attributable.
 The result is written atomically in its new, non-reused run directory: write a
 same-directory temporary file, flush and `fsync` it, `os.replace` to
 `result.json`, then `fsync` the directory. A partial result is never accepted.
-If final schema validation fails and no safety finalizer failed, the process
+If final schema validation fails and no safety-class finalizer failed, the process
 writes a bounded emergency text record and exits 40 without publishing a JSON
-result that claims readiness. If any safety finalizer failed as well, the
+result that claims readiness. If any safety-class finalizer failed as well, the
 emergency record names both the safety gate(s) and the schema defect, suppresses
 the invalid JSON readiness result, and exits 30; safety outranks schema failure.
 On HUP, INT, or TERM, the trap first marks unfinished action gates `NOT_RUN`,
@@ -987,8 +1112,10 @@ The following are hard failures:
    SDK executable.
 6. The PC2 continuous monitor stops early, observes a control-specific
    signature, or observes process-allowlist or aggregate-graph-allowlist
-   divergence during the action window. Generic DDS linkage alone is neutral,
-   and the result does not attribute graph endpoints to PIDs.
+   divergence during a camera/full-stream action. Inventory-only
+   `TRIAGE_UNKNOWN` remains diagnostic; `CONTROL_VIOLATION` fails every
+   profile. Generic DDS linkage alone is neutral, and the result does not
+   attribute graph endpoints to PIDs.
 7. A PC2 or optional OpenClaw cleanup target does not match its recorded PID,
    PGID, start time, and executable identity.
 8. OpenClaw provisioning finds a pre-existing gateway/service/listener, a pin
@@ -996,7 +1123,10 @@ The following are hard failures:
 9. An OpenClaw smoke gateway binds outside loopback or lacks authentication.
 10. An offline AgentOS or skill helper attempts network, ROS publish,
     subprocess, or physical execution.
-11. A secret value appears in stdout, logs, evidence, or a Git-tracked file.
+11. Any process in the complete `workstation_offline` action tree attempts an
+    internet-family socket operation, or complete trace coverage cannot be
+    established.
+12. A secret value appears in stdout, logs, evidence, or a Git-tracked file.
 
 On PC2 and in an optional OpenClaw smoke action, the orchestrator stops only
 identity-matched processes it started. Reused Stage 1-4 scripts own their
@@ -1017,9 +1147,11 @@ Implementation follows test-driven development.
   constraints, DAG validation, and failing network/process/ROS guards proving
   that live dependency factories/imports and side-effect surfaces are not
   reached.
-- Evidence JSON Schema, closed label/gate enums, mode table, status/exit-code
-  consistency, exact per-profile ordering, `SKIPPED`/`NOT_RUN` transitions,
-  atomic writes, redaction, and safety/schema/interruption precedence.
+- Evidence JSON Schema, closed label/gate/top-level-status enums, every exact
+  label/status/exit-class/process-exit tuple, rejection of every cross-product
+  mismatch, mode table, exact per-profile ordering, `SKIPPED`/`NOT_RUN`
+  transitions, atomic writes, redaction, and safety/schema/interruption
+  precedence.
 - Stage 3 pass, qualified continuation, prerequisite failure, malformed result,
   Stage 4 `NOT_RUN` behavior, and postflight safety overriding every evaluator
   exit code.
@@ -1028,25 +1160,31 @@ Implementation follows test-driven development.
   every source/config/asset/policy/provisioning digest mismatch.
 - OpenClaw pins, pre-existing lifecycle detection, exact minimal configuration,
   registry `dist.integrity` comparison before installer execution, downloaded
-  package SRI verification, schema validation, focused/full lint thresholds,
-  socket ownership, and refusal to mutate/upgrade.
+  package SRI verification, exact local `file:` installer argv, canonical
+  expected/installed payload matching, provisioning-schema closure/digest,
+  focused/full lint thresholds, socket ownership, and refusal to mutate/upgrade.
 - Semantic 74-blob verification, canonical asset manifests, exact fixture
   identity/pose, and parser `SKIPPED` behavior.
 - Chatbot dependency failure and all four credential/audio classifications.
 - PC2 static command allowlist, neutral DDS classification, process-plane
   control signatures, independent process and aggregate-graph allowlist
-  matching, absence of PID-to-node attribution, `/proc` observations, PID-reuse
-  defense, signal/early-error trap cleanup, and profile gate roles.
+  matching, inventory-only `TRIAGE_UNKNOWN`, exact camera/full-stream closure,
+  absence of PID-to-node attribution, `/proc` observations, PID-reuse defense,
+  signal/early-error trap cleanup, and profile gate roles.
 
 ### Integration tests
 
 - Run AgentOS offline with transport/process/ROS spies, an audit hook, syscall
   tracing, and graph snapshots; require zero transport, child-process, and ROS
   publication attempts and the expected artifacts.
-- Run workstation offline checks in a network-disabled unprivileged container.
+- Run the complete workstation offline action and every descendant under the
+  specified per-PID syscall trace in a network-disabled unprivileged container;
+  require `offline.network_attempts: PASS`, a closed trace tree, and zero
+  `AF_INET`/`AF_INET6` socket/bind/connect/send operations.
 - Verify exact OpenClaw/Node artifacts, the pinned local configuration,
-  `config validate`, both exact lint commands, and the absence of a gateway
-  process/service/listener.
+  successful provisioning-schema validation, identical expected/installed
+  payload manifests, `config validate`, both exact lint commands, and the
+  absence of a gateway process/service/listener.
 - Run the structured HMSG fixture and assert graph, object, room, pose, frame,
   and ROS endpoint counts.
 - Re-run the tracked MuJoCo test manifest and require every selected test to
@@ -1077,12 +1215,23 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
 - Reject wildcard gateway binds, an existing service/listener, installer hash
   drift, registry `dist.integrity` drift, a package tarball whose computed SRI
   differs from the registry/pin, and unredacted credential-shaped values. Prove
-  no installer child is created for either integrity mismatch.
+  no installer child is created for either integrity mismatch. Change the
+  registry response after verification and prove the installer still receives
+  only the verified local `file:` package; alter one installed payload byte or
+  add an unexpected payload path and require quarantine plus
+  `INSTALLED_PAYLOAD_MISMATCH`.
+- From a descendant at each offline phase, attempt TCP, UDP/DNS, and loopback
+  traffic and require `offline.network_attempts: FAIL`; drop a trace shard or
+  simulate an unclosed PID and require `FAIL_HARNESS`, never a zero-attempt
+  pass.
 - Show that a DDS-linked camera process is neutral; then launch or race a fake
   control-signature process during the PC2 window and require failure. Change
   one path/hash/UID/argv/parent field in the process allowlist or one independent
   aggregate ROS-graph field and require the corresponding monitor plane to fail
-  safely. Verify that evidence never claims a PID owns a ROS node.
+  safely in camera/full-stream profiles. Apply the same non-control changes in
+  inventory and require `TRIAGE_UNKNOWN` diagnostic records without a safety
+  failure; a known control signature must still fail inventory. Verify that
+  evidence never claims a PID owns a ROS node.
 - Reuse a recorded PID with a different start time and prove cleanup does not
   signal it.
 - Interrupt each PC2 phase with HUP, INT, and TERM and verify identity-safe
@@ -1100,8 +1249,9 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
 Provision exact OpenClaw artifacts and the pinned minimal configuration only
 after pre-existing lifecycle checks. Validate the configuration and exact lint
 contracts without starting a gateway. Then run `workstation_offline` with
-networking disabled. Required source, runtime, skill, AgentOS, semantic, chatbot
-dependency/configuration, OpenClaw, and safety gates must pass.
+networking disabled and complete-process-tree tracing. Required source, runtime,
+skill, AgentOS, semantic, chatbot dependency/configuration, OpenClaw,
+`offline.network_attempts`, and safety gates must pass.
 Credentials/audio produce only the fixed qualified labels in their decision
 table.
 
@@ -1140,7 +1290,8 @@ After this design is approved, it is implemented through three independently
 testable plans, in order:
 
 1. Workstation HoloAgent-0 provisioning, offline readiness, deterministic
-   AgentOS, pinned semantic fixture, and evidence schema.
+   AgentOS, pinned semantic fixture, full-process-tree network tracing, and the
+   result/provisioning evidence schemas and policies.
 2. Workstation MuJoCo consolidation with explicit Stage 3 qualification.
 3. PC2 inventory, bounded D435i action, full-stream diagnostics, continuous
    process observation, and handoff.
