@@ -214,8 +214,9 @@ profile. The zero-side-effect proof has three independent guards:
    spawn event. An import guard fails and records any attempted import of
    `rclpy`, `rosidl_runtime_py`, `std_msgs`, or `geometry_msgs`; fake `rclpy`
    publisher/node objects also raise if reached in unit tests.
-3. The integration process runs under `strace`. The transport trace
-   (`connect`, `sendto`, `sendmsg`) must be empty. The process trace may contain
+3. The integration process runs under the pinned trace toolchain. Its FD table
+   may contain no internet socket, and both explicit transport calls and
+   generic socket-I/O events must be empty. The process trace may contain
    only the one initial `execve` of the resolved approved Python interpreter;
    it must contain no subsequent `execve`, `execveat`, `fork`, `vfork`,
    `clone`, or `clone3`. ROS graph snapshots in an isolated, daemon-disabled
@@ -234,25 +235,72 @@ ID. `ROS_LOCALHOST_ONLY=1` confines discovery scope but does not remove those
 IP sockets. This behavior is documented at
 <https://docs.ros.org/en/lyrical/Concepts/Intermediate/About-Domain-ID.html>.
 
-An external evidence supervisor owns three mandatory finalizers over the complete
-`workstation_offline` runner and every descendant:
-`offline.trace_integrity`, `offline.network_policy`, and
-`offline.evidence_binding`. It starts the runner as
-the trace root under resolved strace 6.6 or newer with
-`--kill-on-exit -f -yy -ttt -T -s 256` and one serialized, append-only trace.
-The exact binary path, version, SHA-256, and successful `--kill-on-exit` probe
-are runtime evidence. The trace captures `socket`, `socketpair`, `accept`,
-`accept4`, `getsockopt`, `setsockopt`, `connect`, `bind`, `listen`, `sendto`,
-`recvfrom`, `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`, `prctl`, `unshare`,
-`setns`, `close_range`, `fcntl`, `clone`, `clone3`, `fork`, `vfork`, `execve`,
-`execveat`, `io_uring_setup`, `io_uring_enter`, `io_uring_register`, `ptrace`,
-`exit`, and `exit_group`. `-ttt` timestamps are retained as diagnostic realtime
-values, but policy does not correlate userspace clocks or compare timestamps
-from separate trace files. The single trace's record order and the marker
-protocol below are the authorization boundary. Quiet modes that suppress
-process exit/signal records are prohibited. General `read`/`write` syscalls are
-intentionally not traced so raw application data cannot bypass evidence
-redaction.
+An external evidence supervisor owns bootstrap orchestration and three
+mandatory finalizers over the complete `workstation_offline` runner and every
+descendant: `offline.trace_integrity`, `offline.network_policy`, and
+`offline.evidence_binding`. The authorization-boundary toolchain is closed, not
+version-ranged. Its upstream source is exactly strace 6.6 from
+`https://strace.io/files/6.6/strace-6.6.tar.xz`, byte size `2420364`, SHA-256
+`421b4186c06b705163e64dc85f271ebdcf67660af8667283147d5e859fc8a96c`.
+No distribution `strace`, newer release, PATH fallback, or first-run digest
+learning is permitted.
+
+A tracked, closed
+`scripts/holoagent0_setup/policies/holoagent0-trace-tool-v1.json` contains
+exactly one approved tuple: version; source URL/size/digest; reviewed build
+recipe path/digest and build-container image digest; installed ELF path,
+size, and literal SHA-256; complete `--version` output SHA-256; native syscall
+ABI; normalizer/parser path and blob digest; canonical argv/environment digest
+with `LC_ALL=C` and `TZ=UTC`; and parser-fixture-manifest digest. Those literal
+expected values are committed and
+reviewed after the reproducible build, never generated or amended by a run.
+`source.repository` validates the policy, recipe, parser, and fixtures;
+`runtime.workstation` validates the selected ELF and complete version output
+against the tuple before ptrace is attempted. A missing or mismatched field
+fails closed without trying `/usr/bin/strace`. The v1 tuple supports only the
+observed `linux-x86_64` 64-bit syscall ABI; another architecture, compat
+personality, or personality transition fails runtime/trace integrity rather
+than selecting another decoder table.
+
+The exact approved invocation includes `--kill-on-exit`, `-f`, `-yy`, `-ttt`,
+`-T`, `--no-abbrev`, `--string-limit=1048576`, `--quiet=none`, and
+`--trace=all`, producing one serialized stream. It applies `--raw` to the
+payload-bearing generic-I/O set `read`, `readv`, `pread64`, `preadv`,
+`preadv2`, `write`, `writev`, `pwrite64`, `pwritev`, `pwritev2`, `sendfile`,
+`splice`, `vmsplice`, `tee`, and `copy_file_range`, so those
+records contain numeric FDs, pointer values, lengths, flags, and returns but no
+buffer bytes. Address-bearing `sendto`/`recvfrom` and control-message-bearing
+`sendmsg`/`recvmsg`/`sendmmsg`/`recvmmsg` remain decoded in the transient
+stream so destination/source addresses and `SCM_RIGHTS` cannot be hidden.
+
+The supervisor connects strace's dedicated output FD directly to the pinned
+streaming normalizer; raw strace text is never written to a file, terminal, or
+general log. The normalizer runs with `RLIMIT_CORE=0` and
+`PR_SET_DUMPABLE=0`; its diagnostics contain only fixed reason codes and record
+indices. It discards every payload/iovec byte before emitting a
+canonical append-only NDJSON record containing only the syscall identity,
+PID, serialized entry/exit indices, FD numbers and provenance, lengths/flags,
+address/port or ancillary-control metadata when applicable, return/errno, and
+diagnostic timestamp/duration. Its bounded transient input is discarded after
+normalization and excluded from crash evidence. The canonical NDJSON—not
+transient strace text—is the policy and evidence input. Because all syscalls
+are traced, an omitted syscall name cannot become an unobserved socket-I/O
+path.
+
+`-ttt` values remain diagnostic. Policy uses canonical serialized entry/exit
+order and the marker protocol below, never correlations between userspace
+clocks or separate trace files. Process exit/signal records may not be quieted.
+The parser fixture suite covers every policy-relevant syscall and the exact
+strace 6.6 grammar, including interrupted/resumed calls, native error forms,
+FD annotations, decoded socket addresses, ancillary messages, and raw generic
+I/O. The normalizer must pair the pinned `<unfinished ...>`/`<... NAME
+resumed>` structural form into one complete canonical record; no ellipsis is
+ever emitted canonically. Any argument/structure abbreviation, unexpected
+literal ellipsis, unknown grammar, undecodable relevant field, unpaired
+continuation, unsupported syscall ABI, or noncanonical output is
+`offline.trace_integrity: FAIL` with `TRACE_DECODE_FAILED`. A compatibility
+self-test over the committed fixtures and a bounded live trace fixture must
+pass before the functional coordinator can start.
 
 Before `strace` starts, the supervisor enumerates every candidate inherited FD
 through `/proc/self/fd`, `fstat`, and socket `SO_DOMAIN`/`SO_TYPE`/
@@ -269,21 +317,50 @@ coordinator starts. Coordinator broker-pipe FDs are marked close-on-exec before
 any functional child; newly created child IPC is pipe-only. No profile process
 inherits or receives an internet or Unix-domain socket.
 
+The normalizer seeds a per-process FD-provenance table from that reviewed final
+launcher manifest. It applies every successful `socket`/`socketpair`/`accept*`
+creation; `dup`, `dup2`, `dup3`, and `fcntl(F_DUPFD*)` alias; `fork`/`vfork`/
+`clone*` inheritance; `CLONE_FILES` sharing and `unshare(CLONE_FILES)`/
+`CLOSE_RANGE_UNSHARE` splitting; close-on-exec transition; `close`/
+`close_range` removal; and decoded descriptor return in canonical record order.
+Internet-family
+socket provenance, connected peer, local bind, protocol, and socket type follow
+every alias and descendant until the last close. Any FD-producing syscall that
+returns a strace socket annotation but has no closed provenance transition is
+a trace-integrity failure. `SCM_RIGHTS` receipt and `pidfd_getfd` are prohibited
+acquisition transitions rather than trusted provenance sources.
+
+Every attempted generic I/O operation whose input or output FD resolves to an
+`AF_INET`/`AF_INET6` socket is a network-policy event, regardless of success.
+This includes `read*`, `write*`, `sendfile*`, `splice`, `vmsplice`, `tee`, and
+`copy_file_range`; an unknown or conflicting FD type can never be treated as a
+regular file. The endpoint comes from the tracked `connect` state or explicit
+decoded message address. Generic I/O on an unconnected internet socket has no
+provable peer and is prohibited even inside the marker. Any other such
+operation is permitted only for the exact participant, marker interval,
+protocol, and endpoint allowance below. Thus a connected UDP socket created
+during the fixture cannot be written through
+`write`, `writev`, `sendfile`, or `splice` after END, even through a duplicated
+or inherited FD. Linux documents the generic socket-I/O surface at
+<https://man7.org/linux/man-pages/man7/socket.7.html>.
+
 The same native launcher installs an inherited seccomp filter before the
 coordinator executes. It denies `io_uring_setup`, `io_uring_enter`, and
-`io_uring_register`; denies `ptrace`; returns `ENOSYS` for `clone3` so reviewed
-libraries fall back to inspectable `clone`; and rejects `clone` when
-`CLONE_UNTRACED` is set. The three io_uring syscalls remain in the strace filter
-so any denied attempt is evidence. Any io_uring attempt, `CLONE_UNTRACED`
-attempt, `ptrace` attempt, or `SCM_RIGHTS` control message decoded in `sendmsg`,
-`recvmsg`, `sendmmsg`, or `recvmmsg` fails `offline.network_policy` with
-respectively `PROHIBITED_IO_URING`, `UNTRACED_CHILD_ATTEMPT`,
+`io_uring_register`, `pidfd_getfd`, and `ptrace`; returns `ENOSYS` for `clone3`
+so reviewed libraries fall back to inspectable `clone`; and rejects `clone`
+when `CLONE_UNTRACED` is set. All denied syscalls remain in the all-syscall
+trace and compatibility fixtures. Any io_uring, `pidfd_getfd`,
+`CLONE_UNTRACED`, or `ptrace` attempt, or any `SCM_RIGHTS` control message
+decoded in `sendmsg`, `recvmsg`, `sendmmsg`, or `recvmmsg`, fails
+`offline.network_policy` with respectively `PROHIBITED_IO_URING`,
+`PROHIBITED_FD_ACQUISITION`, `UNTRACED_CHILD_ATTEMPT`,
 `TRACE_BYPASS_ATTEMPT`, or `PROHIBITED_FD_TRANSFER`. This is necessary because
-Unix-domain ancillary data can transfer an already open descriptor and
-io_uring can perform socket I/O without the ordinary socket syscalls listed
-above. The upstream contracts are
+Unix-domain ancillary data or `pidfd_getfd` can duplicate an already open
+descriptor and io_uring can perform socket I/O outside ordinary syscall
+decoding. The upstream contracts are
 <https://man7.org/linux/man-pages/man7/unix.7.html> and
-<https://man7.org/linux/man-pages/man2/io_uring_enter.2.html>.
+<https://man7.org/linux/man-pages/man2/io_uring_enter.2.html>, and
+<https://man7.org/linux/man-pages/man2/pidfd_getfd.2.html>.
 
 The supervisor tails the trace while it is written. Each fully decoded
 prohibited operation is immediately persisted and `fsync`ed in a
@@ -303,11 +380,16 @@ binding; compute the winning outcome; atomically write the authoritative
 `result.json`; and return the authoritative process exit. The coordinator
 never writes a readiness result or chooses the final exit.
 
-The supervisor itself performs no functional or action gate; its only profile
-gates are the three finalizers it owns, and it needs no IP socket. From process
+The supervisor performs no functional/action gate and needs no IP socket. It
+does own the schema/tool/bootstrap checks needed to create a safe trace root,
+may author the pre-trace portions of `source.repository` and
+`runtime.workstation`, may set `safety.workstation_preflight` on a bootstrap
+safety failure, and owns the three finalizers. On the normal path, the traced
+coordinator completes the remaining preflight subchecks and is the only writer
+allowed to make `safety.workstation_preflight` pass. From supervisor process
 start, a Python audit hook rejects and records any internet-family socket
-construction. After spawning `strace` and the runner, the supervisor installs
-a non-inherited seccomp filter on itself that denies new
+construction. After spawning strace and the tracee, the supervisor installs a
+non-inherited seccomp filter on itself that denies new
 `AF_INET`/`AF_INET6` sockets; failure to install that filter is
 `offline.trace_integrity: FAIL`. The trace tool and traced runner do not inherit
 this supervisor-only filter, so the semantic DDS allowance remains usable and
@@ -385,8 +467,9 @@ participant, the exact coordinator PID calls
 characters. After the child reports that every recorded participant has
 exited, been reaped, and its sockets are absent, the coordinator calls
 `prctl(PR_SET_NAME, "H0E<token>")` and then restores its reviewed process name.
-Both marker syscalls, all participant clone/exec/exit events, and every network
-syscall appear in the same serialized trace. The parser accepts markers only
+Both marker syscalls, all participant clone/exec/exit events, and every explicit
+or FD-provenance-derived socket-I/O syscall appear in the same canonical
+serialized trace. The parser accepts markers only
 from the recorded coordinator PID and only when their token matches the full
 ledger nonce. A permitted syscall's entry and completion must both lie between
 the matching marker records and belong to one of the four recorded participant
@@ -402,15 +485,18 @@ duplicated, reordered, spoofed, or incomplete marker sequence fails trace
 integrity. Because an invalid marker sequence supplies no authorization, any
 fully decoded IP operation associated with it also fails network policy.
 
-TCP, DNS, any host-namespace IP operation, an IP operation outside the marked
-semantic-fixture interval or participant set, a UDP endpoint outside that DDS
-port policy, or any non-loopback route or interface fails
+TCP, DNS, any host-namespace IP operation, any explicit or generic socket I/O
+outside the marked semantic-fixture interval or participant/FD-provenance set,
+a UDP endpoint outside that DDS port policy, or any non-loopback route or
+interface fails
 `offline.network_policy` with
 `UNEXPECTED_NETWORK_ATTEMPT`. Every allowed DDS syscall is retained in evidence
-with PID, serialized record index, diagnostic timestamp, address, port, and
-marker nonce. A truncated trace, an unclosed traced PID or syscall, ptrace loss,
-marker failure, parser failure, or incomplete descendant coverage fails
-`offline.trace_integrity` as `FAIL_HARNESS`. Network policy is still evaluated
+with PID, serialized entry/exit indices, FD provenance, lengths/flags,
+diagnostic timestamp, address, port, and marker nonce but no payload. A
+truncated trace, an unclosed traced PID or syscall, ptrace loss, marker failure,
+tool/fixture mismatch, abbreviation, decode failure, or incomplete descendant
+coverage fails `offline.trace_integrity` as `FAIL_HARNESS`. Network policy is
+still evaluated
 over every complete record and the violation journal: it is `FAIL` whenever a
 prohibited operation was established, even if trace integrity also fails; it
 is `PASS` only when trace integrity passes and no violation exists; and it is
@@ -424,10 +510,15 @@ records the first signal. It launches `strace` in a tracer process group, while
 the tracee command starts the coordinator through `setsid`, making the
 coordinator PID its distinct session and PGID. The supervisor records and
 validates both PID/PGID/start-time/executable identities; the tracer never joins
-the coordinator group. Immediately after spawn, the supervisor opens a pidfd
-for the exact tracer identity and continuously polls it alongside the trace
-tail; losing the pidfd, receiving an unexpected tracer exit, or observing a
-tracer identity change stops all profile progression.
+the coordinator group. The normalizer has a third, distinct recorded identity.
+Immediately after spawn, the supervisor opens pidfds for the exact tracer and
+normalizer identities and continuously polls both alongside canonical trace
+progress. Losing either pidfd, receiving an unexpected exit, observing an
+identity change, or seeing the raw pipe close before trace completion stops all
+profile progression. Unexpected normalizer loss makes trace integrity fail
+with `TRACE_DECODE_FAILED`; the supervisor terminates the tracer so
+`PTRACE_O_EXITKILL` stops tracees, then applies the same journal-based cleanup
+and safety precedence as tracer loss.
 
 `--kill-on-exit` is mandatory and is verified to apply Linux
 `PTRACE_O_EXITKILL`, which sends SIGKILL to tracees if their tracer exits; see
@@ -456,14 +547,21 @@ identity-checked child-group cleanup; an incomplete journal or cleanup is
 checked TERM and KILL only when needed. Repeated signals are recorded but do
 not bypass finalization.
 
-Before launch, the supervisor materializes the schema-valid ordered gate
-skeleton as immutable `ledger/generation-000000.json` with every gate
-`NOT_RUN`, generation `0`, null `previous_generation`/`previous_digest`,
-`sealed: false`, and a run nonce. It computes that file's SHA-256 and sends the
-coordinator an acknowledgement containing generation and digest over the
-reviewed non-socket broker pipe.
+The supervisor has an explicit pre-trace bootstrap. Its small bootstrap
+envelope knows the reviewed result/ledger/policy paths and literal digests. If
+those artifacts cannot be loaded and validated, it can write only the bounded
+emergency record and exits 40; no schema-valid profile result is claimed. Once
+they validate, and before any source, runtime, or inherited-FD check, the
+supervisor creates the run directory, zero-record ownership/violation journals,
+explicit `NOT_RUN` host-observer artifacts, and immutable
+`ledger/generation-000000.json`. Generation 0 contains every gate as `NOT_RUN`,
+generation `0`, null `previous_generation`/`previous_digest`, `sealed: false`,
+and a run nonce. The supervisor computes its SHA-256 before continuing.
 
-For every update, the coordinator sends a candidate containing exactly
+On the full traced path, the supervisor sends the coordinator an
+acknowledgement containing the accepted generation/digest over the reviewed
+non-socket broker pipe. For every normal update, the coordinator sends a
+candidate containing exactly
 `generation = previous_generation + 1` and the last supervisor-acknowledged
 generation/digest. The supervisor validates schema, nonce, chain link, and
 allowed gate transition; writes a same-directory temporary file; flushes and
@@ -475,6 +573,41 @@ digest, gap, fork, replay, non-monotonic gate transition, or unacknowledged
 candidate fails `safety.workstation_postflight` with `LEDGER_CHAIN_INVALID`.
 The final generation may set `sealed: true` only with the same nonce and a
 terminal workstation postflight value.
+
+Before the functional trace root, the supervisor validates repository/schema/
+tool-policy integrity, enumerates and sanitizes inherited descriptors, then
+runs the exact tracer ELF/version, normalizer, static fixture suite, bounded
+live capability fixture, kernel-feature, and native-ABI checks. This safe
+execution order prevents a bootstrap fixture from inheriting a socket; the
+result ledger still reports their policy order as `source.repository`,
+`runtime.workstation`, then `safety.workstation_preflight`. The supervisor
+always performs descriptor sanitation and terminal owned-process/FD cleanup,
+even if source or runtime failed; an unsafe descriptor discovered after an
+earlier block is carried into mandatory `safety.workstation_postflight` rather
+than silently discarded. Supervisor-authored early-failure successors use the
+same immutable, acknowledged hash chain and fixed gate transitions as
+coordinator candidates.
+
+The bootstrap outcome table is authoritative:
+
+| Bootstrap outcome | Trace/action behavior | Required terminal states |
+| --- | --- | --- |
+| Exact toolchain and FD manifest pass | Launch the full traced coordinator; it repeats the FD/tool/environment checks before making gate 3 `PASS` | Normal gate sequence and all four mandatory finalizers |
+| Source/runtime pass; inherited socket or unknown FD found; sanitation and safe stdio rebinding succeed | Set gate 3 `FAIL`/`INHERITED_SOCKET_FD`; gates 4-23 `NOT_RUN`; launch the exact tracer around the native finalizer-only tracee, never the functional coordinator | Gate 24 proves cleanup; gate 25 evaluates that sanitized trace; gate 26 evaluates its zero policy events; gate 27 binds all artifacts; safety gate 3 remains primary |
+| Inherited FD sanitation/rebinding cannot be proved | Set gate 3 and gate 24 `FAIL`; launch no child or tracer | Gate 25 `FAIL`/`TRACE_NOT_STARTED`; gate 26 `SKIPPED`; gate 27 binds the explicit not-started artifacts; safety remains primary |
+| Trace-tool/parser/capability pin fails before launch | Set the applicable source/runtime gate `FAIL`; later action gates `NOT_RUN`; launch no functional child or unapproved tracer | Gate 24 records cleanup and becomes `FAIL` if any unsafe inherited FD was found or could not be sanitized; gate 25 `FAIL`/`TRACE_BOOTSTRAP_FAILED`; gate 26 `SKIPPED` unless a bootstrap violation journal proves a policy event; gate 27 binds the explicit not-started artifacts |
+| Signal during bootstrap | Finish the applicable row above without launching a functional child | Safety, then harness, then interruption precedence; interruption survives only if every mandatory finalizer passes or validly skips |
+
+The evidence schema gives the trace descriptor a closed `trace_state` enum of
+`FULL`, `FINALIZER_ONLY`, or `NOT_STARTED`. `FULL` and `FINALIZER_ONLY` require
+the pinned tracer/normalizer identities, exits, record counts, and canonical
+trace digest. `NOT_STARTED` requires null tracer identity/exit, zero trace
+records, and exactly `TRACE_NOT_STARTED` or `TRACE_BOOTSTRAP_FAILED`. Host-
+observer descriptors likewise use `OBSERVED` or `NOT_RUN`; the latter requires
+zero counts and the earlier blocking gate. Empty journals are real, closed,
+hashed artifacts, not absent paths. Therefore every schema-valid bootstrap
+failure still has deterministic ledger, artifact, finalizer, label, and exit
+semantics.
 
 If the coordinator is killed, exits without a valid seal, or cannot establish
 the inner and host postflight observations, the supervisor starts from the last
@@ -978,7 +1111,7 @@ requires both previous fields null; later generations require both non-null.
 The supervisor broker enforces exact increment and digest continuity across
 immutable schema-valid files. The schema permits `sealed: true` only with terminal
 `safety.workstation_postflight` and a DDS-window state other than `OPEN`;
-`additionalProperties: false` applies at every object level. Two additional
+`additionalProperties: false` applies at every object level. Three additional
 tracked, closed policy artifacts are authoritative:
 
 - `scripts/holoagent0_setup/policies/holoagent0-gate-policy-v1.json` defines
@@ -988,9 +1121,14 @@ tracked, closed policy artifacts are authoritative:
   tie breaking;
 - `scripts/holoagent0_setup/policies/holoagent0-reason-codes-v1.json` defines
   the allowed reason-code enum and the allowed reason codes for each
-  gate/status pair.
+  gate/status pair;
+- `scripts/holoagent0_setup/policies/holoagent0-trace-tool-v1.json` defines the
+  one-row strace/build/runtime/parser/argv/fixture allowlist above and validates
+  against closed
+  `scripts/holoagent0_setup/schemas/holoagent0-trace-tool-policy-v1.schema.json`,
+  schema ID `holoagent0.trace-tool-policy.v1`.
 
-Both policy files have versioned schema IDs, `additionalProperties: false`,
+All three policy files have versioned schema IDs, `additionalProperties: false`,
 and reviewed SHA-256 digests. An unknown gate, status, reason code, or invalid
 gate/status/reason combination is an evidence-schema failure; implementations
 cannot improvise a reason string. The result requires:
@@ -1008,8 +1146,9 @@ cannot improvise a reason string. The result requires:
   thresholds, bounded log paths, and nullable child command exit code;
 - nullable `primary_blocking_gate`, an ordered `blocking_gates` array, and an
   ordered `qualifications` array;
-- result-schema, applicable provisioning- and offline-ledger-schema,
-  gate-policy, and reason-code-policy digests;
+- result-schema, applicable provisioning-, offline-ledger-, and trace-tool-
+  policy-schema digests; gate-policy, reason-code-policy, trace-tool-policy,
+  and parser-fixture-manifest digests;
 - `invocation_role` from `standalone`, `parent`, or `child`; a child additionally
   requires non-null `parent_run_id` and `lineage_nonce`, while those fields are
   null for every non-child result;
@@ -1022,6 +1161,13 @@ results. In the MuJoCo parent it must equal the referenced offline child's
 value as well as the current tracked schema digest.
 `offline_ledger_schema_sha256` has the same workstation presence and
 parent/child equality rule.
+`trace_tool_policy_sha256`, `trace_tool_policy_schema_sha256`, and
+`trace_parser_fixture_manifest_sha256` have the same workstation presence and
+parent/child equality rule. An offline result records the expected single-row
+strace source/build/runtime/parser/argv values and separately records observed
+runtime ELF/version/parser/argv values. Observed values may be null or unequal
+only on the corresponding bootstrap failure branch; every pass, qualification,
+and `offline.reference` acceptance requires exact equality.
 `cyclonedds_config_set_sha256`, computed over canonical JSON containing the
 four ordered repository-relative path/SHA-256/role/participant-index records,
 follows the same presence and parent/child equality rule. Each offline result
@@ -1032,15 +1178,21 @@ Every `workstation_offline` result also contains a closed `offline_evidence`
 object whose artifact descriptors are computed only after writers close and
 files/directories are `fsync`ed:
 
-- trace relative path, SHA-256, byte size, serialized record count, tracee
-  count, tracer identity, and tracer exit status;
+- closed trace state, canonical trace relative path, SHA-256, byte size,
+  serialized record count, tracee count, tracer and normalizer identities and
+  exit statuses, exact tool-policy row digest, compatibility-fixture result,
+  and nullable not-started reason under the discriminated bootstrap rules;
+- supervisor-bootstrap report relative path, SHA-256, byte size, terminal
+  state, expected/observed tool values, initial/final FD manifests, sanitation/
+  rebinding actions, and live-fixture result;
 - accepted ledger generation and SHA-256, immutable generation count, and the
   SHA-256/byte size of a canonical chain manifest listing every generation's
   relative path, digest, size, predecessor, and sealed state;
 - ownership-journal relative path, SHA-256, byte size, and record count;
 - violation-journal relative path, SHA-256, byte size, and violation count;
-- separate pre/post host-observer relative paths, SHA-256 values, byte sizes,
-  host network-namespace inodes, and process/service/listener counts; and
+- separate pre/post host-observer state, relative paths, SHA-256 values, byte
+  sizes, nullable host network-namespace inodes, process/service/listener
+  counts, and nullable earlier blocker under the `OBSERVED`/`NOT_RUN` rules;
 - nullable DDS BEGIN/END serialized trace record indices plus the marker token;
   both are null only for the valid `NOT_ENTERED` branch.
 
@@ -1057,8 +1209,9 @@ set, not coordinator-supplied metadata, is the value serialized in the result.
 
 `offline.evidence_binding` is the supervisor-owned finalizer for that operation.
 It is `PASS` only when one stable descriptor snapshot binds the closed trace,
-the accepted immutable ledger chain, the ownership and violation journals, and
-both host-observer artifacts through the bundle digest. Any missing artifact,
+the bootstrap report, the accepted immutable ledger chain, the ownership and
+violation journals, and both host-observer artifacts through the bundle digest.
+Any missing artifact,
 path escape, symlink, type/owner/mode mismatch, chain-manifest mismatch,
 count/index disagreement, digest drift, inode replacement, or failure to retain
 and revalidate the descriptors is `FAIL` with
@@ -1089,6 +1242,7 @@ The v1 reason-code policy is a closed enum containing:
   `MONITOR_NOT_STARTED`;
 - source/runtime/evidence: `SOURCE_MISMATCH`, `RUNTIME_MISMATCH`,
   `DIGEST_MISMATCH`, `EVIDENCE_SCHEMA_INVALID`, `TRACE_INCOMPLETE`,
+  `TRACE_DECODE_FAILED`, `TRACE_NOT_STARTED`, `TRACE_BOOTSTRAP_FAILED`,
   `TRACER_EXITED`, `EVIDENCE_BINDING_MISMATCH`, `TOOL_RUNTIME_ERROR`, and
   `ATOMIC_WRITE_FAILED`;
 - safety/process/graph: `UNEXPECTED_CONTROL_PROCESS`,
@@ -1096,7 +1250,7 @@ The v1 reason-code policy is a closed enum containing:
   `MONITOR_EXITED`, `OWNERSHIP_MISMATCH`, `CLEANUP_INCOMPLETE`,
   `UNEXPECTED_DDS_PARTICIPANT`, `UNEXPECTED_ROS_ENDPOINT`,
   `POSTFLIGHT_FAILED`, `INHERITED_SOCKET_FD`, `PROHIBITED_FD_TRANSFER`,
-  `PROHIBITED_IO_URING`, `UNTRACED_CHILD_ATTEMPT`,
+  `PROHIBITED_FD_ACQUISITION`, `PROHIBITED_IO_URING`, `UNTRACED_CHILD_ATTEMPT`,
   `TRACE_BYPASS_ATTEMPT`, and `LEDGER_CHAIN_INVALID`;
 - OpenClaw: `PREEXISTING_OPENCLAW`, `INSTALLER_PIN_MISMATCH`,
   `REGISTRY_INTEGRITY_MISMATCH`, `INSTALLED_PAYLOAD_MISMATCH`,
@@ -1121,9 +1275,11 @@ of the policy artifact and its digest.
 For the new supervisor boundary, the closed mapping permits
 `INHERITED_SOCKET_FD` only on failed `safety.workstation_preflight`;
 `UNEXPECTED_NETWORK_ATTEMPT`, `PROHIBITED_FD_TRANSFER`,
+`PROHIBITED_FD_ACQUISITION`,
 `PROHIBITED_IO_URING`, `UNTRACED_CHILD_ATTEMPT`, or
 `TRACE_BYPASS_ATTEMPT` only on failed `offline.network_policy`;
-`TRACE_INCOMPLETE` or `TRACER_EXITED` only on failed
+`TRACE_INCOMPLETE`, `TRACE_DECODE_FAILED`, `TRACE_NOT_STARTED`,
+`TRACE_BOOTSTRAP_FAILED`, or `TRACER_EXITED` only on failed
 `offline.trace_integrity`; `EVIDENCE_BINDING_MISMATCH` only on failed
 `offline.evidence_binding`; and `LEDGER_CHAIN_INVALID` only on failed
 `safety.workstation_postflight`. Tests reject every cross-gate use.
@@ -1347,8 +1503,10 @@ parent/nonce fields and therefore cannot satisfy this gate.
   checkpoint digests, AgentOS plan-schema digest, OpenClaw configuration
   template digest, OpenClaw provisioning-record and provisioning-schema
   digests, Cyclone DDS configuration-set digest and member digests,
-  evidence- and offline-ledger-schema digests, gate-policy digest, and
-  reason-code-policy digest exactly match the parent run;
+  evidence-, offline-ledger-, and trace-tool-policy-schema digests, gate-policy,
+  reason-code-policy, and trace-tool-policy digests, parser-fixture-manifest
+  digest, and selected tracer/parser/build/argv values exactly match the parent
+  run;
 - every child `offline_evidence` artifact still exists under the child run
   directory, independently recomputes to its recorded type/owner/mode,
   size/count/digest/marker values, the accepted ledger generation is the sealed
@@ -1408,9 +1566,12 @@ terminal coordinator-written or supervisor-synthesized value and the trace is
 closed does the supervisor evaluate gates 25-27 in order. No authoritative
 label, JSON result, or process exit is selected before that sequence completes.
 The initial host observer supplies gate 4; the isolated action child supplies
-gates 5-23 and its inner cleanup proof; and the host coordinator combines the child
-proof with the final host observer to decide gate 24 on the normal path. A
-missing or unsealed provisional ledger is never a shortcut past gate 24.
+gates 5-23 and its inner cleanup proof; and the host coordinator combines the
+child proof with the final host observer to decide gate 24 on the normal path.
+On a bootstrap-failure path, the supervisor authors and seals gate 24 after the
+mandatory sanitation/cleanup step, closes the finalizer-only trace or records
+`NOT_STARTED`, then evaluates gates 25-27 in the same order. A missing or
+unsealed provisional ledger is never a shortcut past gate 24.
 
 `workstation_mujoco` order:
 
@@ -1483,13 +1644,13 @@ Finalizer failure mappings are closed and precedence-aware:
 
 | Finalizer | `FAIL` condition | Fixed result mapping |
 | --- | --- | --- |
-| `offline.trace_integrity` | truncated/unclosed trace coverage, missing or invalid marker protocol, tracer loss, unclosed PID/syscall, or trace-parser/tool failure; reason `TRACE_INCOMPLETE` or `TRACER_EXITED` | `FAIL_HARNESS`, exit 40 unless a safety gate also fails |
-| `offline.network_policy` | any host-namespace IP operation; any isolated-child IP operation outside the exact marker/config/PID/port-bounded semantic DDS allowance; or any prohibited fd-transfer, io_uring, untraced-child, or ptrace attempt, even when trace integrity later fails | `FAIL_SAFETY`, exit 30, with the fixed gate/reason mapping |
-| `offline.evidence_binding` | any missing, mutable, substituted, path-escaped, digest/count/index-inconsistent, or otherwise unbindable trace, accepted-ledger, chain-manifest, ownership-journal, violation-journal, or host-observer artifact; reason `EVIDENCE_BINDING_MISMATCH` | `FAIL_HARNESS`, exit 40 unless a safety gate also fails or the defect conceals a proved safety violation |
+| `offline.trace_integrity` | trace not started after bootstrap, tool/parser/fixture mismatch, transient grammar or canonical decode failure, abbreviation/unknown relevant record, truncated/unclosed coverage, invalid marker protocol, tracer loss, or unclosed PID/syscall; reason `TRACE_NOT_STARTED`, `TRACE_BOOTSTRAP_FAILED`, `TRACE_DECODE_FAILED`, `TRACE_INCOMPLETE`, or `TRACER_EXITED` | `FAIL_HARNESS`, exit 40 unless a safety gate also fails |
+| `offline.network_policy` | any host-namespace IP operation; any isolated-child explicit or generic socket I/O outside the exact marker/config/PID/FD-provenance/port allowance; or any prohibited fd-transfer/acquisition, io_uring, untraced-child, or ptrace attempt, even when trace integrity later fails | `FAIL_SAFETY`, exit 30, with the fixed gate/reason mapping |
+| `offline.evidence_binding` | any missing, mutable, substituted, path-escaped, digest/count/index-inconsistent, or otherwise unbindable bootstrap-report, trace, accepted-ledger, chain-manifest, ownership-journal, violation-journal, or host-observer artifact; reason `EVIDENCE_BINDING_MISMATCH` | `FAIL_HARNESS`, exit 40 unless a safety gate also fails or the defect conceals a proved safety violation |
 | `pc2.camera_cleanup` | an owned camera PID/PGID/start-time/executable identity mismatch, bounded TERM/wait/KILL exhaustion, or inability to prove that the owned process group terminated | `FAIL_SAFETY`, exit 30 |
 | `safety.pc2_runtime_monitor` | monitor exit, `CONTROL_VIOLATION` in any profile, a transition away from `EXACT_MATCH` in camera/full-stream profiles, or an incomplete terminal sample | `FAIL_SAFETY`, exit 30 |
 | `safety.pc2_postflight` | final control-signature checks fail in any profile, exact process/graph closure fails in camera/full-stream profiles, or the required profile-specific safety state cannot be established | `FAIL_SAFETY`, exit 30 |
-| `safety.workstation_postflight` | offline recorded-PID/socket teardown fails; either host observer is unavailable or inconsistent; the provisional ledger is missing, invalid, unsealed, or has the wrong nonce; MuJoCo localhost-DDS/graph/process checks fail; or a reused Stage 1-4 result has false/missing postflight proof | `FAIL_SAFETY`, exit 30 |
+| `safety.workstation_postflight` | bootstrap FD sanitation/rebinding or offline recorded-PID/socket teardown fails; required host-observer state is unavailable or inconsistent; the provisional ledger is missing, invalid, unsealed, or has the wrong nonce; MuJoCo localhost-DDS/graph/process checks fail; or a reused Stage 1-4 result has false/missing postflight proof | `FAIL_SAFETY`, exit 30 |
 
 The optional OpenClaw smoke action uses the same rule: an owned gateway cleanup
 identity mismatch or incomplete termination is `FAIL_SAFETY`, exit 30. These
@@ -1584,21 +1745,24 @@ The following are hard failures:
 10. An offline AgentOS or skill helper attempts network, ROS publish,
     subprocess, or physical execution.
 11. The offline namespace exposes a non-loopback interface/route, or any
-    process in the complete `workstation_offline` tree performs an IP operation
-    outside the exact semantic-fixture DDS allowance. A complete prohibited
-    operation is a safety violation even when a separate trace defect is also
-    present.
+    process in the complete `workstation_offline` tree performs an explicit or
+    generic FD-provenance-derived socket I/O operation outside the exact
+    semantic-fixture DDS allowance. A complete prohibited operation is a safety
+    violation even when a separate trace defect is also present.
 12. The offline tracee inherits an unapproved or socket FD, transfers an FD with
-    `SCM_RIGHTS`, attempts an io_uring operation, requests an untraced clone, or
-    invokes `ptrace`.
+    `SCM_RIGHTS`, invokes `pidfd_getfd`, attempts an io_uring operation,
+    requests an untraced clone, or invokes `ptrace`.
 13. The tracer loses identity or exits while a tracee is live, and kernel
     exit-kill plus ownership-journal cleanup cannot prove that every tracee and
     owned child stopped. Unexpected tracer exit after proved teardown remains a
     harness failure, not a silent continuation.
-14. Complete trace coverage, the acknowledged immutable ledger chain, or the
-    final evidence-artifact binding cannot be established. These remain
-    structural harness failures unless the specific finalizer rules establish a
-    safety failure; they do not erase an independently proved policy violation.
+14. The exact tracer/parser/argv/fixture allowlist cannot be established, the
+    canonical trace contains an abbreviation or undecodable relevant record,
+    or complete trace coverage, the acknowledged immutable ledger chain, or
+    the final evidence-artifact binding cannot be established. These remain
+    structural harness failures unless the specific finalizer rules establish
+    a safety failure; they do not erase an independently proved policy
+    violation.
 15. A secret value appears in stdout, logs, evidence, or a Git-tracked file.
 
 On PC2 and in an optional OpenClaw smoke action, the orchestrator stops only
@@ -1636,11 +1800,25 @@ Implementation follows test-driven development.
   `ManySocketsMode=false`, trace-visible marker parsing, semantic-fixture
   never-entered/entered marker branches, PID/record-order scoping, host/private
   namespace-interface/route validation, supervisor audit/seccomp enforcement,
-  inherited-FD classification and close-range sanitization, `SCM_RIGHTS`,
-  io_uring/ptrace/`CLONE_UNTRACED` denial, postflight-before-trace ordering,
-  tracer/runner process-group separation, tracer pidfd liveness and
-  `PTRACE_O_EXITKILL`, missing-ledger synthesis, artifact descriptor/bundle
-  recomputation, and supervisor signal/exit precedence.
+  inherited-FD classification and close-range sanitization, per-process FD
+  provenance across socket creation/accept, `dup*`, `fcntl`, inheritance,
+  `CLONE_FILES` sharing/splitting, exec, and close transitions, generic
+  socket-I/O classification,
+  `SCM_RIGHTS`/`pidfd_getfd` acquisition denial, io_uring/ptrace/
+  `CLONE_UNTRACED` denial, postflight-before-trace ordering, tracer/runner
+  process-group separation, tracer pidfd liveness and `PTRACE_O_EXITKILL`,
+  missing-ledger synthesis, artifact descriptor/bundle recomputation, and
+  supervisor signal/exit precedence.
+- Closed trace-tool-policy schema and one-row allowlist; exact 6.6 archive
+  size/digest, build recipe/image, runtime ELF/version, parser blob, canonical
+  argv, and fixture-manifest matching; raw generic-I/O normalization without
+  persisted payload; complete canonical record formation from paired
+  unfinished/resumed input; and rejection of every abbreviation, unknown ABI,
+  unknown grammar, ellipsis, or undecodable policy field.
+- Every supervisor bootstrap-table row, including immutable generation-0
+  creation, supervisor-authored early successors, finalizer-only trace,
+  `NOT_STARTED` trace, `NOT_RUN` observer, empty-journal binding, gate 24
+  synthesis, and safety/harness/interruption precedence.
 - Stage 3 `required_qualification` role, pass, exact qualified continuation,
   prerequisite failure, malformed result, Stage 4 `NOT_RUN` behavior, and
   postflight safety overriding every evaluator exit code.
@@ -1673,12 +1851,22 @@ Implementation follows test-driven development.
   `offline.network_policy: PASS`, exact marker-bounded allowance of the
   semantic fixture's DDS UDP4 operations through the four pinned Cyclone
   configurations, and zero other IP operations.
-- Require strace 6.6 or newer, a passing `--kill-on-exit` capability probe,
-  exact sanitized inherited descriptors, continuous tracer pidfd liveness,
-  and verified kernel exit-kill of tracees if the tracer is terminated. After
-  closure, independently recompute and match the trace, accepted ledger chain,
-  ownership/violation journals, host observations, marker indices, and
-  `offline_evidence_bundle_sha256` recorded in `result.json`.
+- Require only the one approved strace 6.6 tuple, including the exact source
+  archive, build/runtime/parser/argv/fixture digests, `--no-abbrev`,
+  all-syscall trace, raw generic-I/O set, passing compatibility/live fixtures,
+  and `--kill-on-exit` capability. Verify that the canonical NDJSON retains FD,
+  endpoint, size, flag, return, and ordering metadata while no payload bytes
+  appear in any persisted artifact. Require exact sanitized inherited
+  descriptors, continuous tracer pidfd liveness, and verified kernel exit-kill
+  if the tracer is terminated. After closure, independently recompute and match
+  the trace, accepted ledger chain, ownership/violation journals, host
+  observations, marker indices, and `offline_evidence_bundle_sha256` recorded
+  in `result.json`.
+- Exercise every bootstrap outcome in a subprocess with contaminated stdio/
+  extra FDs, missing or mismatched tracer/parser, live-fixture failure, and
+  signals. Require the exact `FULL`, `FINALIZER_ONLY`, or `NOT_STARTED` trace
+  descriptor; observer/journal states; immutable ledger transitions; all four
+  mandatory finalizer statuses; primary blocker; label; and exit.
 - Verify exact OpenClaw/Node artifacts, the pinned local configuration,
   successful provisioning-schema validation, identical expected/installed
   payload manifests, `config validate`, both exact lint commands, and the
@@ -1738,13 +1926,36 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
   not remapped to a harness failure.
 - Give the supervisor an inherited connected TCP or UDP socket in an ordinary
   FD and separately in fd 0, 1, or 2; attempt payload `write` without creating
-  another socket and require preflight `INHERITED_SOCKET_FD` safety failure.
-  Attempt to receive an already connected socket over `SCM_RIGHTS` and use it,
-  and require `PROHIBITED_FD_TRANSFER` even though general `write` is not
-  traced. Submit a socket operation through io_uring, including an SQPOLL case,
-  and attempt `CLONE_UNTRACED` and `ptrace`; require the inherited seccomp
-  policy to deny each operation, trace the attempt, journal it, and select the
-  corresponding network-policy safety reason.
+  another socket and require preflight `INHERITED_SOCKET_FD`, no functional
+  coordinator, a sanitized `FINALIZER_ONLY` trace when possible, gates 4-23
+  `NOT_RUN`, and safety exit 30. Make sanitation fail and require the exact
+  `NOT_STARTED`/postflight-failure branch. Attempt to receive an already
+  connected socket over `SCM_RIGHTS` and require
+  `PROHIBITED_FD_TRANSFER`; attempt `pidfd_getfd` and require
+  `PROHIBITED_FD_ACQUISITION`. Submit a socket operation through io_uring,
+  including an SQPOLL case, and attempt `CLONE_UNTRACED` and `ptrace`; require
+  the inherited seccomp policy to deny each operation, trace the attempt,
+  journal it, and select the corresponding network-policy safety reason.
+- During the permitted DDS interval, connect an allowed UDP socket, duplicate
+  it independently through `dup`, `dup2`, `dup3`, `fcntl(F_DUPFD)`, and a
+  traced descendant using both copied and `CLONE_FILES`-shared tables, then
+  retain each alias past END. Attempt `write`,
+  `writev`, `sendfile`, and pipe-to-socket `splice` after END and require each
+  raw metadata record to resolve to the original socket provenance and fail
+  `offline.network_policy`. Repeat inside the interval with the exact allowed
+  endpoint and require policy acceptance without payload persistence. Feed a
+  generic I/O record for an unconnected internet socket and require policy
+  failure because no peer is provable. Feed a conflicting or unknown FD
+  transition and require trace-integrity failure, never regular-file
+  classification.
+- Replace the approved strace with an older/newer binary, alter its ELF or
+  version output, build recipe/image, parser, argv, or fixture manifest, and
+  require bootstrap failure with no fallback. Feed argument abbreviation,
+  an unexpected ellipsis, malformed FD annotation, unknown syscall ABI,
+  unpaired unfinished/resumed records, and an undecodable relevant field;
+  require `TRACE_DECODE_FAILED`, no functional coordinator, and no readiness
+  result. Inject recognizable payload bytes into every decoded/raw I/O family
+  and prove none appear in canonical trace, logs, journals, or result evidence.
 - Send HUP, INT, and TERM during early, semantic, postflight, and trace-close
   phases. Require distinct tracer/coordinator process groups, one identity-
   checked forward only to the coordinator PGID, coordinator postflight before
@@ -1758,8 +1969,9 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
   require synthesized `safety.workstation_postflight: FAIL`,
   `LEDGER_CHAIN_INVALID` where applicable, `FAIL_SAFETY`, and exit 30 even when
   tracing also fails.
-- Replace or mutate the closed trace, any ledger generation or chain manifest,
-  either journal, or either host-observer artifact between descriptor passes;
+- Replace or mutate the bootstrap report, closed trace, any ledger generation
+  or chain manifest, either journal, or either host-observer artifact between
+  descriptor passes;
   alter recorded sizes/counts, accepted generation, or marker indices; and
   require `offline.evidence_binding: FAIL` with
   `EVIDENCE_BINDING_MISMATCH`. If a violation-journal mutation would conceal a
@@ -1792,12 +2004,15 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
 
 ### Phase A: Workstation provisioning and offline profile
 
-Provision exact OpenClaw artifacts and the pinned minimal configuration only
-after pre-existing lifecycle checks. Validate the configuration and exact lint
-contracts without starting a gateway. Then run `workstation_offline` with
-a traced host coordinator, host listener observers before and after the action,
-an isolated loopback-only action namespace, four digest-pinned Cyclone
-configurations, and complete-process-tree tracing. Required source, runtime,
+Provision the exact one-row strace 6.6 build/runtime/parser/fixture toolchain
+before the offline action, and provision exact OpenClaw artifacts plus the
+pinned minimal configuration only after its pre-existing lifecycle checks; the
+offline runner itself performs no download or tool substitution. Validate
+OpenClaw without starting a gateway. Then run
+`workstation_offline` with the pinned supervisor/normalizer, a traced host
+coordinator, host listener observers before and after the action, an isolated
+loopback-only action namespace, four digest-pinned Cyclone configurations, and
+complete-process-tree tracing. Required source, runtime,
 skill, AgentOS, semantic, chatbot dependency/configuration, OpenClaw, safety,
 `offline.trace_integrity`, `offline.network_policy`, and
 `offline.evidence_binding` gates must pass. Only the exact marker-bounded
