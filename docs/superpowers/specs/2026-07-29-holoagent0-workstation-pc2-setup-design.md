@@ -505,12 +505,33 @@ no violation can be proved. When both gates fail, `offline.network_policy` is
 the precedence-winning safety blocker and `offline.trace_integrity` remains in
 `blocking_gates` as the harness defect.
 
-The supervisor installs `HUP`, `INT`, and `TERM` handlers before launch and
-records the first signal. It launches `strace` in a tracer process group, while
-the tracee command starts the coordinator through `setsid`, making the
-coordinator PID its distinct session and PGID. The supervisor records and
-validates both PID/PGID/start-time/executable identities; the tracer never joins
-the coordinator group. The normalizer has a third, distinct recorded identity.
+Before bootstrap, the supervisor blocks `HUP`, `INT`, and `TERM` in every
+thread and starts one dedicated `sigwaitinfo` collector. The collector and the
+launcher serialize transitions of a closed launch state under one lock. From
+`BOOTSTRAP_CLEAN`, exactly one transition can win: the collector records the
+first signal and changes the state to `PRE_COORDINATOR_INTERRUPTED`, or the
+launcher changes it to `COORDINATOR_LAUNCH_COMMITTED`. This transition, rather
+than scheduler timing around `fork`/`exec`, is the authorization boundary. The
+bootstrap report records the terminal launch state, the first signal when
+present, and `coordinator_launch_committed: true|false`.
+
+The collector records the first signal even while bootstrap is still in
+progress. If all bootstrap checks subsequently pass, an already latched signal
+causes the direct transition to `PRE_COORDINATOR_INTERRUPTED`; it cannot pass
+through `BOOTSTRAP_CLEAN` to the launcher. If bootstrap instead establishes a
+failure, the signal is carried through that failure row and normal precedence.
+
+Only after winning the commit transition does the supervisor launch the full
+`strace`/coordinator pair. `strace` runs in a tracer process group, while the
+tracee command starts the coordinator through `setsid`, making the coordinator
+PID its distinct session and PGID. A signal collected after commitment follows
+the normal coordinator path; if the committed spawn itself fails, the existing
+missing-ledger/trace-bootstrap synthesis applies and the recorded interruption
+cannot hide that failure. The pre-commit interruption path may launch only the
+finalizer-only pair fixed in the table below. The supervisor records and
+validates the applicable PID/PGID/start-time/executable identities; the tracer
+never joins a tracee group. The normalizer has a third, distinct recorded
+identity.
 Immediately after spawn, the supervisor opens pidfds for the exact tracer and
 normalizer identities and continuously polls both alongside canonical trace
 progress. Losing either pidfd, receiving an unexpected exit, observing an
@@ -588,15 +609,24 @@ than silently discarded. Supervisor-authored early-failure successors use the
 same immutable, acknowledged hash chain and fixed gate transitions as
 coordinator candidates.
 
+The bootstrap report's closed terminal launch-state enum is
+`COORDINATOR_LAUNCH_COMMITTED`, `PRE_COORDINATOR_INTERRUPTED`,
+`FINALIZER_ONLY_BOOTSTRAP_FAILURE`, or `NOT_STARTED_BOOTSTRAP_FAILURE`.
+`coordinator_launch_committed` is true if and only if the first value was
+committed; a failed spawn after that commitment does not rewrite history to a
+pre-commit state. The report records `first_signal` as null, `HUP`, `INT`, or
+`TERM`.
+
 The bootstrap outcome table is authoritative:
 
 | Bootstrap outcome | Trace/action behavior | Required terminal states |
 | --- | --- | --- |
-| Exact toolchain and FD manifest pass | Launch the full traced coordinator; it repeats the FD/tool/environment checks before making gate 3 `PASS` | Normal gate sequence and all four mandatory finalizers |
-| Source/runtime pass; inherited socket or unknown FD found; sanitation and safe stdio rebinding succeed | Set gate 3 `FAIL`/`INHERITED_SOCKET_FD`; gates 4-23 `NOT_RUN`; launch the exact tracer around the native finalizer-only tracee, never the functional coordinator | Gate 24 proves cleanup; gate 25 evaluates that sanitized trace; gate 26 evaluates its zero policy events; gate 27 binds all artifacts; safety gate 3 remains primary |
-| Inherited FD sanitation/rebinding cannot be proved | Set gate 3 and gate 24 `FAIL`; launch no child or tracer | Gate 25 `FAIL`/`TRACE_NOT_STARTED`; gate 26 `SKIPPED`; gate 27 binds the explicit not-started artifacts; safety remains primary |
-| Trace-tool/parser/capability pin fails before launch | Set the applicable source/runtime gate `FAIL`; later action gates `NOT_RUN`; launch no functional child or unapproved tracer | Gate 24 records cleanup and becomes `FAIL` if any unsafe inherited FD was found or could not be sanitized; gate 25 `FAIL`/`TRACE_BOOTSTRAP_FAILED`; gate 26 `SKIPPED` unless a bootstrap violation journal proves a policy event; gate 27 binds the explicit not-started artifacts |
-| Signal during bootstrap | Finish the applicable row above without launching a functional child | Safety, then harness, then interruption precedence; interruption survives only if every mandatory finalizer passes or validly skips |
+| Exact toolchain and FD manifest pass, with no signal winning the launch transition | Atomically record `COORDINATOR_LAUNCH_COMMITTED` and `coordinator_launch_committed: true`, then launch the full traced coordinator; it repeats the FD/tool/environment checks before making gate 3 `PASS` | Normal gate sequence and all four mandatory finalizers |
+| Source/runtime and every clean-bootstrap check pass; HUP, INT, or TERM is already latched or wins before coordinator launch commitment | Record `PRE_COORDINATOR_INTERRUPTED`, `coordinator_launch_committed: false`, and the first signal; never exec the functional coordinator; run the exact approved tracer around only the native finalizer-only tracee | Gates 1-2 `PASS`; gates 3-23 `NOT_RUN`/`INTERRUPTED_BEFORE_GATE`; gate 24 `PASS` after proving sanitized descriptors and no owned process/socket remains; gates 25-27 `PASS`; `FINALIZER_ONLY`, semantic DDS `NOT_ENTERED`, null marker indices, both host observers `NOT_RUN`, and real zero-record journals; empty `blocking_gates`, null primary blocker, `INTERRUPTED`, and exit 129/130/143 matching the signal |
+| Source/runtime pass; inherited socket or unknown FD found; sanitation and safe stdio rebinding succeed | Record `FINALIZER_ONLY_BOOTSTRAP_FAILURE`; set gate 3 `FAIL`/`INHERITED_SOCKET_FD`; gates 4-23 `NOT_RUN`; launch the exact tracer around the native finalizer-only tracee, never the functional coordinator | Gate 24 proves cleanup; gate 25 evaluates that sanitized trace; gate 26 evaluates its zero policy events; gate 27 binds all artifacts; safety gate 3 remains primary |
+| Inherited FD sanitation/rebinding cannot be proved | Record `NOT_STARTED_BOOTSTRAP_FAILURE`; set gate 3 and gate 24 `FAIL`; launch no child or tracer | Gate 25 `FAIL`/`TRACE_NOT_STARTED`; gate 26 `SKIPPED`; gate 27 binds the explicit not-started artifacts; safety remains primary |
+| Trace-tool/parser/capability pin fails before launch | Record `NOT_STARTED_BOOTSTRAP_FAILURE`; set the applicable source/runtime gate `FAIL`; later action gates `NOT_RUN`; launch no functional child or unapproved tracer | Gate 24 records cleanup and becomes `FAIL` if any unsafe inherited FD was found or could not be sanitized; gate 25 `FAIL`/`TRACE_BOOTSTRAP_FAILED`; gate 26 `SKIPPED` unless a bootstrap violation journal proves a policy event; gate 27 binds the explicit not-started artifacts |
+| Signal during a bootstrap that resolves to one of the failure rows above | Finish that failure row without launching a functional child | Safety, then harness, then interruption precedence; interruption survives only if every mandatory finalizer passes or validly skips |
 
 The evidence schema gives the trace descriptor a closed `trace_state` enum of
 `FULL`, `FINALIZER_ONLY`, or `NOT_STARTED`. `FULL` and `FINALIZER_ONLY` require
@@ -604,10 +634,18 @@ the pinned tracer/normalizer identities, exits, record counts, and canonical
 trace digest. `NOT_STARTED` requires null tracer identity/exit, zero trace
 records, and exactly `TRACE_NOT_STARTED` or `TRACE_BOOTSTRAP_FAILED`. Host-
 observer descriptors likewise use `OBSERVED` or `NOT_RUN`; the latter requires
-zero counts and the earlier blocking gate. Empty journals are real, closed,
-hashed artifacts, not absent paths. Therefore every schema-valid bootstrap
-failure still has deterministic ledger, artifact, finalizer, label, and exit
-semantics.
+zero counts and either the earlier blocking gate or the pre-coordinator
+interruption. Empty journals are real, closed, hashed artifacts, not absent
+paths. Therefore every schema-valid bootstrap failure still has deterministic
+ledger, artifact, finalizer, label, and exit semantics.
+
+For `PRE_COORDINATOR_INTERRUPTED`, both `NOT_RUN` host-observer descriptors
+name gate 3 and `INTERRUPTED_BEFORE_GATE` as their cause rather than a blocking
+failure. The bootstrap report, generation chain, finalizer-only trace, empty
+journals, and observer placeholders are still closed and bound normally. If
+gate 24, 25, 26, or 27 does not reach the passing state fixed in the table, its
+ordinary safety/harness precedence replaces the interruption tuple; the table's
+null primary blocker and signal exit apply only when all four pass.
 
 If the coordinator is killed, exits without a valid seal, or cannot establish
 the inner and host postflight observations, the supervisor starts from the last
@@ -1183,7 +1221,8 @@ files/directories are `fsync`ed:
   exit statuses, exact tool-policy row digest, compatibility-fixture result,
   and nullable not-started reason under the discriminated bootstrap rules;
 - supervisor-bootstrap report relative path, SHA-256, byte size, terminal
-  state, expected/observed tool values, initial/final FD manifests, sanitation/
+  launch state, `coordinator_launch_committed`, nullable first signal,
+  expected/observed tool values, initial/final FD manifests, sanitation/
   rebinding actions, and live-fixture result;
 - accepted ledger generation and SHA-256, immutable generation count, and the
   SHA-256/byte size of a canonical chain manifest listing every generation's
@@ -1818,7 +1857,8 @@ Implementation follows test-driven development.
 - Every supervisor bootstrap-table row, including immutable generation-0
   creation, supervisor-authored early successors, finalizer-only trace,
   `NOT_STARTED` trace, `NOT_RUN` observer, empty-journal binding, gate 24
-  synthesis, and safety/harness/interruption precedence.
+  synthesis, the mutually exclusive pre-coordinator interruption versus launch-
+  committed transitions, and safety/harness/interruption precedence.
 - Stage 3 `required_qualification` role, pass, exact qualified continuation,
   prerequisite failure, malformed result, Stage 4 `NOT_RUN` behavior, and
   postflight safety overriding every evaluator exit code.
@@ -1867,6 +1907,16 @@ Implementation follows test-driven development.
   signals. Require the exact `FULL`, `FINALIZER_ONLY`, or `NOT_STARTED` trace
   descriptor; observer/journal states; immutable ledger transitions; all four
   mandatory finalizer statuses; primary blocker; label; and exit.
+- Hold the launcher at the clean-bootstrap barrier and inject HUP, INT, and
+  TERM before allowing the launch-state transition. Require
+  `PRE_COORDINATOR_INTERRUPTED`, `coordinator_launch_committed: false`, gates
+  1-2 `PASS`, gates 3-23 `NOT_RUN`, gates 24-27 `PASS`, no functional
+  coordinator PID or exec record, the exact finalizer-only artifacts, and the
+  matching `INTERRUPTED` exit. Race each signal against launch commitment
+  repeatedly: every run must select exactly one state. If commitment wins,
+  require `coordinator_launch_committed: true`, the normal full-coordinator
+  signal path, and exactly one forward; mixed artifacts or two results fail the
+  test.
 - Verify exact OpenClaw/Node artifacts, the pinned local configuration,
   successful provisioning-schema validation, identical expected/installed
   payload manifests, `config validate`, both exact lint commands, and the
@@ -1956,11 +2006,12 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
   require `TRACE_DECODE_FAILED`, no functional coordinator, and no readiness
   result. Inject recognizable payload bytes into every decoded/raw I/O family
   and prove none appear in canonical trace, logs, journals, or result evidence.
-- Send HUP, INT, and TERM during early, semantic, postflight, and trace-close
-  phases. Require distinct tracer/coordinator process groups, one identity-
-  checked forward only to the coordinator PGID, coordinator postflight before
-  trace closure, all three supervisor finalizers afterward, one authoritative
-  result, and the precedence-defined exit. Kill the tracer before coordinator
+- Send HUP, INT, and TERM after coordinator launch commitment during early,
+  semantic, postflight, and trace-close phases. Require distinct tracer/
+  coordinator process groups, one identity-checked forward only to the
+  coordinator PGID, coordinator postflight before trace closure, all three
+  supervisor finalizers afterward, one authoritative result, and the
+  precedence-defined exit. Kill the tracer before coordinator
   setup, while a descendant is live, and after all tracees exit; prove pidfd
   detection, kernel exit-kill, journal-based remainder cleanup, no continued
   profile progression, and the specified safety-versus-harness outcome. Kill
