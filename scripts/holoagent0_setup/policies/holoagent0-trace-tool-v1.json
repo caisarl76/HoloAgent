@@ -1,0 +1,91 @@
+{
+  "$id": "holoagent0.trace-tool-policy.v1",
+  "schema_version": "holoagent0.trace-tool-policy.v1",
+  "digest_algorithm": "sha256",
+  "rows": [
+    {
+      "tool": "strace",
+      "version": "6.6",
+      "platform": "linux-x86_64",
+      "syscall_abi": "linux-x86_64",
+      "source": {
+        "url": "https://strace.io/files/6.6/strace-6.6.tar.xz",
+        "size": 2420364,
+        "sha256": "421b4186c06b705163e64dc85f271ebdcf67660af8667283147d5e859fc8a96c"
+      },
+      "build": {
+        "recipe_path": "scripts/holoagent0_setup/trace/build-strace-6.6.sh",
+        "recipe_sha256": null,
+        "container_image_digest": null,
+        "digest_algorithm": "sha256",
+        "review_state": "PENDING_REPRODUCIBLE_BUILD"
+      },
+      "runtime": {
+        "elf_path": "scripts/holoagent0_setup/trace/install/bin/strace",
+        "elf_size": null,
+        "elf_sha256": null,
+        "version_output_sha256": null,
+        "digest_algorithm": "sha256",
+        "review_state": "PENDING_REPRODUCIBLE_BUILD"
+      },
+      "parser": {
+        "path": "scripts/holoagent0_setup/holoagent0_setup/trace_parser.py",
+        "sha256": null,
+        "digest_algorithm": "sha256",
+        "review_state": "PENDING_IMPLEMENTATION_REVIEW"
+      },
+      "argv": {
+        "options": [
+          "--kill-on-exit",
+          "-f",
+          "-yy",
+          "-ttt",
+          "-T",
+          "--no-abbrev",
+          "--string-limit=1048576",
+          "--quiet=none",
+          "--trace=all"
+        ],
+        "raw_syscalls": [
+          "read",
+          "readv",
+          "pread64",
+          "preadv",
+          "preadv2",
+          "write",
+          "writev",
+          "pwrite64",
+          "pwritev",
+          "pwritev2",
+          "sendfile",
+          "splice",
+          "vmsplice",
+          "tee",
+          "copy_file_range"
+        ],
+        "decoded_address_syscalls": [
+          "sendto",
+          "recvfrom",
+          "sendmsg",
+          "recvmsg",
+          "sendmmsg",
+          "recvmmsg"
+        ],
+        "environment": {
+          "LC_ALL": "C",
+          "TZ": "UTC"
+        },
+        "canonical_sha256": null,
+        "digest_algorithm": "sha256",
+        "review_state": "PENDING_IMPLEMENTATION_REVIEW"
+      },
+      "fixtures": {
+        "manifest_path": "scripts/holoagent0_setup/trace/fixtures/manifest-v1.json",
+        "manifest_sha256": null,
+        "digest_algorithm": "sha256",
+        "review_state": "PENDING_IMPLEMENTATION_REVIEW"
+      }
+    }
+  ],
+  "additionalProperties": false
+}

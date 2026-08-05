@@ -1,0 +1,209 @@
+{
+  "$id": "holoagent0.gate-policy.v1",
+  "schema_version": "holoagent0.gate-policy.v1",
+  "digest_algorithm": "sha256",
+  "gate_statuses": ["PASS", "FAIL", "QUALIFIED", "SKIPPED", "NOT_RUN"],
+  "top_statuses": ["PASS", "QUALIFIED", "FAIL", "INTERRUPTED"],
+  "roles": ["required", "diagnostic", "qualification", "required_qualification", "finalizer"],
+  "profiles": {
+    "workstation_offline": {
+      "gate_order": [
+        "source.repository", "runtime.workstation", "safety.workstation_preflight",
+        "openclaw.preexisting", "openclaw.version_pin", "openclaw.registry_integrity",
+        "openclaw.config_pin", "openclaw.config_validate", "openclaw.doctor_lint",
+        "skills.registry", "skills.dry_run", "agentos.plan_schema",
+        "agentos.offline_execution", "agentos.network_attempts", "source.semantic_blobs",
+        "semantic.asset_lock", "semantic.fixture_graph", "semantic.fixture_query",
+        "semantic.natural_language_parser", "chatbot.dependencies", "chatbot.configuration",
+        "chatbot.credentials", "chatbot.audio_hardware", "safety.workstation_postflight",
+        "offline.trace_integrity", "offline.network_policy", "offline.evidence_binding"
+      ],
+      "roles": {
+        "source.repository": "required", "runtime.workstation": "required",
+        "safety.workstation_preflight": "required", "openclaw.preexisting": "required",
+        "openclaw.version_pin": "required", "openclaw.registry_integrity": "required",
+        "openclaw.config_pin": "required", "openclaw.config_validate": "required",
+        "openclaw.doctor_lint": "required", "skills.registry": "required",
+        "skills.dry_run": "required", "agentos.plan_schema": "required",
+        "agentos.offline_execution": "required", "agentos.network_attempts": "required",
+        "source.semantic_blobs": "required", "semantic.asset_lock": "required",
+        "semantic.fixture_graph": "required", "semantic.fixture_query": "required",
+        "semantic.natural_language_parser": "diagnostic", "chatbot.dependencies": "required",
+        "chatbot.configuration": "required", "chatbot.credentials": "qualification",
+        "chatbot.audio_hardware": "qualification", "safety.workstation_postflight": "finalizer",
+        "offline.trace_integrity": "finalizer", "offline.network_policy": "finalizer",
+        "offline.evidence_binding": "finalizer"
+      },
+      "finalizers": {
+        "safety.workstation_postflight": "safety",
+        "offline.trace_integrity": "harness",
+        "offline.network_policy": "safety",
+        "offline.evidence_binding": "harness"
+      }
+    },
+    "workstation_mujoco": {
+      "gate_order": [
+        "source.repository", "runtime.workstation", "safety.workstation_preflight",
+        "offline.reference", "mujoco.stage1", "mujoco.stage2", "mujoco.stage3",
+        "mujoco.stage4", "safety.workstation_postflight"
+      ],
+      "roles": {
+        "source.repository": "required", "runtime.workstation": "required",
+        "safety.workstation_preflight": "required", "offline.reference": "required",
+        "mujoco.stage1": "required", "mujoco.stage2": "required",
+        "mujoco.stage3": "required_qualification", "mujoco.stage4": "required",
+        "safety.workstation_postflight": "finalizer"
+      },
+      "finalizers": {"safety.workstation_postflight": "safety"}
+    },
+    "pc2_inventory": {
+      "gate_order": [
+        "source.repository", "source.pc2_script", "runtime.pc2", "safety.pc2_preflight",
+        "pc2.inventory", "pc2.camera_inventory", "pc2.lidar_advertisement",
+        "pc2.lidar_sample", "pc2.lidar_rate", "pc2.lidar_schema",
+        "pc2.imu_advertisement", "pc2.imu_sample", "pc2.imu_rate",
+        "safety.pc2_runtime_monitor", "safety.pc2_postflight"
+      ],
+      "roles": {
+        "source.repository": "required", "source.pc2_script": "required",
+        "runtime.pc2": "required", "safety.pc2_preflight": "required",
+        "pc2.inventory": "required", "pc2.camera_inventory": "required",
+        "pc2.lidar_advertisement": "diagnostic", "pc2.lidar_sample": "diagnostic",
+        "pc2.lidar_rate": "diagnostic", "pc2.lidar_schema": "diagnostic",
+        "pc2.imu_advertisement": "diagnostic", "pc2.imu_sample": "diagnostic",
+        "pc2.imu_rate": "diagnostic", "safety.pc2_runtime_monitor": "finalizer",
+        "safety.pc2_postflight": "finalizer"
+      },
+      "finalizers": {
+        "safety.pc2_runtime_monitor": "safety",
+        "safety.pc2_postflight": "safety"
+      }
+    },
+    "pc2_camera": {
+      "gate_order": [
+        "source.repository", "source.pc2_script", "runtime.pc2", "safety.pc2_preflight",
+        "pc2.inventory", "pc2.camera_inventory", "pc2.camera_sample", "pc2.camera_rate",
+        "pc2.lidar_advertisement", "pc2.lidar_sample", "pc2.lidar_rate",
+        "pc2.lidar_schema", "pc2.imu_advertisement", "pc2.imu_sample", "pc2.imu_rate",
+        "pc2.camera_cleanup", "safety.pc2_runtime_monitor", "safety.pc2_postflight"
+      ],
+      "roles": {
+        "source.repository": "required", "source.pc2_script": "required",
+        "runtime.pc2": "required", "safety.pc2_preflight": "required",
+        "pc2.inventory": "required", "pc2.camera_inventory": "required",
+        "pc2.camera_sample": "required", "pc2.camera_rate": "required",
+        "pc2.lidar_advertisement": "diagnostic", "pc2.lidar_sample": "diagnostic",
+        "pc2.lidar_rate": "diagnostic", "pc2.lidar_schema": "diagnostic",
+        "pc2.imu_advertisement": "diagnostic", "pc2.imu_sample": "diagnostic",
+        "pc2.imu_rate": "diagnostic", "pc2.camera_cleanup": "finalizer",
+        "safety.pc2_runtime_monitor": "finalizer", "safety.pc2_postflight": "finalizer"
+      },
+      "finalizers": {
+        "pc2.camera_cleanup": "safety", "safety.pc2_runtime_monitor": "safety",
+        "safety.pc2_postflight": "safety"
+      }
+    },
+    "pc2_full_streams": {
+      "gate_order": [
+        "source.repository", "source.pc2_script", "runtime.pc2", "safety.pc2_preflight",
+        "pc2.inventory", "pc2.camera_inventory", "pc2.camera_sample", "pc2.camera_rate",
+        "pc2.lidar_advertisement", "pc2.lidar_sample", "pc2.lidar_rate",
+        "pc2.lidar_schema", "pc2.imu_advertisement", "pc2.imu_sample", "pc2.imu_rate",
+        "pc2.camera_cleanup", "safety.pc2_runtime_monitor", "safety.pc2_postflight"
+      ],
+      "roles": {
+        "source.repository": "required", "source.pc2_script": "required",
+        "runtime.pc2": "required", "safety.pc2_preflight": "required",
+        "pc2.inventory": "required", "pc2.camera_inventory": "required",
+        "pc2.camera_sample": "required", "pc2.camera_rate": "required",
+        "pc2.lidar_advertisement": "required", "pc2.lidar_sample": "required",
+        "pc2.lidar_rate": "required", "pc2.lidar_schema": "required",
+        "pc2.imu_advertisement": "required", "pc2.imu_sample": "required",
+        "pc2.imu_rate": "required", "pc2.camera_cleanup": "finalizer",
+        "safety.pc2_runtime_monitor": "finalizer", "safety.pc2_postflight": "finalizer"
+      },
+      "finalizers": {
+        "pc2.camera_cleanup": "safety", "safety.pc2_runtime_monitor": "safety",
+        "safety.pc2_postflight": "safety"
+      }
+    }
+  },
+  "label_tuples": [
+    {"labels": ["PASS_HOLOAGENT0_OFFLINE", "PASS_HOLOAGENT0_MUJOCO", "PASS_PC2_SENSOR_INVENTORY", "PASS_PC2_CAMERA_ONLY", "PASS_PC2_SENSOR_STREAMS"], "status": "PASS", "exit_class": "PASS", "process_exit_code": 0},
+    {"labels": ["READY_CREDENTIALS_REQUIRED", "READY_AUDIO_HARDWARE_REQUIRED", "READY_CREDENTIALS_AND_AUDIO_REQUIRED", "READY_MUJOCO_STAGE4_ESTIMATOR_FAILED"], "status": "QUALIFIED", "exit_class": "QUALIFIED", "process_exit_code": 10},
+    {"labels": ["FAIL_SOURCE", "FAIL_RUNTIME", "FAIL_OPENCLAW", "FAIL_AGENTOS", "FAIL_SEMANTIC", "FAIL_CHATBOT", "FAIL_MUJOCO", "FAIL_PC2_INVENTORY", "FAIL_PC2_CAMERA", "FAIL_PC2_STREAMS"], "status": "FAIL", "exit_class": "GATE_FAILURE", "process_exit_code": 20},
+    {"labels": ["FAIL_SAFETY"], "status": "FAIL", "exit_class": "SAFETY_FAILURE", "process_exit_code": 30},
+    {"labels": ["FAIL_HARNESS"], "status": "FAIL", "exit_class": "HARNESS_FAILURE", "process_exit_code": 40},
+    {"labels": ["INTERRUPTED"], "status": "INTERRUPTED", "exit_class": "HUP", "process_exit_code": 129},
+    {"labels": ["INTERRUPTED"], "status": "INTERRUPTED", "exit_class": "INT", "process_exit_code": 130},
+    {"labels": ["INTERRUPTED"], "status": "INTERRUPTED", "exit_class": "TERM", "process_exit_code": 143}
+  ],
+  "non_failure_outcomes": {
+    "workstation_offline": {
+      "": "PASS_HOLOAGENT0_OFFLINE",
+      "chatbot.credentials": "READY_CREDENTIALS_REQUIRED",
+      "chatbot.audio_hardware": "READY_AUDIO_HARDWARE_REQUIRED",
+      "chatbot.credentials,chatbot.audio_hardware": "READY_CREDENTIALS_AND_AUDIO_REQUIRED"
+    },
+    "workstation_mujoco": {
+      "": "PASS_HOLOAGENT0_MUJOCO",
+      "mujoco.stage3": "READY_MUJOCO_STAGE4_ESTIMATOR_FAILED"
+    },
+    "pc2_inventory": {"": "PASS_PC2_SENSOR_INVENTORY"},
+    "pc2_camera": {"": "PASS_PC2_CAMERA_ONLY"},
+    "pc2_full_streams": {"": "PASS_PC2_SENSOR_STREAMS"}
+  },
+  "failure_outcomes": {
+    "workstation_offline": {
+      "source.repository": "FAIL_SOURCE", "runtime.workstation": "FAIL_RUNTIME",
+      "safety.workstation_preflight": "FAIL_SAFETY", "openclaw.preexisting": "FAIL_OPENCLAW",
+      "openclaw.version_pin": "FAIL_OPENCLAW", "openclaw.registry_integrity": "FAIL_OPENCLAW",
+      "openclaw.config_pin": "FAIL_OPENCLAW", "openclaw.config_validate": "FAIL_OPENCLAW",
+      "openclaw.doctor_lint": "FAIL_OPENCLAW", "skills.registry": "FAIL_AGENTOS",
+      "skills.dry_run": "FAIL_AGENTOS", "agentos.plan_schema": "FAIL_AGENTOS",
+      "agentos.offline_execution": "FAIL_AGENTOS", "agentos.network_attempts": "FAIL_AGENTOS",
+      "source.semantic_blobs": "FAIL_SOURCE", "semantic.asset_lock": "FAIL_SEMANTIC",
+      "semantic.fixture_graph": "FAIL_SEMANTIC", "semantic.fixture_query": "FAIL_SEMANTIC",
+      "chatbot.dependencies": "FAIL_CHATBOT", "chatbot.configuration": "FAIL_CHATBOT",
+      "safety.workstation_postflight": "FAIL_SAFETY", "offline.trace_integrity": "FAIL_HARNESS",
+      "offline.network_policy": "FAIL_SAFETY", "offline.evidence_binding": "FAIL_HARNESS"
+    },
+    "workstation_mujoco": {
+      "source.repository": "FAIL_SOURCE", "runtime.workstation": "FAIL_RUNTIME",
+      "safety.workstation_preflight": "FAIL_SAFETY", "offline.reference": "FAIL_MUJOCO",
+      "mujoco.stage1": "FAIL_MUJOCO", "mujoco.stage2": "FAIL_MUJOCO",
+      "mujoco.stage3": "FAIL_MUJOCO", "mujoco.stage4": "FAIL_MUJOCO",
+      "safety.workstation_postflight": "FAIL_SAFETY"
+    },
+    "pc2_inventory": {
+      "source.repository": "FAIL_SOURCE", "source.pc2_script": "FAIL_SOURCE",
+      "runtime.pc2": "FAIL_RUNTIME", "safety.pc2_preflight": "FAIL_SAFETY",
+      "pc2.inventory": "FAIL_PC2_INVENTORY", "pc2.camera_inventory": "FAIL_PC2_INVENTORY",
+      "safety.pc2_runtime_monitor": "FAIL_SAFETY", "safety.pc2_postflight": "FAIL_SAFETY"
+    },
+    "pc2_camera": {
+      "source.repository": "FAIL_SOURCE", "source.pc2_script": "FAIL_SOURCE",
+      "runtime.pc2": "FAIL_RUNTIME", "safety.pc2_preflight": "FAIL_SAFETY",
+      "pc2.inventory": "FAIL_PC2_CAMERA", "pc2.camera_inventory": "FAIL_PC2_CAMERA",
+      "pc2.camera_sample": "FAIL_PC2_CAMERA", "pc2.camera_rate": "FAIL_PC2_CAMERA",
+      "pc2.camera_cleanup": "FAIL_SAFETY", "safety.pc2_runtime_monitor": "FAIL_SAFETY",
+      "safety.pc2_postflight": "FAIL_SAFETY"
+    },
+    "pc2_full_streams": {
+      "source.repository": "FAIL_SOURCE", "source.pc2_script": "FAIL_SOURCE",
+      "runtime.pc2": "FAIL_RUNTIME", "safety.pc2_preflight": "FAIL_SAFETY",
+      "pc2.inventory": "FAIL_PC2_STREAMS", "pc2.camera_inventory": "FAIL_PC2_STREAMS",
+      "pc2.camera_sample": "FAIL_PC2_STREAMS", "pc2.camera_rate": "FAIL_PC2_STREAMS",
+      "pc2.lidar_advertisement": "FAIL_PC2_STREAMS", "pc2.lidar_sample": "FAIL_PC2_STREAMS",
+      "pc2.lidar_rate": "FAIL_PC2_STREAMS", "pc2.lidar_schema": "FAIL_PC2_STREAMS",
+      "pc2.imu_advertisement": "FAIL_PC2_STREAMS", "pc2.imu_sample": "FAIL_PC2_STREAMS",
+      "pc2.imu_rate": "FAIL_PC2_STREAMS", "pc2.camera_cleanup": "FAIL_SAFETY",
+      "safety.pc2_runtime_monitor": "FAIL_SAFETY", "safety.pc2_postflight": "FAIL_SAFETY"
+    }
+  },
+  "precedence": ["safety", "harness", "interruption", "functional", "qualification", "pass"],
+  "safety_gate_patterns": ["safety.*", "pc2.camera_cleanup", "offline.network_policy"],
+  "harness_gates": ["offline.trace_integrity", "offline.evidence_binding"],
+  "same_class_tie_breaker": "profile_gate_order",
+  "additionalProperties": false
+}

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "holoagent.agentos.plan.v1",
+  "type": "object",
+  "required": ["schema_version", "mode", "description", "nodes"],
+  "properties": {
+    "schema_version": {"const": "holoagent.agentos.plan.v1"},
+    "mode": {"type": "string", "enum": ["single_robot", "multi_robot"]},
+    "description": {"type": "string", "minLength": 1, "maxLength": 512},
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {"$ref": "#/$defs/node"}
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "node": {
+      "type": "object",
+      "required": ["id", "robot_id", "skill", "target", "depends_on"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"},
+        "robot_id": {"type": "integer", "enum": [11, 12, 13, 14, 15, 16]},
+        "skill": {"type": "string", "enum": ["navigation", "arm"]},
+        "target": {
+          "type": "string",
+          "enum": [
+            "one_point_1", "one_point_2", "one_point_3", "one_point_4", "stop",
+            "release_arm", "turn_back_wave", "blow_kiss_with_both_hands",
+            "blow_kiss_with_left_hand", "blow_kiss_with_right_hand", "both_hands_up",
+            "clamp", "high_five", "hug", "make_heart_with_both_hands",
+            "make_heart_with_right_hand", "refuse", "right_hand_up", "ultraman_ray",
+            "wave_under_head", "wave_above_head", "shake_hand", "one_point_1_waypoint_1",
+            "box_left_hand_win", "box_right_hand_win", "box_both_hand_win",
+            "right_hand_on_heart", "both_hands_up_deviate_right", "forward_push"
+          ]
+        },
+        "depends_on": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"}
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"skill": {"const": "navigation"}}, "required": ["skill"]},
+          "then": {"properties": {"target": {"enum": ["one_point_1", "one_point_2", "one_point_3", "one_point_4", "stop"]}}}
+        },
+        {
+          "if": {"properties": {"skill": {"const": "arm"}}, "required": ["skill"]},
+          "then": {"properties": {"target": {"enum": ["release_arm", "turn_back_wave", "blow_kiss_with_both_hands", "blow_kiss_with_left_hand", "blow_kiss_with_right_hand", "both_hands_up", "clamp", "high_five", "hug", "make_heart_with_both_hands", "make_heart_with_right_hand", "refuse", "right_hand_up", "ultraman_ray", "wave_under_head", "wave_above_head", "shake_hand", "one_point_1_waypoint_1", "box_left_hand_win", "box_right_hand_win", "box_both_hand_win", "right_hand_on_heart", "both_hands_up_deviate_right", "forward_push"]}}}
+        }
+      ]
+    }
+  }
+}

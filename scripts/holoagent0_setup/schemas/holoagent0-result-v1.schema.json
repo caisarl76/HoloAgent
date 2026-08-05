@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "holoagent0.result.v1",
+  "type": "object",
+  "required": [
+    "schema_version", "run_id", "mode", "label", "status", "exit_class",
+    "process_exit_code", "started_at", "ended_at", "duration_monotonic_seconds",
+    "hostname", "architecture", "source_commit", "redacted_environment",
+    "prohibited_commands", "result_schema_sha256", "gate_policy_sha256",
+    "reason_code_policy_sha256", "invocation_role", "parent_run_id", "lineage_nonce",
+    "gates", "primary_blocking_gate", "blocking_gates", "qualifications"
+  ],
+  "properties": {
+    "schema_version": {"const": "holoagent0.result.v1"},
+    "run_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "mode": {"type": "string", "enum": ["workstation_offline", "workstation_mujoco", "pc2_inventory", "pc2_camera", "pc2_full_streams"]},
+    "label": {"$ref": "#/$defs/label"},
+    "status": {"type": "string", "enum": ["PASS", "QUALIFIED", "FAIL", "INTERRUPTED"]},
+    "exit_class": {"type": "string", "enum": ["PASS", "QUALIFIED", "GATE_FAILURE", "SAFETY_FAILURE", "HARNESS_FAILURE", "HUP", "INT", "TERM"]},
+    "process_exit_code": {"type": "integer", "enum": [0, 10, 20, 30, 40, 129, 130, 143]},
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": "string", "format": "date-time"},
+    "duration_monotonic_seconds": {"type": "number", "minimum": 0},
+    "hostname": {"type": "string", "minLength": 1, "maxLength": 255},
+    "architecture": {"type": "string", "minLength": 1, "maxLength": 64},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "redacted_environment": {
+      "type": "object",
+      "properties": {
+        "network_namespace": {"type": ["string", "null"], "maxLength": 256},
+        "ros_domain_id": {"type": ["integer", "null"], "minimum": 0, "maximum": 232},
+        "ros_localhost_only": {"type": ["boolean", "null"]},
+        "credential_variables_present": {"type": "array", "uniqueItems": true, "items": {"type": "string", "maxLength": 128}},
+        "proxy_variables_present": {"type": "array", "uniqueItems": true, "items": {"type": "string", "maxLength": 128}}
+      },
+      "additionalProperties": false
+    },
+    "prohibited_commands": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 256}},
+    "result_schema_sha256": {"$ref": "#/$defs/sha256"},
+    "openclaw_provisioning_schema_sha256": {"$ref": "#/$defs/sha256"},
+    "offline_ledger_schema_sha256": {"$ref": "#/$defs/sha256"},
+    "trace_tool_policy_sha256": {"$ref": "#/$defs/sha256"},
+    "trace_tool_policy_schema_sha256": {"$ref": "#/$defs/sha256"},
+    "trace_parser_fixture_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "cyclonedds_config_set_sha256": {"$ref": "#/$defs/sha256"},
+    "gate_policy_sha256": {"$ref": "#/$defs/sha256"},
+    "reason_code_policy_sha256": {"$ref": "#/$defs/sha256"},
+    "agentos_plan_schema_sha256": {"$ref": "#/$defs/sha256"},
+    "source_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "configuration_sha256": {"$ref": "#/$defs/sha256"},
+    "script_sha256": {"$ref": "#/$defs/sha256"},
+    "graph_sha256": {"$ref": "#/$defs/sha256"},
+    "dataset_sha256": {"$ref": "#/$defs/sha256"},
+    "checkpoint_sha256": {"$ref": "#/$defs/sha256"},
+    "offline_evidence_bundle_sha256": {"$ref": "#/$defs/sha256"},
+    "offline_reference_evidence_bundle_sha256": {"$ref": "#/$defs/sha256"},
+    "invocation_role": {"type": "string", "enum": ["standalone", "parent", "child"]},
+    "parent_run_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 128},
+    "lineage_nonce": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "gates": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/gate"}},
+    "primary_blocking_gate": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/gateId"}]},
+    "blocking_gates": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/gateId"}},
+    "qualifications": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/gateId"}},
+    "pc2_evidence": {"$ref": "#/$defs/pc2Evidence"},
+    "offline_evidence": {"$ref": "#/$defs/offlineEvidence"}
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "oneOf": [
+        {"properties": {"label": {"enum": ["PASS_HOLOAGENT0_OFFLINE", "PASS_HOLOAGENT0_MUJOCO", "PASS_PC2_SENSOR_INVENTORY", "PASS_PC2_CAMERA_ONLY", "PASS_PC2_SENSOR_STREAMS"]}, "status": {"const": "PASS"}, "exit_class": {"const": "PASS"}, "process_exit_code": {"const": 0}}, "required": ["label", "status", "exit_class", "process_exit_code"]},
+        {"properties": {"label": {"enum": ["READY_CREDENTIALS_REQUIRED", "READY_AUDIO_HARDWARE_REQUIRED", "READY_CREDENTIALS_AND_AUDIO_REQUIRED", "READY_MUJOCO_STAGE4_ESTIMATOR_FAILED"]}, "status": {"const": "QUALIFIED"}, "exit_class": {"const": "QUALIFIED"}, "process_exit_code": {"const": 10}}, "required": ["label", "status", "exit_class", "process_exit_code"]},
+        {"properties": {"label": {"enum": ["FAIL_SOURCE", "FAIL_RUNTIME", "FAIL_OPENCLAW", "FAIL_AGENTOS", "FAIL_SEMANTIC", "FAIL_CHATBOT", "FAIL_MUJOCO", "FAIL_PC2_INVENTORY", "FAIL_PC2_CAMERA", "FAIL_PC2_STREAMS"]}, "status": {"const": "FAIL"}, "exit_class": {"const": "GATE_FAILURE"}, "process_exit_code": {"const": 20}}, "required": ["label", "status", "exit_class", "process_exit_code"]},
+        {"properties": {"label": {"const": "FAIL_SAFETY"}, "status": {"const": "FAIL"}, "exit_class": {"const": "SAFETY_FAILURE"}, "process_exit_code": {"const": 30}}, "required": ["label", "status", "exit_class", "process_exit_code"]},
+        {"properties": {"label": {"const": "FAIL_HARNESS"}, "status": {"const": "FAIL"}, "exit_class": {"const": "HARNESS_FAILURE"}, "process_exit_code": {"const": 40}}, "required": ["label", "status", "exit_class", "process_exit_code"]},
+        {"properties": {"label": {"const": "INTERRUPTED"}, "status": {"const": "INTERRUPTED"}, "exit_class": {"const": "HUP"}, "process_exit_code": {"const": 129}}, "required": ["label", "status", "exit_class", "process_exit_code"]},
+        {"properties": {"label": {"const": "INTERRUPTED"}, "status": {"const": "INTERRUPTED"}, "exit_class": {"const": "INT"}, "process_exit_code": {"const": 130}}, "required": ["label", "status", "exit_class", "process_exit_code"]},
+        {"properties": {"label": {"const": "INTERRUPTED"}, "status": {"const": "INTERRUPTED"}, "exit_class": {"const": "TERM"}, "process_exit_code": {"const": 143}}, "required": ["label", "status", "exit_class", "process_exit_code"]}
+      ]
+    },
+    {
+      "if": {"properties": {"invocation_role": {"const": "child"}}, "required": ["invocation_role"]},
+      "then": {"properties": {"parent_run_id": {"type": "string", "minLength": 1}, "lineage_nonce": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}},
+      "else": {"properties": {"parent_run_id": {"type": "null"}, "lineage_nonce": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"mode": {"enum": ["workstation_offline", "workstation_mujoco"]}}, "required": ["mode"]},
+      "then": {"required": ["openclaw_provisioning_schema_sha256", "offline_ledger_schema_sha256", "trace_tool_policy_sha256", "trace_tool_policy_schema_sha256", "trace_parser_fixture_manifest_sha256", "cyclonedds_config_set_sha256", "agentos_plan_schema_sha256", "source_manifest_sha256", "configuration_sha256", "graph_sha256", "dataset_sha256", "checkpoint_sha256"]}
+    },
+    {
+      "if": {"properties": {"mode": {"const": "workstation_offline"}}, "required": ["mode"]},
+      "then": {"required": ["offline_evidence", "offline_evidence_bundle_sha256"]}
+    },
+    {
+      "if": {"properties": {"mode": {"const": "workstation_mujoco"}}, "required": ["mode"]},
+      "then": {"required": ["offline_reference_evidence_bundle_sha256"]}
+    },
+    {
+      "if": {"properties": {"mode": {"enum": ["pc2_inventory", "pc2_camera", "pc2_full_streams"]}}, "required": ["mode"]},
+      "then": {"required": ["pc2_evidence", "source_manifest_sha256", "configuration_sha256", "script_sha256"]}
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "label": {"type": "string", "enum": ["PASS_HOLOAGENT0_OFFLINE", "PASS_HOLOAGENT0_MUJOCO", "PASS_PC2_SENSOR_INVENTORY", "PASS_PC2_CAMERA_ONLY", "PASS_PC2_SENSOR_STREAMS", "READY_CREDENTIALS_REQUIRED", "READY_AUDIO_HARDWARE_REQUIRED", "READY_CREDENTIALS_AND_AUDIO_REQUIRED", "READY_MUJOCO_STAGE4_ESTIMATOR_FAILED", "FAIL_SOURCE", "FAIL_RUNTIME", "FAIL_OPENCLAW", "FAIL_AGENTOS", "FAIL_SEMANTIC", "FAIL_CHATBOT", "FAIL_MUJOCO", "FAIL_PC2_INVENTORY", "FAIL_PC2_CAMERA", "FAIL_PC2_STREAMS", "FAIL_SAFETY", "FAIL_HARNESS", "INTERRUPTED"]},
+    "gateId": {"type": "string", "enum": ["source.repository", "source.semantic_blobs", "source.pc2_script", "runtime.workstation", "runtime.pc2", "offline.reference", "safety.workstation_preflight", "safety.workstation_postflight", "safety.pc2_preflight", "safety.pc2_runtime_monitor", "safety.pc2_postflight", "offline.trace_integrity", "offline.network_policy", "offline.evidence_binding", "openclaw.preexisting", "openclaw.version_pin", "openclaw.registry_integrity", "openclaw.config_pin", "openclaw.config_validate", "openclaw.doctor_lint", "skills.registry", "skills.dry_run", "agentos.plan_schema", "agentos.offline_execution", "agentos.network_attempts", "semantic.asset_lock", "semantic.fixture_graph", "semantic.fixture_query", "semantic.natural_language_parser", "chatbot.dependencies", "chatbot.configuration", "chatbot.credentials", "chatbot.audio_hardware", "mujoco.stage1", "mujoco.stage2", "mujoco.stage3", "mujoco.stage4", "pc2.inventory", "pc2.camera_inventory", "pc2.camera_sample", "pc2.camera_rate", "pc2.camera_cleanup", "pc2.lidar_advertisement", "pc2.lidar_sample", "pc2.lidar_rate", "pc2.lidar_schema", "pc2.imu_advertisement", "pc2.imu_sample", "pc2.imu_rate"]},
+    "measurement": {"type": "object", "required": ["name", "value", "unit"], "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 128}, "value": {"type": ["number", "integer", "string", "boolean", "null"]}, "unit": {"type": ["string", "null"], "maxLength": 64}}, "additionalProperties": false},
+    "gate": {"type": "object", "required": ["id", "status", "role", "reason", "measurements", "thresholds", "log_paths", "child_command_exit_code"], "properties": {"id": {"$ref": "#/$defs/gateId"}, "status": {"type": "string", "enum": ["PASS", "FAIL", "QUALIFIED", "SKIPPED", "NOT_RUN"]}, "role": {"type": "string", "enum": ["required", "diagnostic", "qualification", "required_qualification", "finalizer"]}, "reason": {"type": "string", "enum": ["OK", "EARLIER_BLOCKING_GATE", "INTERRUPTED_BEFORE_GATE", "POLICY_DISABLED", "DEPENDENCY_NOT_AVAILABLE", "NO_OWNED_CAMERA", "MONITOR_NOT_STARTED", "SOURCE_MISMATCH", "RUNTIME_MISMATCH", "DIGEST_MISMATCH", "EVIDENCE_SCHEMA_INVALID", "TRACE_INCOMPLETE", "TRACE_DECODE_FAILED", "TRACE_NOT_STARTED", "TRACE_BOOTSTRAP_FAILED", "TRACER_EXITED", "EVIDENCE_BINDING_MISMATCH", "TOOL_RUNTIME_ERROR", "ATOMIC_WRITE_FAILED", "UNEXPECTED_CONTROL_PROCESS", "PROCESS_ALLOWLIST_MISMATCH", "GRAPH_ALLOWLIST_MISMATCH", "MONITOR_EXITED", "OWNERSHIP_MISMATCH", "CLEANUP_INCOMPLETE", "UNEXPECTED_DDS_PARTICIPANT", "UNEXPECTED_ROS_ENDPOINT", "POSTFLIGHT_FAILED", "INHERITED_SOCKET_FD", "PROHIBITED_FD_TRANSFER", "PROHIBITED_FD_ACQUISITION", "PROHIBITED_IO_URING", "UNTRACED_CHILD_ATTEMPT", "TRACE_BYPASS_ATTEMPT", "LEDGER_CHAIN_INVALID", "PREEXISTING_OPENCLAW", "INSTALLER_PIN_MISMATCH", "REGISTRY_INTEGRITY_MISMATCH", "INSTALLED_PAYLOAD_MISMATCH", "OPENCLAW_VERSION_MISMATCH", "OPENCLAW_CONFIG_MISMATCH", "OPENCLAW_CONFIG_INVALID", "OPENCLAW_LINT_FINDING", "PLAN_INVALID", "OFFLINE_SIDE_EFFECT_ATTEMPT", "UNEXPECTED_NETWORK_ATTEMPT", "SEMANTIC_BLOB_MISMATCH", "SEMANTIC_ASSET_MISMATCH", "SEMANTIC_FIXTURE_MISMATCH", "CHATBOT_DEPENDENCY_MISSING", "CHATBOT_CONFIG_INVALID", "CREDENTIALS_MISSING", "AUDIO_HARDWARE_MISSING", "TOPIC_NOT_ADVERTISED", "TOPIC_NO_SAMPLE", "RATE_BELOW_THRESHOLD", "MESSAGE_SCHEMA_MISMATCH", "UNCLASSIFIED_SENSOR_CANDIDATE", "STAGE_CHILD_FAILED", "STAGE_EVIDENCE_INVALID", "ESTIMATOR_THRESHOLD_FAILED", "STAGE_POSTFLIGHT_FAILED"]}, "measurements": {"type": "array", "items": {"$ref": "#/$defs/measurement"}}, "thresholds": {"type": "array", "items": {"$ref": "#/$defs/measurement"}}, "log_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4096}}, "child_command_exit_code": {"type": ["integer", "null"], "minimum": 0, "maximum": 255}}, "additionalProperties": false},
+    "processIdentity": {"type": "object", "required": ["pid", "pgid", "start_time_ticks", "executable"], "properties": {"pid": {"type": "integer", "minimum": 1}, "pgid": {"type": "integer", "minimum": 1}, "start_time_ticks": {"type": "integer", "minimum": 0}, "executable": {"type": "string", "minLength": 1, "maxLength": 4096}}, "additionalProperties": false},
+    "monitorSample": {"type": "object", "required": ["timestamp", "state", "observed_matches"], "properties": {"timestamp": {"type": "string", "format": "date-time"}, "state": {"type": "string", "enum": ["EXACT_MATCH", "CONTROL_VIOLATION", "OBSERVATION_ONLY"]}, "observed_matches": {"type": "array", "items": {"type": "string", "maxLength": 4096}}}, "additionalProperties": false},
+    "pc2Evidence": {"type": "object", "required": ["action_window_started_at", "action_window_ended_at", "monitor_samples", "owned_processes"], "properties": {"action_window_started_at": {"type": ["string", "null"], "format": "date-time"}, "action_window_ended_at": {"type": ["string", "null"], "format": "date-time"}, "monitor_samples": {"type": "array", "items": {"$ref": "#/$defs/monitorSample"}}, "owned_processes": {"type": "array", "items": {"$ref": "#/$defs/processIdentity"}}}, "additionalProperties": false},
+    "artifact": {"type": "object", "required": ["relative_path", "sha256", "size"], "properties": {"relative_path": {"type": "string", "minLength": 1, "maxLength": 4096}, "sha256": {"$ref": "#/$defs/sha256"}, "size": {"type": "integer", "minimum": 0}}, "additionalProperties": false},
+    "offlineEvidence": {"type": "object", "required": ["trace", "bootstrap_report", "ledger_chain_manifest", "ownership_journal", "violation_journal", "host_observer_pre", "host_observer_post", "semantic_dds_window", "dds_begin_record_index", "dds_end_record_index", "marker_token", "bundle_sha256"], "properties": {"trace": {"$ref": "#/$defs/artifact"}, "bootstrap_report": {"$ref": "#/$defs/artifact"}, "ledger_chain_manifest": {"$ref": "#/$defs/artifact"}, "ownership_journal": {"$ref": "#/$defs/artifact"}, "violation_journal": {"$ref": "#/$defs/artifact"}, "host_observer_pre": {"$ref": "#/$defs/artifact"}, "host_observer_post": {"$ref": "#/$defs/artifact"}, "semantic_dds_window": {"type": "string", "enum": ["NOT_ENTERED", "CLOSED"]}, "dds_begin_record_index": {"type": ["integer", "null"], "minimum": 0}, "dds_end_record_index": {"type": ["integer", "null"], "minimum": 0}, "marker_token": {"type": "string", "minLength": 1, "maxLength": 256}, "bundle_sha256": {"$ref": "#/$defs/sha256"}}, "additionalProperties": false}
+  }
+}

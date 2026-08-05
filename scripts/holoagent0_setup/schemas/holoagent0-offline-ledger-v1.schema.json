@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "holoagent0.offline-ledger.v1",
+  "type": "object",
+  "required": ["schema_version", "run_id", "ledger_nonce", "generation", "previous_generation", "previous_digest", "sealed", "semantic_dds_window", "gates"],
+  "properties": {
+    "schema_version": {"const": "holoagent0.offline-ledger.v1"},
+    "run_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "ledger_nonce": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "generation": {"type": "integer", "minimum": 0},
+    "previous_generation": {"type": ["integer", "null"], "minimum": 0},
+    "previous_digest": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]},
+    "sealed": {"type": "boolean"},
+    "semantic_dds_window": {"type": "string", "enum": ["NOT_ENTERED", "OPEN", "CLOSED"]},
+    "gates": {
+      "type": "array",
+      "minItems": 27,
+      "maxItems": 27,
+      "prefixItems": [
+        {"$ref": "#/$defs/sourceRepository"},
+        {"$ref": "#/$defs/runtimeWorkstation"},
+        {"$ref": "#/$defs/workstationPreflight"},
+        {"$ref": "#/$defs/openclawPreexisting"},
+        {"$ref": "#/$defs/openclawVersionPin"},
+        {"$ref": "#/$defs/openclawRegistryIntegrity"},
+        {"$ref": "#/$defs/openclawConfigPin"},
+        {"$ref": "#/$defs/openclawConfigValidate"},
+        {"$ref": "#/$defs/openclawDoctorLint"},
+        {"$ref": "#/$defs/skillsRegistry"},
+        {"$ref": "#/$defs/skillsDryRun"},
+        {"$ref": "#/$defs/agentosPlanSchema"},
+        {"$ref": "#/$defs/agentosOfflineExecution"},
+        {"$ref": "#/$defs/agentosNetworkAttempts"},
+        {"$ref": "#/$defs/sourceSemanticBlobs"},
+        {"$ref": "#/$defs/semanticAssetLock"},
+        {"$ref": "#/$defs/semanticFixtureGraph"},
+        {"$ref": "#/$defs/semanticFixtureQuery"},
+        {"$ref": "#/$defs/semanticNaturalLanguageParser"},
+        {"$ref": "#/$defs/chatbotDependencies"},
+        {"$ref": "#/$defs/chatbotConfiguration"},
+        {"$ref": "#/$defs/chatbotCredentials"},
+        {"$ref": "#/$defs/chatbotAudioHardware"},
+        {"$ref": "#/$defs/workstationPostflight"},
+        {"$ref": "#/$defs/offlineTraceIntegrity"},
+        {"$ref": "#/$defs/offlineNetworkPolicy"},
+        {"$ref": "#/$defs/offlineEvidenceBinding"}
+      ],
+      "items": false
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"generation": {"const": 0}}, "required": ["generation"]},
+      "then": {"properties": {"previous_generation": {"type": "null"}, "previous_digest": {"type": "null"}}},
+      "else": {"properties": {"previous_generation": {"type": "integer", "minimum": 0}, "previous_digest": {"$ref": "#/$defs/sha256"}}}
+    },
+    {
+      "if": {"properties": {"sealed": {"const": true}}, "required": ["sealed"]},
+      "then": {
+        "properties": {
+          "semantic_dds_window": {"enum": ["NOT_ENTERED", "CLOSED"]},
+          "gates": {
+            "prefixItems": [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {"properties": {"status": {"enum": ["PASS", "FAIL"]}}, "required": ["status"]}]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "measurement": {"type": "object", "required": ["name", "value", "unit"], "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 128}, "value": {"type": ["number", "integer", "string", "boolean", "null"]}, "unit": {"type": ["string", "null"], "maxLength": 64}}, "additionalProperties": false},
+    "gate": {"type": "object", "required": ["id", "status", "role", "reason", "measurements", "thresholds", "log_paths", "child_command_exit_code"], "properties": {"id": {"type": "string"}, "status": {"type": "string", "enum": ["PASS", "FAIL", "QUALIFIED", "SKIPPED", "NOT_RUN"]}, "role": {"type": "string", "enum": ["required", "diagnostic", "qualification", "finalizer"]}, "reason": {"type": "string", "minLength": 2, "maxLength": 64}, "measurements": {"type": "array", "items": {"$ref": "#/$defs/measurement"}}, "thresholds": {"type": "array", "items": {"$ref": "#/$defs/measurement"}}, "log_paths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 4096}}, "child_command_exit_code": {"type": ["integer", "null"], "minimum": 0, "maximum": 255}}, "additionalProperties": false},
+    "sourceRepository": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "source.repository"}, "role": {"const": "required"}}},
+    "runtimeWorkstation": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "runtime.workstation"}, "role": {"const": "required"}}},
+    "workstationPreflight": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "safety.workstation_preflight"}, "role": {"const": "required"}}},
+    "openclawPreexisting": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "openclaw.preexisting"}, "role": {"const": "required"}}},
+    "openclawVersionPin": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "openclaw.version_pin"}, "role": {"const": "required"}}},
+    "openclawRegistryIntegrity": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "openclaw.registry_integrity"}, "role": {"const": "required"}}},
+    "openclawConfigPin": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "openclaw.config_pin"}, "role": {"const": "required"}}},
+    "openclawConfigValidate": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "openclaw.config_validate"}, "role": {"const": "required"}}},
+    "openclawDoctorLint": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "openclaw.doctor_lint"}, "role": {"const": "required"}}},
+    "skillsRegistry": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "skills.registry"}, "role": {"const": "required"}}},
+    "skillsDryRun": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "skills.dry_run"}, "role": {"const": "required"}}},
+    "agentosPlanSchema": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "agentos.plan_schema"}, "role": {"const": "required"}}},
+    "agentosOfflineExecution": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "agentos.offline_execution"}, "role": {"const": "required"}}},
+    "agentosNetworkAttempts": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "agentos.network_attempts"}, "role": {"const": "required"}}},
+    "sourceSemanticBlobs": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "source.semantic_blobs"}, "role": {"const": "required"}}},
+    "semanticAssetLock": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "semantic.asset_lock"}, "role": {"const": "required"}}},
+    "semanticFixtureGraph": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "semantic.fixture_graph"}, "role": {"const": "required"}}},
+    "semanticFixtureQuery": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "semantic.fixture_query"}, "role": {"const": "required"}}},
+    "semanticNaturalLanguageParser": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "semantic.natural_language_parser"}, "role": {"const": "diagnostic"}}},
+    "chatbotDependencies": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "chatbot.dependencies"}, "role": {"const": "required"}}},
+    "chatbotConfiguration": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "chatbot.configuration"}, "role": {"const": "required"}}},
+    "chatbotCredentials": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "chatbot.credentials"}, "role": {"const": "qualification"}}},
+    "chatbotAudioHardware": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "chatbot.audio_hardware"}, "role": {"const": "qualification"}}},
+    "workstationPostflight": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "safety.workstation_postflight"}, "role": {"const": "finalizer"}}},
+    "offlineTraceIntegrity": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "offline.trace_integrity"}, "role": {"const": "finalizer"}}},
+    "offlineNetworkPolicy": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "offline.network_policy"}, "role": {"const": "finalizer"}}},
+    "offlineEvidenceBinding": {"$ref": "#/$defs/gate", "properties": {"id": {"const": "offline.evidence_binding"}, "role": {"const": "finalizer"}}}
+  }
+}
