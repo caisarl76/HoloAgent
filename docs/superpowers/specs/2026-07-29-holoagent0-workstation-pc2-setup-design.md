@@ -306,7 +306,8 @@ Before `strace` starts, the supervisor enumerates every candidate inherited FD
 through `/proc/self/fd`, `fstat`, and socket `SO_DOMAIN`/`SO_TYPE`/
 `SO_PROTOCOL` probes. Stdin is `/dev/null`; stdout/stderr are owned non-socket
 pipes or regular files; and the only additional tracee descriptors are exact
-anonymous pipes for ledger and ownership-journal requests/acknowledgements.
+anonymous broker pipes for the closed signal-handoff, ledger, and ownership-
+journal request/response protocols.
 Any socket—including a socket placed in fd 0, 1, or 2—or unknown descriptor in
 the pass set fails `safety.workstation_preflight` with
 `INHERITED_SOCKET_FD`. The spawn uses close-on-exec defaults and an explicit
@@ -541,21 +542,40 @@ must complete this handoff in order:
 
 1. While `HUP`, `INT`, and `TERM` remain blocked, install all three cleanup
    handlers and verify their dispositions.
-2. Write one bounded `SIGNAL_READY` acknowledgement to the existing reviewed
-   broker pipe. It contains the run nonce, coordinator PID, PGID, `/proc` start
-   time, executable identity, exact blocked mask, and successful disposition
-   checks.
-3. Unblock exactly `HUP`, `INT`, and `TERM`, without resetting any disposition,
-   and only then permit functional progression.
+2. Write one bounded `SIGNAL_READY` request to the existing reviewed broker
+   pipe and remain blocked and progression-disabled. The request contains the
+   run nonce, monotonically increasing broker sequence, coordinator PID, PGID,
+   `/proc` start time, executable identity, exact blocked mask, and successful
+   disposition checks.
+3. Wait on the response pipe for exactly one `SIGNAL_READY_ACCEPTED` whose run
+   nonce, complete process-identity tuple, and request sequence match the
+   request. Any other response, EOF, or missing response is not acceptance and
+   cannot release the barrier.
+4. Only after validating that response, unblock exactly `HUP`, `INT`, and
+   `TERM` without resetting any disposition, then permit functional
+   progression.
 
-`SIGNAL_READY` is a closed broker-protocol message, not a ledger transition.
-On receipt, the supervisor opens a pidfd for the reported coordinator PID and
-accepts the message only after the PID/PGID/start-time/executable identity and
-broker nonce all validate, and only once. A malformed, duplicate, wrong-nonce,
-wrong-identity, or timed-out acknowledgement stops progression; the supervisor
-forwards no pending signal, performs identity-checked cleanup, and applies the
-existing missing/unsealed-ledger rule. Thus a failed handoff cannot preserve
-an interruption exit over `safety.workstation_postflight: FAIL`.
+`SIGNAL_READY` and `SIGNAL_READY_ACCEPTED` are closed broker-protocol messages,
+not ledger transitions. On receipt of the request, the supervisor opens a
+pidfd for the reported coordinator PID and validates the broker nonce,
+monotonic request sequence, PID/PGID/start-time/executable identity, blocked
+mask, and disposition results. Only then may it write one acceptance response
+that repeats those bound fields and the canonical request digest. Acceptance
+exists only after that complete bounded response write succeeds. A malformed,
+duplicate, wrong-nonce, wrong-sequence, wrong-identity, or timed-out request, or
+a failed acceptance write, stops progression; the supervisor returns no valid
+acceptance, forwards no pending signal, performs identity-checked cleanup, and
+applies the existing missing/unsealed-ledger rule. The coordinator remains
+blocked and progression-disabled until that cleanup; it cannot treat a reject,
+pipe close, timeout, or locally reconstructed value as acceptance. Thus a
+failed handoff cannot preserve an interruption exit over
+`safety.workstation_postflight: FAIL`.
+
+The supervisor owns one bounded deadline from coordinator spawn through the
+canonical trace record proving the coordinator's step-4 unblock. Expiry at any
+point enters `FAILED` and starts cleanup. The coordinator has no timeout-to-
+unblock or timeout-to-progress fallback; while waiting, every exit other than
+validated acceptance leaves the three signals blocked.
 
 Immediately after spawn, the supervisor opens pidfds for the exact tracer and
 normalizer identities and continuously polls both alongside canonical trace
@@ -582,23 +602,30 @@ ownership journal proves no live child, the outcome is trace-integrity
 `FAIL_SAFETY`. Unexpected tracer exit never permits a functional gate or tracee
 to continue.
 
-Successful coordinator spawn initializes `AWAITING_READY`. Before a valid
-`SIGNAL_READY`, the supervisor holds the first collected signal in
-`PENDING_FORWARD` and makes no `kill`, `tgkill`, or process-group signal call
-for it. Once the acknowledgement and exact
-PID/PGID/start-time/executable identity validate, the supervisor changes the
-handoff state to `READY` and forwards that signal exactly once only to the
-coordinator PGID, leaving `strace` alive. If the forward races the coordinator's
-step-3 unblock, the signal remains pending behind the already installed handler
-and is delivered when the coordinator unblocks it; default disposition is
-never exposed. A first signal collected after `READY` is forwarded immediately
-under the same identity check.
+Successful coordinator spawn initializes `AWAITING_READY`. Before a complete
+`SIGNAL_READY_ACCEPTED` response has been written, the supervisor holds the
+first collected signal in `PENDING_FORWARD` and makes no `kill`, `tgkill`, or
+process-group signal call for it. A validated request advances the event
+sequence through `AWAITING_ACCEPTANCE`, but does not authorize forwarding. Only
+after the bound acceptance write succeeds does the supervisor change the
+handoff state to `READY` and forward that signal exactly once to the coordinator
+PGID, leaving `strace` alive. If the forward races the coordinator's step-4
+unblock, the signal remains pending behind the already installed handler and is
+delivered when the coordinator validates acceptance and unblocks it; default
+disposition is never exposed. A first signal collected after `READY` is
+forwarded immediately under the same identity check.
 
-`AWAITING_READY` and `PENDING_FORWARD` are transient evidence events only. The
-terminal handoff state is `NOT_APPLICABLE` when no full coordinator was
-committed, `READY` after a successful handoff, or `FAILED` after any handoff
-defect. The forward count is exactly zero or one; `NOT_APPLICABLE` and `FAILED`
-require zero.
+`AWAITING_READY`, `AWAITING_ACCEPTANCE`, and `PENDING_FORWARD` are transient
+evidence events only. The terminal handoff state is `NOT_APPLICABLE` when no
+full coordinator was committed, `READY` after a successful two-way handoff, or
+`FAILED` after any handoff defect. The supervisor's live `READY` transition
+after its acceptance write is not sufficient for terminal `READY`: the closed
+trace must also prove that the coordinator received and validated the matching
+response, unblocked the three signals, and performed no functional operation
+before that unblock. The acceptance and forward counts are each exactly zero or
+one. `NOT_APPLICABLE` requires both zero; terminal `READY` requires one
+acceptance; and `FAILED` records the counts actually reached, but any missing or
+rejected acceptance requires both zero.
 
 The coordinator trap propagates cleanup to any separately owned child groups
 using their recorded identities. Every owned child identity is also streamed
@@ -1264,9 +1291,11 @@ files/directories are `fsync`ed:
 - supervisor-bootstrap report relative path, SHA-256, byte size, terminal
   launch state, `coordinator_launch_committed`, nullable first signal,
   signal-handoff event sequence over the closed states `NOT_APPLICABLE`,
-  `AWAITING_READY`, `PENDING_FORWARD`, `READY`, and `FAILED`, terminal state,
-  nullable `SIGNAL_READY` identity and broker sequence, inherited/unblocked
-  masks, pending signal, forward target PGID and count,
+  `AWAITING_READY`, `AWAITING_ACCEPTANCE`, `PENDING_FORWARD`, `READY`, and
+  `FAILED`, terminal state, nullable `SIGNAL_READY` identity, broker sequence,
+  and canonical digest, nullable bound `SIGNAL_READY_ACCEPTED` sequence and
+  digest, inherited/unblocked masks, pending signal, acceptance count, forward
+  target PGID and count,
   expected/observed tool values, initial/final FD manifests, sanitation/
   rebinding actions, and live-fixture result;
 - accepted ledger generation and SHA-256, immutable generation count, and the
@@ -1903,8 +1932,9 @@ Implementation follows test-driven development.
   creation, supervisor-authored early successors, finalizer-only trace,
   `NOT_STARTED` trace, `NOT_RUN` observer, empty-journal binding, gate 24
   synthesis, the mutually exclusive pre-coordinator interruption versus launch-
-  committed transitions, the blocked-handler/`SIGNAL_READY`/unblock ordering,
-  pending-forward state, and safety/harness/interruption precedence.
+  committed transitions, the blocked-handler/`SIGNAL_READY`/
+  `SIGNAL_READY_ACCEPTED`/unblock ordering, pending-forward state, and safety/
+  harness/interruption precedence.
 - Stage 3 `required_qualification` role, pass, exact qualified continuation,
   prerequisite failure, malformed result, Stage 4 `NOT_RUN` behavior, and
   postflight safety overriding every evaluator exit code.
@@ -1966,13 +1996,18 @@ Implementation follows test-driven development.
   inject HUP, INT, and TERM separately. Require `PENDING_FORWARD`, zero
   supervisor signal calls to the coordinator PID or PGID, and no functional
   gate progression. Then require all three handlers to be installed while the
-  mask is blocked, the nonce/identity-bound broker acknowledgement to validate,
-  and exactly one group forward. Hold once more between acknowledgement and
-  unblock; the forwarded signal must remain pending and invoke the installed
-  handler immediately after unblock, completing cleanup and the matching
-  interruption exit without default termination. Malformed, duplicate,
-  wrong-identity, and timed-out acknowledgements must produce no forward and
-  the specified postflight safety failure.
+  mask is blocked and the nonce/identity/sequence-bound `SIGNAL_READY` request
+  to validate. Delay `SIGNAL_READY_ACCEPTED` and prove zero unblock syscall,
+  zero functional-gate ledger transition, zero functional child, and zero
+  forward throughout the delay. After the bound acceptance response is fully
+  written, require exactly one group forward. Hold once more after acceptance
+  receipt but before unblock; the forwarded signal must remain pending and
+  invoke the installed handler immediately after unblock, completing cleanup
+  and the matching interruption exit without default termination. Reject or
+  omit acceptance, and inject malformed, duplicate, wrong-nonce, wrong-
+  sequence, and wrong-identity requests and responses; every case must produce
+  zero unblock, zero functional progression, zero forward when acceptance did
+  not succeed, and the specified postflight safety failure.
 - Verify exact OpenClaw/Node artifacts, the pinned local configuration,
   successful provisioning-schema validation, identical expected/installed
   payload manifests, `config validate`, both exact lint commands, and the
@@ -2065,10 +2100,12 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
 - Send HUP, INT, and TERM after coordinator launch commitment during early,
   semantic, postflight, and trace-close phases. Require distinct tracer/
   coordinator process groups, the inherited blocked mask, handler installation
-  before `SIGNAL_READY`, readiness validation before one identity-checked
-  forward only to the coordinator PGID, coordinator postflight before trace
-  closure, all three supervisor finalizers afterward, one authoritative result,
-  and the precedence-defined exit. Kill the tracer before coordinator
+  before `SIGNAL_READY`, request validation and the bound
+  `SIGNAL_READY_ACCEPTED` write before one identity-checked forward only to the
+  coordinator PGID, acceptance validation before coordinator unblock or
+  functional progression, coordinator postflight before trace closure, all
+  three supervisor finalizers afterward, one authoritative result, and the
+  precedence-defined exit. Kill the tracer before coordinator
   setup, while a descendant is live, and after all tracees exit; prove pidfd
   detection, kernel exit-kill, journal-based remainder cleanup, no continued
   profile progression, and the specified safety-versus-harness outcome. Kill
