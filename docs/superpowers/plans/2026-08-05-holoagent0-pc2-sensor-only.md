@@ -4,9 +4,9 @@
 
 **Goal:** Build observation-only PC2 inventory, bounded D435i camera, and full-stream sensor profiles with continuous control-process monitoring, identity-safe cleanup, and no physical motion command.
 
-**Architecture:** A stdlib-first Python package under `robots/unitree/holoagent0_pc2/` performs independent process-plane and aggregate ROS-graph checks; a small Bash wrapper owns traps and exact profile selection. Reviewed JSON allowlists are immutable inputs. The PC2 result uses Plan 1 schemas and precedence, but the copyable action contains no workstation provisioning, MuJoCo, Unitree command publisher, tmux, FIFO, Docker, daemon, or SDK control path.
+**Architecture:** A stdlib-only Python package under `robots/unitree/holoagent0_pc2/` performs independent process-plane and aggregate ROS-graph checks; a small Bash wrapper owns traps and exact profile selection. Reviewed JSON allowlists are immutable inputs. The PC2 result consumes copied Plan 1 schema/policy data but imports no Plan 1 Python package, so the manifest is a closed runtime bundle. The copyable action contains no workstation provisioning, MuJoCo, Unitree command publisher, tmux, FIFO, Docker, daemon, or SDK control path.
 
-**Tech Stack:** Python 3.10, pytest, Bash, Linux `/proc`, ELF metadata tools, ROS 2 Humble CLI/introspection, RealSense ROS, Livox ROS, Plan 1 JSON schemas and policies.
+**Tech Stack:** Python 3.10 standard library, pytest for workstation tests, Bash, Linux `/proc`, ELF metadata tools, ROS 2 Humble CLI/introspection, RealSense ROS, Livox ROS, copied Plan 1 JSON schemas and policies.
 
 **Dependencies:** Complete Plan 1 contract/result work first. Run `inventory` before proposing host-specific allowlist entries. PC2 execution requires separate explicit action authorization; writing and testing this plan on the workstation does not authorize remote execution.
 
@@ -26,6 +26,7 @@
 - `robots/unitree/config/pc2_sensor_process_allowlist_v1.json`: host-specific process identities.
 - `robots/unitree/config/pc2_sensor_graph_allowlist_v1.json`: exact aggregate graph per profile.
 - `robots/unitree/config/pc2_sensor_allowlist_v1.schema.json`: closed allowlist schema.
+- `robots/unitree/config/pc2_sensor_copy_manifest_v1.json`: exact copied runtime closure; the reviewed manifest digest is verified out of band and the manifest lists every other runtime file.
 - `robots/unitree/tests/`: workstation fixtures plus subprocess/adversarial tests.
 
 ### Task 1: Closed PC2 allowlist schemas and profile roles
@@ -361,6 +362,7 @@ git commit -m "feat: add bounded pc2 camera and topic gates"
 - Create: `robots/unitree/holoagent0_pc2/result.py`
 - Create: `robots/unitree/holoagent0_pc2/cli.py`
 - Create: `robots/unitree/scripts/run_holoagent0_sensor_check.sh`
+- Create: `robots/unitree/config/pc2_sensor_copy_manifest_v1.json`
 - Test: `robots/unitree/tests/test_pc2_result.py`
 - Test: `robots/unitree/tests/test_pc2_cli.py`
 
@@ -386,7 +388,7 @@ def test_signal_exit_survives_only_after_finalizers(runner, signal, code):
 
 - [ ] **Step 2: Run and verify result/CLI absence**
 
-Run: `PYTHONPATH=robots/unitree:scripts/holoagent0_setup python3 -m pytest -q robots/unitree/tests/test_pc2_result.py robots/unitree/tests/test_pc2_cli.py`
+Run: `PYTHONPATH=robots/unitree python3 -m pytest -q robots/unitree/tests/test_pc2_result.py robots/unitree/tests/test_pc2_cli.py`
 
 Expected: FAIL because PC2 result and wrapper are absent.
 
@@ -395,9 +397,25 @@ Expected: FAIL because PC2 result and wrapper are absent.
 ```bash
 #!/usr/bin/env bash
 set -Eeuo pipefail
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+bundle_root="$(cd -- "${script_dir}/../../.." && pwd -P)"
 profile="${1:?profile must be inventory, camera, or full-streams}"
 case "${profile}" in inventory|camera|full-streams) ;; *) exit 40 ;; esac
-run_dir="${HOLOAGENT0_RUN_DIR:?set a new evidence directory}"
+shift
+output_root=""
+while (($#)); do
+  case "$1" in
+    --output-root) (($# >= 2)) || exit 40; output_root="$2"; shift 2 ;;
+    *) exit 40 ;;
+  esac
+done
+[[ -n "${output_root}" ]] || exit 40
+mkdir -p -- "${output_root}"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-${BASHPID}"
+run_dir="${output_root%/}/${run_id}"
+(umask 077 && mkdir -- "${run_dir}") || exit 40
+export PYTHONNOUSERSITE=1
+export PYTHONPATH="${bundle_root}/robots/unitree"
 child_pid=""
 received_signal=""
 finalize() {
@@ -405,7 +423,8 @@ finalize() {
   trap - EXIT HUP INT TERM
   set +e
   python3 -m holoagent0_pc2.cli finalize \
-    --run-dir "${run_dir}" --child-pid "${child_pid}" \
+    --bundle-root "${bundle_root}" --run-dir "${run_dir}" \
+    --child-pid "${child_pid}" \
     --signal "${received_signal}" --prior-exit "${prior_exit}"
   final_exit="$?"
   exit "${final_exit}"
@@ -414,7 +433,8 @@ trap finalize EXIT
 trap 'received_signal=HUP; exit 129' HUP
 trap 'received_signal=INT; exit 130' INT
 trap 'received_signal=TERM; exit 143' TERM
-python3 -m holoagent0_pc2.cli run "${profile}" --run-dir "${run_dir}" "${@:2}" &
+python3 -m holoagent0_pc2.cli run "${profile}" \
+  --bundle-root "${bundle_root}" --run-dir "${run_dir}" &
 child_pid="$!"
 set +e
 wait "${child_pid}"
@@ -423,18 +443,20 @@ set -e
 exit "${child_exit}"
 ```
 
-Before action, the wrapper verifies its own SHA-256 and every copied policy/package file against `pc2_sensor_copy_manifest_v1.json`; a local/remote mismatch fails before monitor or sensor startup. The Python `run` command starts in an owned PGID and writes its PID/PGID/start-time/executable identity before action; `finalize` validates that identity rather than trusting the PID argument alone. The idempotent finalizer stops owned camera, seals monitor, runs final independent scans, validates schema, writes atomically, and applies safety → harness → interruption → functional → pass precedence.
+The shell excerpt is normative for argument ownership, bundle-root discovery, run-directory creation, and module search; implementation may factor parsing helpers but must preserve that observable contract. The sole operator-facing CLI is `run_holoagent0_sensor_check.sh PROFILE --output-root DIR`. `HOLOAGENT0_RUN_DIR`, caller `PYTHONPATH`, and caller working directory are neither required nor trusted. The wrapper derives `bundle_root` from its resolved script location, resets `PYTHONPATH` to the copied `robots/unitree` root, creates one mode-`0700` run directory beneath `--output-root`, and passes that exact path to internal `python3 -m holoagent0_pc2.cli run/finalize` subcommands. Do not forward `${@:2}` after the parser consumes arguments; the final implementation passes only the closed arguments it constructed.
+
+Before action, the wrapper verifies its own SHA-256 and every copied policy/package file against `pc2_sensor_copy_manifest_v1.json`; a local/remote mismatch fails before monitor or sensor startup. The manifest itself is not self-hashed: its reviewed SHA-256 is compared before transfer and again on PC2, then the verified manifest authenticates every listed payload file. The Python `run` command starts in an owned PGID and writes its PID/PGID/start-time/executable identity before action; `finalize` validates that identity rather than trusting the PID argument alone. The idempotent finalizer stops owned camera, seals monitor, runs final independent scans, validates schema, writes atomically, and applies safety → harness → interruption → functional → pass precedence.
 
 - [ ] **Step 4: Run shell syntax and finalizer tests**
 
-Run: `bash -n robots/unitree/scripts/run_holoagent0_sensor_check.sh && PYTHONPATH=robots/unitree:scripts/holoagent0_setup python3 -m pytest -q robots/unitree/tests/test_pc2_result.py robots/unitree/tests/test_pc2_cli.py`
+Run: `bash -n robots/unitree/scripts/run_holoagent0_sensor_check.sh && PYTHONPATH=robots/unitree python3 -m pytest -q robots/unitree/tests/test_pc2_result.py robots/unitree/tests/test_pc2_cli.py`
 
 Expected: PASS for all three profiles, early errors, each signal phase, double traps, invalid JSON, and combined functional/finalizer failures.
 
 - [ ] **Step 5: Commit the PC2 runner**
 
 ```bash
-git add robots/unitree/holoagent0_pc2/result.py robots/unitree/holoagent0_pc2/cli.py robots/unitree/scripts/run_holoagent0_sensor_check.sh robots/unitree/tests/test_pc2_result.py robots/unitree/tests/test_pc2_cli.py
+git add robots/unitree/holoagent0_pc2/result.py robots/unitree/holoagent0_pc2/cli.py robots/unitree/scripts/run_holoagent0_sensor_check.sh robots/unitree/config/pc2_sensor_copy_manifest_v1.json robots/unitree/tests/test_pc2_result.py robots/unitree/tests/test_pc2_cli.py
 git commit -m "feat: add pc2 sensor-only profile runner"
 ```
 
@@ -463,7 +485,7 @@ def test_pc2_action_has_no_motion_path(action_sources):
 
 - [ ] **Step 2: Run and verify any unsafe reference fails**
 
-Run: `PYTHONPATH=robots/unitree:scripts/holoagent0_setup python3 -m pytest -q robots/unitree/tests/test_pc2_no_motion_static.py robots/unitree/tests/test_pc2_integration.py robots/unitree/tests/test_pc2_adversarial.py`
+Run: `PYTHONPATH=robots/unitree python3 -m pytest -q robots/unitree/tests/test_pc2_no_motion_static.py robots/unitree/tests/test_pc2_integration.py robots/unitree/tests/test_pc2_adversarial.py`
 
 Expected: FAIL until all fixtures and action source boundaries are registered.
 
@@ -473,7 +495,7 @@ Exercise inventory with inactive lidar/IMU and unknown non-control sensor; camer
 
 - [ ] **Step 4: Run the complete workstation PC2 test set**
 
-Run: `bash -n robots/unitree/scripts/run_holoagent0_sensor_check.sh && PYTHONPATH=robots/unitree:scripts/holoagent0_setup python3 -m pytest -q robots/unitree/tests && git diff --check`
+Run: `bash -n robots/unitree/scripts/run_holoagent0_sensor_check.sh && PYTHONPATH=robots/unitree python3 -m pytest -q robots/unitree/tests && git diff --check`
 
 Expected: at least one test collected, zero failures, and no diff-check output.
 
@@ -487,7 +509,7 @@ git commit -m "test: cover pc2 sensor-only safety boundary"
 ### Task 8: PC2 copy manifest, execution runbook, and handoff
 
 **Files:**
-- Create: `robots/unitree/config/pc2_sensor_copy_manifest_v1.json`
+- Modify: `robots/unitree/config/pc2_sensor_copy_manifest_v1.json`
 - Create: `docs/holoagent0/pc2-sensor-only-runbook.md`
 - Create: `docs/holoagent0/handoff-template.md`
 - Test: `robots/unitree/tests/test_pc2_runbook.py`
@@ -497,7 +519,28 @@ git commit -m "test: cover pc2 sensor-only safety boundary"
 ```python
 def test_copy_manifest_is_closed_and_hashed(copy_manifest):
     assert copy_manifest["schema"] == "holoagent0.pc2-copy-manifest.v1"
+    assert tuple(item["path"] for item in copy_manifest["files"]) == PC2_RUNTIME_PATHS
     assert all(len(item["sha256"]) == 64 for item in copy_manifest["files"])
+
+
+def test_manifest_only_bundle_runs_inventory_from_neutral_cwd(
+    tmp_path, copy_manifest, fake_ros_path
+):
+    bundle = copy_manifest_and_only_its_payloads(tmp_path / "bundle", copy_manifest)
+    neutral = tmp_path / "neutral"
+    neutral.mkdir()
+    completed = subprocess.run(
+        [bundle / "robots/unitree/scripts/run_holoagent0_sensor_check.sh",
+         "inventory", "--output-root", tmp_path / "evidence"],
+        cwd=neutral,
+        env=minimal_pc2_env(PATH=fake_ros_path),
+        text=True,
+        capture_output=True,
+    )
+    result = load_single_result(tmp_path / "evidence")
+    assert result["mode"] == "pc2_inventory"
+    assert validates_against_copied_contract(result, bundle)
+    assert "ModuleNotFoundError" not in completed.stderr
 
 
 def test_runbook_starts_inventory_only(runbook):
@@ -509,11 +552,35 @@ def test_runbook_starts_inventory_only(runbook):
 
 Run: `PYTHONPATH=robots/unitree python3 -m pytest -q robots/unitree/tests/test_pc2_runbook.py`
 
-Expected: FAIL because copy manifest and runbook are absent.
+Expected: FAIL because the closed manifest smoke test and runbook are absent.
 
 - [ ] **Step 3: Document the authorized sequence and evidence**
 
-The copy manifest contains only the Bash wrapper, `robots/unitree/holoagent0_pc2/` package, three PC2 allowlist/control JSON files and their schema, and the shared result schema plus gate/reason policy files from Plan 1. The runbook must first verify local/remote SHA-256, copy only those manifest files, run `inventory`, stop for review of every `TRIAGE_UNKNOWN`, and require updated reviewed allowlists before camera/full-stream profiles. Include exact commands for result validation and evidence retrieval, but do not include SSH credentials, PC2 mutation outside the copied action, or any motion command.
+Define `PC2_RUNTIME_PATHS` as this exact sorted closure, with no globbing or directory entries:
+
+```text
+robots/unitree/config/pc2_control_signatures_v1.json
+robots/unitree/config/pc2_sensor_allowlist_v1.schema.json
+robots/unitree/config/pc2_sensor_graph_allowlist_v1.json
+robots/unitree/config/pc2_sensor_process_allowlist_v1.json
+robots/unitree/holoagent0_pc2/__init__.py
+robots/unitree/holoagent0_pc2/allowlist.py
+robots/unitree/holoagent0_pc2/camera.py
+robots/unitree/holoagent0_pc2/cli.py
+robots/unitree/holoagent0_pc2/graph_scan.py
+robots/unitree/holoagent0_pc2/monitor.py
+robots/unitree/holoagent0_pc2/process_scan.py
+robots/unitree/holoagent0_pc2/result.py
+robots/unitree/holoagent0_pc2/topics.py
+robots/unitree/scripts/run_holoagent0_sensor_check.sh
+scripts/holoagent0_setup/policies/holoagent0-gate-policy-v1.json
+scripts/holoagent0_setup/policies/holoagent0-reason-codes-v1.json
+scripts/holoagent0_setup/schemas/holoagent0-result-v1.schema.json
+```
+
+`pc2_sensor_copy_manifest_v1.json` contains one regular-file SHA-256 record for every path above and no other payload path; its path set must equal `PC2_RUNTIME_PATHS` exactly. The PC2 package must use only Python 3.10 standard-library imports plus ROS subprocesses, and it loads the three copied Plan 1 contract files as data. It must not import `holoagent0_setup`, depend on the repository working directory, preserve caller `PYTHONPATH`, or search outside `bundle_root`. An import-graph test enforces that closure, while the subprocess smoke test copies only the manifest plus its listed payloads, runs the published inventory command from a neutral directory with fake ROS commands on `PATH`, and requires a contract-valid `pc2_inventory` result rather than merely a successful `--help` import.
+
+The runbook must first compare the reviewed manifest SHA-256 locally and remotely, verify every listed payload SHA-256, run `inventory` through the one public wrapper CLI, stop for review of every `TRIAGE_UNKNOWN`, and require updated reviewed allowlists before camera/full-stream profiles. Include exact commands for result validation and evidence retrieval, but do not include SSH credentials, PC2 mutation outside the copied action, or any motion command.
 
 ```bash
 bash robots/unitree/scripts/run_holoagent0_sensor_check.sh inventory --output-root ./holoagent0-evidence
@@ -524,7 +591,7 @@ The handoff template records commit, script/config hashes, hostname, profile, ev
 
 - [ ] **Step 4: Run final PC2 static verification**
 
-Run: `bash -n robots/unitree/scripts/run_holoagent0_sensor_check.sh && PYTHONPATH=robots/unitree:scripts/holoagent0_setup python3 -m pytest -q robots/unitree/tests && git diff --check`
+Run: `bash -n robots/unitree/scripts/run_holoagent0_sensor_check.sh && PYTHONPATH=robots/unitree python3 -m pytest -q robots/unitree/tests && git diff --check`
 
 Expected: zero failures and no diff-check output.
 

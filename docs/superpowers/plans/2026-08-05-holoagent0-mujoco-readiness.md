@@ -14,27 +14,54 @@
 
 ## File map
 
+- `scripts/holoagent0_setup/holoagent0_setup/lineage_request.py`: create, canonically bind, and single-use-claim the offline child request.
 - `scripts/holoagent0_setup/holoagent0_setup/offline_reference.py`: validate child lineage, freshness, labels, gates, and digests.
 - `scripts/holoagent0_setup/holoagent0_setup/stage_adapter.py`: read one stage result and separate process exit, evaluator outcome, and postflight safety.
 - `scripts/holoagent0_setup/holoagent0_setup/mujoco_decision.py`: closed Stage 3 qualification and top-level result mapping.
 - `scripts/holoagent0_setup/holoagent0_setup/mujoco_runner.py`: sequential child orchestration and mandatory postflight.
 - `scripts/holoagent0_setup/run_workstation_mujoco.sh`: public wrapper with localhost-only DDS.
-- `scripts/holoagent0_setup/tests/test_offline_reference.py`, `test_stage_adapter.py`, `test_mujoco_decision.py`, `test_mujoco_runner.py`: focused contract tests.
+- `scripts/holoagent0_setup/tests/test_lineage_request.py`, `test_offline_reference.py`, `test_stage_adapter.py`, `test_mujoco_decision.py`, `test_mujoco_runner.py`: focused contract tests.
 - `docs/holoagent0/workstation-mujoco-runbook.md`: execution and evidence inspection.
 
 ### Task 1: Offline child lineage and reference acceptance
 
 **Files:**
+- Create: `scripts/holoagent0_setup/holoagent0_setup/lineage_request.py`
 - Create: `scripts/holoagent0_setup/holoagent0_setup/offline_reference.py`
+- Modify: `scripts/holoagent0_setup/holoagent0_setup/invocation.py`
+- Modify: `scripts/holoagent0_setup/holoagent0_setup/offline_cli.py`
+- Modify: `scripts/holoagent0_setup/schemas/holoagent0-result-v1.schema.json`
+- Create: `scripts/holoagent0_setup/schemas/holoagent0-lineage-request-v1.schema.json`
+- Test: `scripts/holoagent0_setup/tests/test_lineage_request.py`
 - Test: `scripts/holoagent0_setup/tests/test_offline_reference.py`
 
-- [ ] **Step 1: Write rejection tests for stale, failed, and mismatched children**
+- [ ] **Step 1: Write establishment, single-use, and reference-rejection tests**
 
 ```python
+def test_parent_creates_canonical_mode_0600_request(parent_run):
+    request = create_lineage_request(parent_run.request_fields)
+    assert request.path.parent == parent_run.path.resolve()
+    assert stat.S_IMODE(request.path.stat().st_mode) == 0o600
+    assert request.path.read_bytes() == rfc8785(request.value)
+
+
+@pytest.mark.parametrize("mutation", [
+    "replay", "symlink", "outside_parent", "mode_0640", "wrong_owner",
+    "noncanonical", "wrong_parent", "wrong_nonce", "wrong_child_mode",
+    "source_digest", "config_digest", "asset_digest", "policy_digest",
+])
+def test_child_rejects_lineage_request_before_gate_one(
+    child_cli, lineage_request, mutation
+):
+    completed = child_cli(mutate_request(lineage_request, mutation))
+    assert completed.functional_gate_calls == []
+    assert completed.gates[0].status == "NOT_RUN"
+
+
 @pytest.mark.parametrize("mutation", [
     "stale", "failed_label", "blocking_gate", "wrong_parent",
-    "wrong_nonce", "source_digest", "asset_digest", "policy_digest",
-    "provisioning_digest", "evidence_bundle_digest",
+    "wrong_nonce", "request_digest", "source_digest", "asset_digest",
+    "policy_digest", "provisioning_digest", "evidence_bundle_digest",
 ])
 def test_offline_reference_rejects_mismatch(valid_child, parent_context, mutation):
     child = mutate(valid_child, mutation)
@@ -43,13 +70,13 @@ def test_offline_reference_rejects_mismatch(valid_child, parent_context, mutatio
     assert decision.reason in {"DIGEST_MISMATCH", "STAGE_EVIDENCE_INVALID"}
 ```
 
-- [ ] **Step 2: Run the focused test and verify failure**
+- [ ] **Step 2: Run the focused tests and verify failure**
 
-Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_offline_reference.py`
+Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_lineage_request.py scripts/holoagent0_setup/tests/test_offline_reference.py`
 
-Expected: FAIL because `offline_reference` is absent.
+Expected: FAIL because the request protocol and `offline_reference` are absent.
 
-- [ ] **Step 3: Implement the exact acceptance record**
+- [ ] **Step 3: Implement request establishment, child claim, and exact acceptance**
 
 ```python
 @dataclass(frozen=True)
@@ -59,6 +86,16 @@ class ParentContext:
     source_commit: str
     started_monotonic_ns: int
     required_digests: Mapping[str, str]
+    lineage_request_sha256: str
+
+
+@dataclass(frozen=True)
+class LineageRequest:
+    schema: Literal["holoagent0.lineage-request.v1"]
+    parent_run_id: str
+    lineage_nonce: str
+    child_mode: Literal["workstation_offline"]
+    expected_digests: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -69,18 +106,22 @@ class OfflineReferenceDecision:
     child_bundle_sha256: str | None
 ```
 
-Require a fresh schema-valid child; allowed offline pass/qualification label and exit; no blocking failed gate; exact parent ID and lineage nonce on the child; child start/end within the parent window; and equality of every source, config, graph, dataset, checkpoint, provisioning, schema, policy, Cyclone, trace-tool, and evidence-bundle digest named in the approved design.
+The MuJoCo parent generates exactly 32 random bytes as 64 lowercase hex, builds a closed `holoagent0.lineage-request.v1` object containing only schema/version, parent run ID, nonce, child mode, and the complete expected schema/policy/source/config/asset digest map, serializes it as RFC 8785 canonical JSON, and atomically installs `offline-lineage-request-v1.json` with `O_EXCL`, owner UID, mode `0600`, file and parent-directory `fsync`, and no symlink or path escape. It records the canonical request SHA-256 and passes the absolute request path to the child only as `--lineage-request PATH`; it never passes independent parent/nonce values that could disagree with the request.
 
-- [ ] **Step 4: Run valid and adversarial reference tests**
+Extend the Plan 1 invocation and CLI so `--lineage-request` is the sole way to select `invocation_role="child"`. Before `source.repository` or any other gate can transition from `NOT_RUN`, the child opens the file with `O_NOFOLLOW`, requires a regular current-UID mode-`0600` file directly inside the declared parent run directory, validates the closed schema/canonical bytes/64-hex nonce/child mode/digest set, and atomically claims it by a no-replace rename to `offline-lineage-request-v1.claimed.json`. Missing, already-claimed, replayed, replaced, noncanonical, wrong-owner, over-permissive, symlinked, escaped, or digest-mismatched requests fail closed with zero functional-gate progression. The child derives and records `parent_run_id`, `lineage_nonce`, `lineage_request_sha256`, `invocation_role="child"`, and expected digests from the claimed request. Standalone invocation rejects `--lineage-request` companions and records null lineage fields.
 
-Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_offline_reference.py`
+Require a fresh schema-valid child; allowed offline pass/qualification label and exit; no blocking failed gate; exact parent ID, nonce, and canonical request digest on the child; child start/end within the parent window; and equality of every source, config, graph, dataset, checkpoint, provisioning, schema, policy, Cyclone, trace-tool, and evidence-bundle digest named in the approved design. The parent hashes the closed child result and computes `lineage_binding_sha256` over RFC 8785 canonical JSON containing exactly `parent_run_id`, `child_run_id`, `lineage_nonce`, and `child_result_sha256`; any extra/missing field, alternate serialization, request replay, or path substitution fails `offline.reference`.
 
-Expected: PASS; only exact child lineage is accepted.
+- [ ] **Step 4: Run valid and adversarial establishment/reference tests**
+
+Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_lineage_request.py scripts/holoagent0_setup/tests/test_offline_reference.py scripts/holoagent0_setup/tests/test_offline_cli.py`
+
+Expected: PASS; request creation is canonical and mode `0600`, one request can be claimed exactly once before gate 1, and only the exactly bound child result is accepted.
 
 - [ ] **Step 5: Commit reference validation**
 
 ```bash
-git add scripts/holoagent0_setup/holoagent0_setup/offline_reference.py scripts/holoagent0_setup/tests/test_offline_reference.py
+git add scripts/holoagent0_setup/holoagent0_setup/lineage_request.py scripts/holoagent0_setup/holoagent0_setup/offline_reference.py scripts/holoagent0_setup/holoagent0_setup/invocation.py scripts/holoagent0_setup/holoagent0_setup/offline_cli.py scripts/holoagent0_setup/schemas/holoagent0-result-v1.schema.json scripts/holoagent0_setup/schemas/holoagent0-lineage-request-v1.schema.json scripts/holoagent0_setup/tests/test_lineage_request.py scripts/holoagent0_setup/tests/test_offline_reference.py scripts/holoagent0_setup/tests/test_offline_cli.py
 git commit -m "feat: validate offline child lineage"
 ```
 
@@ -265,12 +306,24 @@ STAGE_COMMANDS = {
 
 class MujocoRunner:
     def run(self) -> int:
-        self.run_fresh_offline_child()
+        request = self.create_fresh_offline_request()
+        child = self.run_fresh_offline_child(
+            argv=(
+                "bash", "scripts/holoagent0_setup/run_workstation_offline.sh",
+                "--output-root", str(self.offline_child_root),
+                "--run-id", self.allocate_child_run_id(),
+                "--lineage-request", str(request.path),
+            ),
+            expected_request_sha256=request.sha256,
+        )
+        self.require_offline_reference(child, request)
         for stage in (1, 2, 3, 4):
             if self.should_run(stage):
                 self.run_stage(stage)
         return self.finalize_authoritative_result()
 ```
+
+`run_fresh_offline_child()` accepts only the fully constructed argv tuple and expected canonical request digest shown above; it does not accept a pre-existing result or independent lineage fields. It verifies the request is still the parent's unclaimed mode-`0600` file immediately before spawn, records the child PID/start time, requires the `.claimed.json` transition, resolves the one explicitly allocated child result path, and hashes/validates that result before Stage 1. A nonzero child exit is interpreted only through its schema-valid result; missing claim/result, request mutation/replay, wrong path, wrong permission, lineage mismatch, or reference rejection leaves Stages 1–4 `NOT_RUN`.
 
 Set `ROS_DOMAIN_ID=77`, `ROS_LOCALHOST_ONLY=1`, `ROS2CLI_DISABLE_DAEMON=1`, exact Cyclone RMW, `MUJOCO_GL=egl`, and a new output directory. Never invoke Unitree SDK or PC2. Capture all child exits without `set -e` short-circuiting, validate results, mark later stages deterministically, and always execute parent workstation postflight.
 
@@ -278,7 +331,7 @@ Set `ROS_DOMAIN_ID=77`, `ROS_LOCALHOST_ONLY=1`, `ROS2CLI_DISABLE_DAEMON=1`, exac
 
 Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_mujoco_runner.py`
 
-Expected: PASS for offline rejection, every stage failure, qualified Stage 3, parent HUP/INT/TERM, and postflight override.
+Expected: PASS for request creation/claim, replay/path/permission rejection before Stage 1, offline result rejection, every stage failure, qualified Stage 3, parent HUP/INT/TERM, and postflight override.
 
 - [ ] **Step 5: Commit the parent runner**
 

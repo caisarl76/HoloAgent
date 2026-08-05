@@ -473,12 +473,12 @@ git commit -m "feat: pin strace parser and provisioning recipe"
 - Test: `scripts/holoagent0_setup/tests/test_trace_policy.py`
 - Test: `scripts/holoagent0_setup/tests/test_cyclone_policy.py`
 
-- [ ] **Step 1: Write adversarial provenance tests**
+- [ ] **Step 1: Write adversarial provenance and exact DDS port-matrix tests**
 
 ```python
 @pytest.mark.parametrize("op", ["write", "writev", "sendfile", "splice"])
 def test_connected_udp_alias_after_end_is_safety_failure(policy, op):
-    policy.feed(socket_udp(fd=7, peer=("127.0.0.1", 25310)))
+    policy.feed(socket_udp(fd=7, peer=("127.0.0.1", 26661)))
     policy.feed(dup_fd(old=7, new=11))
     policy.feed(marker("BEGIN", token="m"))
     policy.feed(marker("END", token="m"))
@@ -486,8 +486,44 @@ def test_connected_udp_alias_after_end_is_safety_failure(policy, op):
     assert decision.reason == "UNEXPECTED_NETWORK_ATTEMPT"
 
 
-def test_dds_requires_exact_participant_config_and_port(policy):
-    decision = policy.feed(sendto_udp(pid=42, port=25311, marker="m", config="wrong"))
+@pytest.mark.parametrize("destination_index,kind,address,port", [
+    (None, "spdp_multicast", "239.255.0.1", 26650),
+    (0, "unicast_meta", "127.0.0.1", 26660),
+    (0, "unicast_data", "127.0.0.1", 26661),
+    (1, "unicast_meta", "127.0.0.1", 26662),
+    (1, "unicast_data", "127.0.0.1", 26663),
+    (2, "unicast_meta", "127.0.0.1", 26664),
+    (2, "unicast_data", "127.0.0.1", 26665),
+    (3, "unicast_meta", "127.0.0.1", 26666),
+    (3, "unicast_data", "127.0.0.1", 26667),
+])
+def test_exact_dds_destination_matrix_passes(
+    dds_window_policy, destination_index, kind, address, port
+):
+    decision = dds_window_policy.feed(dds_udp(
+        issuer=dds_window_policy.allowed_issuer,
+        destination_index=destination_index,
+        kind=kind, address=address, port=port,
+    ))
+    assert decision.status == "PASS"
+
+
+@pytest.mark.parametrize("destination_index,kind,address,port", [
+    (None, "data_multicast", "239.255.0.1", 26651),
+    (None, "spdp_multicast", "127.0.0.1", 26650),
+    (0, "unicast_meta", "239.255.0.1", 26660),
+    (0, "unicast_data", "127.0.0.1", 26663),
+    (3, "unicast_data", "127.0.0.1", 26668),
+    (0, "unicast_data", "127.0.0.1", 26659),
+])
+def test_every_nonmatrix_dds_destination_is_rejected(
+    dds_window_policy, destination_index, kind, address, port
+):
+    decision = dds_window_policy.feed(dds_udp(
+        issuer=dds_window_policy.allowed_issuer,
+        destination_index=destination_index,
+        kind=kind, address=address, port=port,
+    ))
     assert decision.reason == "UNEXPECTED_NETWORK_ATTEMPT"
 ```
 
@@ -525,7 +561,9 @@ class TracePolicy:
         return PolicyDecision("SKIPPED", "DEPENDENCY_NOT_AVAILABLE", None)
 ```
 
-Track socket creation, peers, `dup*`, `fcntl(F_DUPFD*)`, fork/clone table semantics, exec, close, `SCM_RIGHTS`, and `pidfd_getfd`. Deny or classify io_uring, ptrace, `CLONE_UNTRACED`, FD transfer/acquisition, TCP/DNS, host-namespace IP, non-loopback routes, and any UDP operation outside the exact four participant identities, marker interval, configuration digests, and domain-77 port formula. Preserve violation-journal failures even when trace integrity later fails.
+Track socket creation, peers, `dup*`, `fcntl(F_DUPFD*)`, fork/clone table semantics, exec, close, `SCM_RIGHTS`, and `pidfd_getfd`. Deny or classify io_uring, ptrace, `CLONE_UNTRACED`, FD transfer/acquisition, TCP/DNS, host-namespace IP, non-loopback routes, and any UDP operation outside the exact four participant identities, marker interval, configuration digests, and domain-77 port matrix. The positive matrix is exactly SPDP multicast `239.255.0.1:26650` plus participant-index unicast meta/data pairs `0 → 26660/26661`, `1 → 26662/26663`, `2 → 26664/26665`, and `3 → 26666/26667`; `239.255.0.1:26651` is explicitly negative because data multicast is disabled. Also reject a permitted port with the wrong address, role, participant/config digest, PID, marker nonce, or position outside the BEGIN/END interval. Preserve violation-journal failures even when trace integrity later fails.
+
+The four XML files are byte-pinned and differ only in `Discovery/ParticipantIndex`. Each pins domain `77`; required `lo` with autodetection disabled and `multicast=true`; `General/Transport=udp`; interface and global `AllowMulticast=spdp`; multicast loopback enabled; TTL `1`; numeric SPDP/default multicast address `239.255.0.1`; no static peers and `Peers/AddLocalhost=false`; `ManySocketsMode=false`; monitor port `-1`; redundant networking disabled; and DDSI port constants base `7400`, domain gain `250`, participant gain `2`, offsets `0`, `1`, `10`, and `11`. Tests must reject disabled/all multicast, automatic participant selection, alternate transport/interface/address/port constants, inline or symlinked `CYCLONEDDS_URI`, and any digest mismatch before a ROS import.
 
 - [ ] **Step 4: Run provenance, marker, and DDS matrix tests**
 
@@ -854,7 +892,7 @@ Expected: FAIL because the 74-blob verifier, asset lock, and fixture node are ab
 
 Populate `semantic-source-manifest-v1.json` with the exact 74 sorted paths approved in Component 1 of `docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md`; the test must compare the tracked manifest path set to that table with no extras or omissions. Verify every path against commit `f164095abb0045a69c0b8eb23683063be3deaa38`, reject a reappeared conflicting path, and never expand the manifest by scanning the old snapshot tree. Record graph/dataset/checkpoint root digests from the approved design. Run the structured query through the real HMSG retrieval/transform code, bypassing only the external LLM parser. Enforce exact publisher/subscriber counts, frame, object, pose, and the four pinned Cyclone participant configurations; bracket DDS with nonce-bearing BEGIN/END markers.
 
-The pinned semantic digests are graph root `6e8e27504598c0fe28836b2148ec77732be00ca9cf6d5640f7193332da98e050`, dataset root `a28fea956a4520330a76d90f75a60f7781602bfd19cd13e510b2574d39b4a913`, and checkpoint file `5ddb47339f44e4fd9cace3d3960d38af1b51a25857440cfae90afc44706d7e2b`. The four Cyclone configurations use loopback UDP only, multicast disabled, `ManySocketsMode=false`, domain 77, and fixed participant indices 0–3 for fixture, query publisher, result subscriber, and graph inspector.
+The pinned semantic digests are graph root `6e8e27504598c0fe28836b2148ec77732be00ca9cf6d5640f7193332da98e050`, dataset root `a28fea956a4520330a76d90f75a60f7781602bfd19cd13e510b2574d39b4a913`, and checkpoint file `5ddb47339f44e4fd9cace3d3960d38af1b51a25857440cfae90afc44706d7e2b`. The four Cyclone configurations use loopback UDP4, SPDP-only multicast at `239.255.0.1:26650`, `ManySocketsMode=false`, domain 77, and fixed participant indices 0–3 for fixture, query publisher, result subscriber, and graph inspector. Data multicast port `26651` is prohibited; the only unicast local/destination endpoints are the four exact meta/data pairs from Task 6.
 
 ```python
 EXPECTED_QUERY = SemanticExpectation(
