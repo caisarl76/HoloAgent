@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import sys
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+
 
 def manifest_test_paths(manifest_path: Path) -> tuple[Path, ...]:
     """Return existing test paths declared by a non-empty manifest."""
@@ -15,21 +17,38 @@ def manifest_test_paths(manifest_path: Path) -> tuple[Path, ...]:
     if not relative_paths:
         raise ValueError("test manifest must list at least one test path")
 
-    manifest_parent = manifest_path.parent
-    if (
-        manifest_parent.name == "holoagent0_setup"
-        and manifest_parent.parent.name == "scripts"
-    ):
-        path_root = manifest_parent.parent.parent
-    else:
-        path_root = manifest_parent
+    test_paths = []
+    missing_paths = []
+    for entry in relative_paths:
+        entry_path = Path(entry)
+        if entry_path.is_absolute():
+            raise ValueError(
+                "test manifest paths must be relative to the repository root"
+            )
+        if ".." in entry_path.parts:
+            raise ValueError("test manifest paths must not contain parent traversal")
 
-    test_paths = tuple(path_root / relative_path for relative_path in relative_paths)
-    missing_paths = tuple(path for path in test_paths if not path.is_file())
+        unresolved_path = REPOSITORY_ROOT / entry_path
+        try:
+            test_path = unresolved_path.resolve(strict=True)
+        except FileNotFoundError:
+            missing_paths.append(unresolved_path)
+            continue
+        try:
+            test_path.relative_to(REPOSITORY_ROOT)
+        except ValueError as error:
+            raise ValueError(
+                f"test manifest path resolves outside the repository root: {entry}"
+            ) from error
+        if not test_path.is_file():
+            missing_paths.append(unresolved_path)
+            continue
+        test_paths.append(test_path)
+
     if missing_paths:
         missing = ", ".join(str(path) for path in missing_paths)
         raise FileNotFoundError(f"test manifest lists missing files: {missing}")
-    return test_paths
+    return tuple(test_paths)
 
 
 def main() -> int:
@@ -44,9 +63,22 @@ def main() -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
-    os.execv(
+    pytest_environment = os.environ.copy()
+    pytest_environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    pytest_environment.pop("PYTEST_ADDOPTS", None)
+    pytest_environment.pop("PYTEST_PLUGINS", None)
+    os.execve(
         sys.executable,
-        [sys.executable, "-m", "pytest", "-q", *(str(path) for path in test_paths)],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-c",
+            os.devnull,
+            *(str(path) for path in test_paths),
+        ],
+        pytest_environment,
     )
 
 
