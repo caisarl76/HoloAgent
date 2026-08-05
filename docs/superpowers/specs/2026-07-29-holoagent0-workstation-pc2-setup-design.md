@@ -525,13 +525,38 @@ Only after winning the commit transition does the supervisor launch the full
 `strace`/coordinator pair. `strace` runs in a tracer process group, while the
 tracee command starts the coordinator through `setsid`, making the coordinator
 PID its distinct session and PGID. A signal collected after commitment follows
-the normal coordinator path; if the committed spawn itself fails, the existing
+the readiness handoff below; if the committed spawn itself fails, the existing
 missing-ledger/trace-bootstrap synthesis applies and the recorded interruption
 cannot hide that failure. The pre-commit interruption path may launch only the
 finalizer-only pair fixed in the table below. The supervisor records and
 validates the applicable PID/PGID/start-time/executable identities; the tracer
 never joins a tracee group. The normalizer has a third, distinct recorded
 identity.
+
+The blocked signal mask is intentionally inherited across the coordinator's
+`fork` and `exec`; signal-mask inheritance is defined by
+<https://man7.org/linux/man-pages/man7/signal.7.html>. Before any functional
+gate, host observation, action child, or other thread can start, the coordinator
+must complete this handoff in order:
+
+1. While `HUP`, `INT`, and `TERM` remain blocked, install all three cleanup
+   handlers and verify their dispositions.
+2. Write one bounded `SIGNAL_READY` acknowledgement to the existing reviewed
+   broker pipe. It contains the run nonce, coordinator PID, PGID, `/proc` start
+   time, executable identity, exact blocked mask, and successful disposition
+   checks.
+3. Unblock exactly `HUP`, `INT`, and `TERM`, without resetting any disposition,
+   and only then permit functional progression.
+
+`SIGNAL_READY` is a closed broker-protocol message, not a ledger transition.
+On receipt, the supervisor opens a pidfd for the reported coordinator PID and
+accepts the message only after the PID/PGID/start-time/executable identity and
+broker nonce all validate, and only once. A malformed, duplicate, wrong-nonce,
+wrong-identity, or timed-out acknowledgement stops progression; the supervisor
+forwards no pending signal, performs identity-checked cleanup, and applies the
+existing missing/unsealed-ledger rule. Thus a failed handoff cannot preserve
+an interruption exit over `safety.workstation_postflight: FAIL`.
+
 Immediately after spawn, the supervisor opens pidfds for the exact tracer and
 normalizer identities and continuously polls both alongside canonical trace
 progress. Losing either pidfd, receiving an unexpected exit, observing an
@@ -557,16 +582,32 @@ ownership journal proves no live child, the outcome is trace-integrity
 `FAIL_SAFETY`. Unexpected tracer exit never permits a functional gate or tracee
 to continue.
 
-If the coordinator is live, the supervisor forwards the signal exactly once
-only to the coordinator PGID, leaving `strace` alive. The
-coordinator trap propagates cleanup to any separately owned child groups using
-their recorded identities. Every owned child identity is also streamed before
-exec to a supervisor-owned append-only ownership journal. If the coordinator
-cannot run its trap, the supervisor uses that journal for the same bounded,
-identity-checked child-group cleanup; an incomplete journal or cleanup is
-`safety.workstation_postflight: FAIL`. A bounded wait is followed by identity-
-checked TERM and KILL only when needed. Repeated signals are recorded but do
-not bypass finalization.
+Successful coordinator spawn initializes `AWAITING_READY`. Before a valid
+`SIGNAL_READY`, the supervisor holds the first collected signal in
+`PENDING_FORWARD` and makes no `kill`, `tgkill`, or process-group signal call
+for it. Once the acknowledgement and exact
+PID/PGID/start-time/executable identity validate, the supervisor changes the
+handoff state to `READY` and forwards that signal exactly once only to the
+coordinator PGID, leaving `strace` alive. If the forward races the coordinator's
+step-3 unblock, the signal remains pending behind the already installed handler
+and is delivered when the coordinator unblocks it; default disposition is
+never exposed. A first signal collected after `READY` is forwarded immediately
+under the same identity check.
+
+`AWAITING_READY` and `PENDING_FORWARD` are transient evidence events only. The
+terminal handoff state is `NOT_APPLICABLE` when no full coordinator was
+committed, `READY` after a successful handoff, or `FAILED` after any handoff
+defect. The forward count is exactly zero or one; `NOT_APPLICABLE` and `FAILED`
+require zero.
+
+The coordinator trap propagates cleanup to any separately owned child groups
+using their recorded identities. Every owned child identity is also streamed
+before exec to a supervisor-owned append-only ownership journal. If the
+coordinator cannot run its trap, the supervisor uses that journal for the same
+bounded, identity-checked child-group cleanup; an incomplete journal or cleanup
+is `safety.workstation_postflight: FAIL`. A bounded wait is followed by
+identity-checked TERM and KILL only when needed. Repeated signals are recorded
+but are never forwarded and do not bypass finalization.
 
 The supervisor has an explicit pre-trace bootstrap. Its small bootstrap
 envelope knows the reviewed result/ledger/policy paths and literal digests. If
@@ -1222,6 +1263,10 @@ files/directories are `fsync`ed:
   and nullable not-started reason under the discriminated bootstrap rules;
 - supervisor-bootstrap report relative path, SHA-256, byte size, terminal
   launch state, `coordinator_launch_committed`, nullable first signal,
+  signal-handoff event sequence over the closed states `NOT_APPLICABLE`,
+  `AWAITING_READY`, `PENDING_FORWARD`, `READY`, and `FAILED`, terminal state,
+  nullable `SIGNAL_READY` identity and broker sequence, inherited/unblocked
+  masks, pending signal, forward target PGID and count,
   expected/observed tool values, initial/final FD manifests, sanitation/
   rebinding actions, and live-fixture result;
 - accepted ledger generation and SHA-256, immutable generation count, and the
@@ -1858,7 +1903,8 @@ Implementation follows test-driven development.
   creation, supervisor-authored early successors, finalizer-only trace,
   `NOT_STARTED` trace, `NOT_RUN` observer, empty-journal binding, gate 24
   synthesis, the mutually exclusive pre-coordinator interruption versus launch-
-  committed transitions, and safety/harness/interruption precedence.
+  committed transitions, the blocked-handler/`SIGNAL_READY`/unblock ordering,
+  pending-forward state, and safety/harness/interruption precedence.
 - Stage 3 `required_qualification` role, pass, exact qualified continuation,
   prerequisite failure, malformed result, Stage 4 `NOT_RUN` behavior, and
   postflight safety overriding every evaluator exit code.
@@ -1914,9 +1960,19 @@ Implementation follows test-driven development.
   coordinator PID or exec record, the exact finalizer-only artifacts, and the
   matching `INTERRUPTED` exit. Race each signal against launch commitment
   repeatedly: every run must select exactly one state. If commitment wins,
-  require `coordinator_launch_committed: true`, the normal full-coordinator
-  signal path, and exactly one forward; mixed artifacts or two results fail the
-  test.
+  require `coordinator_launch_committed: true` and the readiness-gated full-
+  coordinator signal path; mixed artifacts or two results fail the test.
+- After launch commitment, hold the coordinator before `SIGNAL_READY` and
+  inject HUP, INT, and TERM separately. Require `PENDING_FORWARD`, zero
+  supervisor signal calls to the coordinator PID or PGID, and no functional
+  gate progression. Then require all three handlers to be installed while the
+  mask is blocked, the nonce/identity-bound broker acknowledgement to validate,
+  and exactly one group forward. Hold once more between acknowledgement and
+  unblock; the forwarded signal must remain pending and invoke the installed
+  handler immediately after unblock, completing cleanup and the matching
+  interruption exit without default termination. Malformed, duplicate,
+  wrong-identity, and timed-out acknowledgements must produce no forward and
+  the specified postflight safety failure.
 - Verify exact OpenClaw/Node artifacts, the pinned local configuration,
   successful provisioning-schema validation, identical expected/installed
   payload manifests, `config validate`, both exact lint commands, and the
@@ -2008,10 +2064,11 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
   and prove none appear in canonical trace, logs, journals, or result evidence.
 - Send HUP, INT, and TERM after coordinator launch commitment during early,
   semantic, postflight, and trace-close phases. Require distinct tracer/
-  coordinator process groups, one identity-checked forward only to the
-  coordinator PGID, coordinator postflight before trace closure, all three
-  supervisor finalizers afterward, one authoritative result, and the
-  precedence-defined exit. Kill the tracer before coordinator
+  coordinator process groups, the inherited blocked mask, handler installation
+  before `SIGNAL_READY`, readiness validation before one identity-checked
+  forward only to the coordinator PGID, coordinator postflight before trace
+  closure, all three supervisor finalizers afterward, one authoritative result,
+  and the precedence-defined exit. Kill the tracer before coordinator
   setup, while a descendant is live, and after all tracees exit; prove pidfd
   detection, kernel exit-kill, journal-based remainder cleanup, no continued
   profile progression, and the specified safety-versus-harness outcome. Kill
