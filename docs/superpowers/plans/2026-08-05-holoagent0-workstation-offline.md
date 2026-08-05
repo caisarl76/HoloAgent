@@ -32,7 +32,7 @@ Create these focused units:
 - `scripts/holoagent0_setup/holoagent0_setup/offline_cli.py`: the public `workstation_offline` command.
 - `scripts/holoagent0_setup/native/tracee_launcher.c`: final FD layout, process group/session setup, prctl markers, and coordinator exec.
 - `scripts/holoagent0_setup/native/finalizer_only.c`: sanitized trace root for bootstrap finalization.
-- `scripts/holoagent0_setup/native/seccomp_policy.c`: deny FD acquisition/transfer, io_uring, ptrace, and untraced-child bypasses.
+- `scripts/holoagent0_setup/native/seccomp_policy.c`: deny the exact io_uring, `pidfd_getfd`, ptrace, and untraced-clone bypasses while leaving message syscalls traceable.
 - `scripts/holoagent0_setup/tests/`: unit, integration, fixture, and adversarial tests mirroring the approved gate catalog.
 
 ### Task 1: Package skeleton and deterministic test entrypoint
@@ -486,6 +486,49 @@ def test_connected_udp_alias_after_end_is_safety_failure(policy, op):
     assert decision.reason == "UNEXPECTED_NETWORK_ATTEMPT"
 
 
+@pytest.mark.parametrize("local_address", ["0.0.0.0", "127.0.0.1"])
+@pytest.mark.parametrize("participant,channel,local_port", [
+    (0, "spdp_multicast", 26650),
+    (1, "spdp_multicast", 26650),
+    (2, "spdp_multicast", 26650),
+    (3, "spdp_multicast", 26650),
+    (0, "unicast_meta", 26660),
+    (0, "unicast_data", 26661),
+    (1, "unicast_meta", 26662),
+    (1, "unicast_data", 26663),
+    (2, "unicast_meta", 26664),
+    (2, "unicast_data", 26665),
+    (3, "unicast_meta", 26666),
+    (3, "unicast_data", 26667),
+])
+def test_exact_dds_local_bind_matrix_passes(
+    dds_window_policy, local_address, participant, channel, local_port
+):
+    decision = dds_window_policy.feed(dds_bind(
+        issuer=dds_window_policy.issuer(participant),
+        local_address=local_address, local_port=local_port, channel=channel,
+    ))
+    assert decision.status == "PASS"
+
+
+@pytest.mark.parametrize("local_address,participant,channel,local_port", [
+    ("192.0.2.10", 0, "spdp_multicast", 26650),
+    ("::1", 0, "spdp_multicast", 26650),
+    ("239.255.0.1", 0, "spdp_multicast", 26650),
+    ("0.0.0.0", 0, "data_multicast", 26651),
+    ("127.0.0.1", 0, "unicast_meta", 26662),
+    ("0.0.0.0", 0, "unicast_data", 0),
+])
+def test_invalid_dds_bind_interface_or_port_is_rejected(
+    dds_window_policy, local_address, participant, channel, local_port
+):
+    decision = dds_window_policy.feed(dds_bind(
+        issuer=dds_window_policy.issuer(participant),
+        local_address=local_address, local_port=local_port, channel=channel,
+    ))
+    assert decision.reason == "UNEXPECTED_NETWORK_ATTEMPT"
+
+
 @pytest.mark.parametrize("destination_index,kind,address,port", [
     (None, "spdp_multicast", "239.255.0.1", 26650),
     (0, "unicast_meta", "127.0.0.1", 26660),
@@ -525,6 +568,96 @@ def test_every_nonmatrix_dds_destination_is_rejected(
         kind=kind, address=address, port=port,
     ))
     assert decision.reason == "UNEXPECTED_NETWORK_ATTEMPT"
+
+
+META_PORTS = {0: 26660, 1: 26662, 2: 26664, 3: 26666}
+DATA_PORTS = {0: 26661, 1: 26663, 2: 26665, 3: 26667}
+
+
+def exact_dds_flows(policy):
+    flows = []
+    for local_index in range(4):
+        issuer = policy.participant(local_index)
+        flows.append(dds_packet(
+            direction="outbound", issuer=issuer, channel="spdp_multicast",
+            local=("127.0.0.1", META_PORTS[local_index]),
+            remote=("239.255.0.1", 26650),
+        ))
+        for remote_index in range(4):
+            flows.extend((
+                dds_packet(
+                    direction="inbound", issuer=issuer, channel="spdp_multicast",
+                    local=("0.0.0.0", 26650),
+                    remote=("127.0.0.1", META_PORTS[remote_index]),
+                ),
+                dds_packet(
+                    direction="outbound", issuer=issuer, channel="unicast_meta",
+                    local=("127.0.0.1", META_PORTS[local_index]),
+                    remote=("127.0.0.1", META_PORTS[remote_index]),
+                ),
+                dds_packet(
+                    direction="inbound", issuer=issuer, channel="unicast_meta",
+                    local=("0.0.0.0", META_PORTS[local_index]),
+                    remote=("127.0.0.1", META_PORTS[remote_index]),
+                ),
+                dds_packet(
+                    direction="outbound", issuer=issuer, channel="unicast_data",
+                    local=("127.0.0.1", DATA_PORTS[local_index]),
+                    remote=("127.0.0.1", DATA_PORTS[remote_index]),
+                ),
+                dds_packet(
+                    direction="inbound", issuer=issuer, channel="unicast_data",
+                    local=("0.0.0.0", DATA_PORTS[local_index]),
+                    remote=("127.0.0.1", DATA_PORTS[remote_index]),
+                ),
+            ))
+    return tuple(flows)
+
+
+def test_directional_sources_and_destinations(dds_window_policy):
+    for flow in exact_dds_flows(dds_window_policy):
+        assert dds_window_policy.feed(flow).status == "PASS"
+
+    for flow in (
+        dds_packet(
+            direction="outbound", issuer=dds_window_policy.participant(0),
+            channel="spdp_multicast", local=("0.0.0.0", 26660),
+            remote=("239.255.0.1", 26650),
+        ),
+        dds_packet(
+            direction="inbound", issuer=dds_window_policy.participant(0),
+            channel="spdp_multicast", local=("0.0.0.0", 26650),
+            remote=("192.0.2.10", 26660),
+        ),
+        dds_packet(
+            direction="outbound", issuer=dds_window_policy.participant(0),
+            channel="unicast_meta", local=("127.0.0.1", 26661),
+            remote=("127.0.0.1", 26662),
+        ),
+        dds_packet(
+            direction="inbound", issuer=dds_window_policy.participant(0),
+            channel="unicast_meta", local=("127.0.0.1", 26660),
+            remote=("127.0.0.1", 26663),
+        ),
+    ):
+        assert dds_window_policy.feed(flow).reason == "UNEXPECTED_NETWORK_ATTEMPT"
+
+
+def test_ordinary_dds_message_passes_but_scm_rights_is_journaled(dds_window_policy):
+    ordinary = dds_window_policy.feed(sendmsg_udp(
+        issuer=dds_window_policy.participant(0),
+        source=("127.0.0.1", 26660),
+        destination=("239.255.0.1", 26650),
+        control_messages=(),
+    ))
+    assert ordinary.status == "PASS"
+
+    transfer = dds_window_policy.feed(sendmsg_unix(
+        issuer=dds_window_policy.participant(0),
+        control_messages=(scm_rights(fd=7),),
+    ))
+    assert transfer.reason == "PROHIBITED_FD_TRANSFER"
+    assert dds_window_policy.journal.first_violation.reason == "PROHIBITED_FD_TRANSFER"
 ```
 
 - [ ] **Step 2: Run and verify the policy tests fail**
@@ -561,7 +694,22 @@ class TracePolicy:
         return PolicyDecision("SKIPPED", "DEPENDENCY_NOT_AVAILABLE", None)
 ```
 
-Track socket creation, peers, `dup*`, `fcntl(F_DUPFD*)`, fork/clone table semantics, exec, close, `SCM_RIGHTS`, and `pidfd_getfd`. Deny or classify io_uring, ptrace, `CLONE_UNTRACED`, FD transfer/acquisition, TCP/DNS, host-namespace IP, non-loopback routes, and any UDP operation outside the exact four participant identities, marker interval, configuration digests, and domain-77 port matrix. The positive matrix is exactly SPDP multicast `239.255.0.1:26650` plus participant-index unicast meta/data pairs `0 → 26660/26661`, `1 → 26662/26663`, `2 → 26664/26665`, and `3 → 26666/26667`; `239.255.0.1:26651` is explicitly negative because data multicast is disabled. Also reject a permitted port with the wrong address, role, participant/config digest, PID, marker nonce, or position outside the BEGIN/END interval. Preserve violation-journal failures even when trace integrity later fails.
+Track socket creation, local binds, connected and message peers, `dup*`, `fcntl(F_DUPFD*)`, fork/clone table semantics, exec, close, decoded `SCM_RIGHTS`, and `pidfd_getfd`. Classify TCP/DNS, host-namespace IP, non-loopback routes, any `pidfd_getfd` acquisition attempt, any decoded `SCM_RIGHTS` transfer, and any UDP operation outside the exact four participant identities, marker interval, configuration digests, and direction-specific domain-77 endpoint matrix. Preserve violation-journal failures even when trace integrity later fails.
+
+The closed UDP4 allowance is:
+
+| Operation | Local bind/source | Peer/source/destination | Additional restriction |
+|---|---|---|---|
+| Bind SPDP receive socket | `0.0.0.0:26650` or `127.0.0.1:26650` | none | Any of the four exact participant identities; reuse options do not widen the endpoint |
+| Bind unicast meta/data socket | `0.0.0.0` or `127.0.0.1` at that participant's exact pair | none | p0 `26660/26661`; p1 `26662/26663`; p2 `26664/26665`; p3 `26666/26667` |
+| Outbound SPDP | `127.0.0.1` at the issuing participant's meta port | destination `239.255.0.1:26650` | Meta channel only |
+| Inbound SPDP | bound wildcard/loopback `:26650` | source `127.0.0.1` at any exact participant meta port | Source address may never be wildcard or multicast |
+| Outbound unicast meta/data | `127.0.0.1` at the issuer's matching meta/data port | destination `127.0.0.1` at any exact participant port of the same channel | Meta-to-meta or data-to-data only |
+| Inbound unicast meta/data | bound wildcard/loopback at the receiver's matching meta/data port | source `127.0.0.1` at any exact participant port of the same channel | Meta-to-meta or data-to-data only |
+
+Derive the local endpoint from the FD's trace-visible bind/connect/`getsockname` provenance and the remote endpoint from connect state or the decoded message address. A wildcard-bound outbound socket may normalize to effective source `127.0.0.1` only after the preflight artifact proves the private namespace has exactly `lo` and no non-loopback interface or route; without that proof, its source is unknown and the operation fails. An inbound message requires a decoded loopback source. Unknown, conflicting, or post-hoc endpoint provenance never inherits permission from a valid port number alone.
+
+Wildcard `0.0.0.0` is permitted only as a local bind address, never as a packet source or destination. IPv6, non-loopback interfaces/sources/destinations, multicast binds, alternate multicast groups, port `26651`, port zero/ephemeral binds, cross-channel pairs, and ports outside `26650` plus `26660`–`26667` are rejected. Every permitted operation still requires the exact PID/config role and BEGIN/END nonce; socket reuse flags, connection state, or a previously valid bind cannot widen the matrix.
 
 The four XML files are byte-pinned and differ only in `Discovery/ParticipantIndex`. Each pins domain `77`; required `lo` with autodetection disabled and `multicast=true`; `General/Transport=udp`; interface and global `AllowMulticast=spdp`; multicast loopback enabled; TTL `1`; numeric SPDP/default multicast address `239.255.0.1`; no static peers and `Peers/AddLocalhost=false`; `ManySocketsMode=false`; monitor port `-1`; redundant networking disabled; and DDSI port constants base `7400`, domain gain `250`, participant gain `2`, offsets `0`, `1`, `10`, and `11`. Tests must reject disabled/all multicast, automatic participant selection, alternate transport/interface/address/port constants, inline or symlinked `CYCLONEDDS_URI`, and any digest mismatch before a ROS import.
 
@@ -599,6 +747,25 @@ def test_tracee_launcher_rejects_inherited_socket(native_launcher, socket_fd):
     assert completed.json["reason"] == "INHERITED_SOCKET_FD"
 
 
+@pytest.mark.parametrize("syscall", [
+    "io_uring_setup", "io_uring_enter", "io_uring_register",
+    "pidfd_getfd", "ptrace", "clone_untraced",
+])
+def test_seccomp_denies_only_reviewed_bypasses(native_launcher, syscall):
+    assert native_launcher.probe(syscall).denied
+
+
+def test_clone3_gets_reviewed_fallback_errno(native_launcher):
+    assert native_launcher.probe("clone3").errno == errno.ENOSYS
+
+
+def test_seccomp_leaves_message_syscalls_for_trace_policy(native_launcher):
+    completed = native_launcher.probe_unix_message_round_trip(
+        control_messages=(), syscalls=("sendmsg", "recvmsg", "sendmmsg", "recvmmsg")
+    )
+    assert completed.returncode == 0
+
+
 def test_identity_rejects_reused_pid(proc_fixture):
     expected = proc_fixture.identity()
     proc_fixture.replace_start_time()
@@ -626,7 +793,7 @@ int install_tracee_seccomp(void);
 int emit_marker(const char *phase, const char *nonce);
 ```
 
-Use `/proc/self/fd`, `fstat`, `SO_DOMAIN`, `SO_TYPE`, `SO_PROTOCOL`, explicit FD relocation, `CLOSE_RANGE_UNSHARE`, `PR_SET_NO_NEW_PRIVS`, seccomp denial of io_uring/ptrace/FD acquisition/transfer/untraced child paths, `setsid`, `PR_SET_PDEATHSIG`, and no socket IPC. Keep the supervisor's filter non-inherited. Build into ignored `native/build/` with `-std=c17 -Wall -Wextra -Werror -fPIE -pie`; `.gitignore` contains exactly `/build/`, so no generated ELF is committed.
+Use `/proc/self/fd`, `fstat`, `SO_DOMAIN`, `SO_TYPE`, `SO_PROTOCOL`, explicit FD relocation, `CLOSE_RANGE_UNSHARE`, `PR_SET_NO_NEW_PRIVS`, `setsid`, and `PR_SET_PDEATHSIG`. The inherited tracee seccomp filter denies exactly `io_uring_setup`, `io_uring_enter`, `io_uring_register`, `pidfd_getfd`, and `ptrace`; returns `ENOSYS` for `clone3`; and rejects `clone` only when `CLONE_UNTRACED` is set. It does not deny `sendmsg`, `recvmsg`, `sendmmsg`, or `recvmmsg` wholesale and does not claim to inspect ancillary payloads. Decoded `SCM_RIGHTS` control messages are rejected by Task 6 trace policy as `PROHIBITED_FD_TRANSFER` and durably recorded in the violation journal. The supervisor/coordinator control channel remains reviewed anonymous pipes rather than socket IPC. Keep the supervisor's filter non-inherited. Build into ignored `native/build/` with `-std=c17 -Wall -Wextra -Werror -fPIE -pie`; `.gitignore` contains exactly `/build/`, so no generated ELF is committed.
 
 - [ ] **Step 4: Run native tests and compiler warnings as errors**
 
