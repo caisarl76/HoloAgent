@@ -700,9 +700,7 @@ def _policy_errors(
     yield from _mode_evidence_errors(mode, value)
     yield from _conditional_status_errors(mode, gates_by_id)
     yield from _trace_authorization_errors(policies, mode, value.get("status"))
-    yield from _terminal_state_errors(
-        expected_order, expected_roles, gates_by_id, value.get("status")
-    )
+    yield from _terminal_state_errors(expected_order, expected_roles, gates_by_id)
     yield from _selector_and_outcome_errors(
         gate_policy, mode, expected_order, expected_roles, gates_by_id, value
     )
@@ -875,7 +873,6 @@ def _terminal_state_errors(
     order: Sequence[str],
     roles: Mapping[str, str],
     gates: Mapping[str, Mapping[str, object]],
-    top_status: object,
 ) -> Iterable[str]:
     blocking_action_seen = False
     interrupted_action_seen = False
@@ -893,20 +890,26 @@ def _terminal_state_errors(
                 and not blocking_action_seen
             ):
                 yield f"$.gates[{gate_id}]: EARLIER_BLOCKING_GATE has no earlier block"
-            if (
-                status == "NOT_RUN"
-                and reason == "INTERRUPTED_BEFORE_GATE"
-                and top_status != "INTERRUPTED"
-            ):
-                yield f"$.gates[{gate_id}]: interrupted gate requires top-level interruption"
             if blocking_action_seen and status != "NOT_RUN":
                 yield f"$.gates[{gate_id}]: later action gate must be NOT_RUN after a block"
-            if interrupted_action_seen and status != "NOT_RUN":
-                yield f"$.gates[{gate_id}]: later action gate must be NOT_RUN after interruption"
+            if interrupted_action_seen and (
+                status != "NOT_RUN" or reason != "INTERRUPTED_BEFORE_GATE"
+            ):
+                yield (
+                    f"$.gates[{gate_id}]: interruption must remain an exact "
+                    "INTERRUPTED_BEFORE_GATE action suffix"
+                )
             if status == "FAIL" and role in {"required", "required_qualification"}:
                 blocking_action_seen = True
             if status == "NOT_RUN" and reason == "INTERRUPTED_BEFORE_GATE":
                 interrupted_action_seen = True
+    if interrupted_action_seen and not _has_exact_interruption_suffix(
+        order, roles, gates
+    ):
+        yield (
+            "$.gates: every non-finalizer NOT_RUN action must belong to the exact "
+            "INTERRUPTED_BEFORE_GATE suffix"
+        )
 
 
 def _selector_and_outcome_errors(
@@ -939,11 +942,31 @@ def _selector_and_outcome_errors(
     status = value.get("status")
     label = value.get("label")
     primary = value.get("primary_blocking_gate")
-    expected_primary = _primary_blocker(gate_policy, order, blockers)
+    safety_blockers = [
+        gate_id
+        for gate_id in blockers
+        if gate_id.startswith("safety.")
+        or gate_id in set(gate_policy["safety_gate_patterns"][1:])
+    ]
+    harness_blockers = [
+        gate_id for gate_id in blockers if gate_id in gate_policy["harness_gates"]
+    ]
+    has_interruption_suffix = _has_exact_interruption_suffix(order, roles, gates)
+    interruption_wins = (
+        has_interruption_suffix and not safety_blockers and not harness_blockers
+    )
+    expected_primary = (
+        None if interruption_wins else _primary_blocker(gate_policy, order, blockers)
+    )
     if primary != expected_primary:
         yield "$.primary_blocking_gate: does not select the precedence-winning blocker"
 
-    if blockers:
+    if interruption_wins:
+        if label != "INTERRUPTED":
+            yield "$.label: interruption requires INTERRUPTED"
+        if status != "INTERRUPTED":
+            yield "$.status: interruption outranks functional failure"
+    elif blockers:
         failure_map = gate_policy["failure_outcomes"][mode]
         expected_label = failure_map.get(expected_primary)
         if expected_label is None:
@@ -955,10 +978,8 @@ def _selector_and_outcome_errors(
     elif status == "INTERRUPTED":
         if label != "INTERRUPTED":
             yield "$.label: interruption requires INTERRUPTED"
-        if not any(
-            gate.get("reason") == "INTERRUPTED_BEFORE_GATE" for gate in gates.values()
-        ):
-            yield "$.status: interruption requires an INTERRUPTED_BEFORE_GATE marker"
+        if not has_interruption_suffix:
+            yield "$.status: interruption requires an exact action interruption suffix"
     else:
         qualification_key = ",".join(qualifications)
         expected_label = gate_policy["non_failure_outcomes"][mode].get(
@@ -982,6 +1003,35 @@ def _selector_and_outcome_errors(
     ]
     if len(matching_tuples) != 1:
         yield "$.label/status/exit_class/process_exit_code: tuple is not allowed"
+
+
+def _has_exact_interruption_suffix(
+    order: Sequence[str],
+    roles: Mapping[str, str],
+    gates: Mapping[str, Mapping[str, object]],
+) -> bool:
+    actions = [gate_id for gate_id in order if roles[gate_id] != "finalizer"]
+    marker_indexes = [
+        index
+        for index, gate_id in enumerate(actions)
+        if gate_id in gates
+        and gates[gate_id].get("status") == "NOT_RUN"
+        and gates[gate_id].get("reason") == "INTERRUPTED_BEFORE_GATE"
+    ]
+    if not marker_indexes:
+        return False
+    first = marker_indexes[0]
+    not_run_indexes = [
+        index
+        for index, gate_id in enumerate(actions)
+        if gate_id in gates and gates[gate_id].get("status") == "NOT_RUN"
+    ]
+    return not_run_indexes == list(range(first, len(actions))) and all(
+        gate_id in gates
+        and gates[gate_id].get("status") == "NOT_RUN"
+        and gates[gate_id].get("reason") == "INTERRUPTED_BEFORE_GATE"
+        for gate_id in actions[first:]
+    )
 
 
 def _primary_blocker(
@@ -1066,6 +1116,12 @@ def _offline_ledger_errors(
             continue
         status = gate.get("status")
         reason = gate.get("reason")
+        if (
+            status == "NOT_RUN"
+            and reason == "EARLIER_BLOCKING_GATE"
+            and (value.get("sealed") is False or index >= 24)
+        ):
+            continue
         allowed = reasons[gate_id]
         if not isinstance(status, str) or status not in allowed:
             yield f"$.gates[{index}].status: invalid ledger status for {gate_id}"

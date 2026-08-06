@@ -1,2 +1,5 @@
 scripts/holoagent0_setup/tests/test_constants.py
 scripts/holoagent0_setup/tests/test_contract.py
+scripts/holoagent0_setup/tests/test_atomic_io.py
+scripts/holoagent0_setup/tests/test_result_policy.py
+scripts/holoagent0_setup/tests/test_ledger.py

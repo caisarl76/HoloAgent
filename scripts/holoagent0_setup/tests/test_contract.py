@@ -7,6 +7,7 @@ import shutil
 import pytest
 
 from holoagent0_setup.contract import ContractError, ContractLoadError, ContractSet
+from holoagent0_setup.result_policy import ResultPolicy, ResultPolicyError
 
 
 PACKAGE_ROOT = Path(__file__).parents[1]
@@ -383,6 +384,46 @@ def test_not_run_requires_its_claimed_control_flow_context(
     value = make_pass_result("pc2_inventory")
     value["gates"][6].update(status="NOT_RUN", reason=reason)
     value["status"] = top_status
+    assert not contract.validate_result(value).ok
+
+
+def test_interruption_marker_must_form_an_exact_remaining_action_suffix(
+    contract: ContractSet,
+):
+    value = make_pass_result("pc2_inventory")
+    value["gates"][4].update(status="FAIL", reason="TOOL_RUNTIME_ERROR")
+    for gate in value["gates"][5:-2]:
+        gate.update(status="NOT_RUN", reason="INTERRUPTED_BEFORE_GATE")
+    value["gates"][7]["reason"] = "EARLIER_BLOCKING_GATE"
+    value.update(
+        label="INTERRUPTED",
+        status="INTERRUPTED",
+        exit_class="TERM",
+        process_exit_code=143,
+        blocking_gates=["pc2.inventory"],
+    )
+
+    assert not contract.validate_result(value).ok
+
+
+def test_interruption_cannot_follow_an_earlier_blocked_not_run_segment(
+    contract: ContractSet,
+):
+    value = make_pass_result("pc2_inventory")
+    value["gates"][4].update(status="FAIL", reason="TOOL_RUNTIME_ERROR")
+    value["gates"][5].update(status="NOT_RUN", reason="EARLIER_BLOCKING_GATE")
+    for gate in value["gates"][6:-2]:
+        gate.update(status="NOT_RUN", reason="INTERRUPTED_BEFORE_GATE")
+    value.update(
+        label="INTERRUPTED",
+        status="INTERRUPTED",
+        exit_class="TERM",
+        process_exit_code=143,
+        blocking_gates=["pc2.inventory"],
+    )
+
+    with pytest.raises(ResultPolicyError, match="exact action interruption marker"):
+        ResultPolicy(contract).decide("pc2_inventory", value["gates"], signal="TERM")
     assert not contract.validate_result(value).ok
 
 
@@ -944,3 +985,113 @@ def test_trace_policy_pin_mutations_fail_closed(
 
     with pytest.raises(ContractLoadError, match="trace tool policy"):
         ContractSet(root)
+
+
+def test_result_policy_interruption_precedence_materializes_valid_contract_result(
+    contract: ContractSet,
+):
+    value = make_pass_result("pc2_inventory")
+    failed = next(gate for gate in value["gates"] if gate["id"] == "pc2.inventory")
+    failed.update(status="FAIL", reason="TOOL_RUNTIME_ERROR")
+    failure_index = value["gates"].index(failed)
+    for gate in value["gates"][failure_index + 1 : -2]:
+        gate.update(status="NOT_RUN", reason="INTERRUPTED_BEFORE_GATE")
+
+    decision = ResultPolicy(contract).decide(
+        "pc2_inventory", value["gates"], signal="TERM"
+    )
+    value.update(
+        label=decision.label,
+        status=decision.status,
+        exit_class=decision.exit_class,
+        process_exit_code=decision.exit_code,
+        primary_blocking_gate=decision.primary,
+        blocking_gates=list(decision.blocking_gates),
+        qualifications=list(decision.qualifications),
+    )
+
+    validation = contract.validate_result(value)
+    assert validation.ok, validation.errors
+
+    functional_over_interrupt = copy.deepcopy(value)
+    functional_over_interrupt.update(
+        label="FAIL_PC2_INVENTORY",
+        status="FAIL",
+        exit_class="GATE_FAILURE",
+        process_exit_code=20,
+        primary_blocking_gate="pc2.inventory",
+    )
+    assert not contract.validate_result(functional_over_interrupt).ok
+
+
+@pytest.mark.parametrize(
+    ("winning_gate", "reason", "expected_label"),
+    [
+        ("offline.network_policy", "UNEXPECTED_NETWORK_ATTEMPT", "FAIL_SAFETY"),
+        ("offline.trace_integrity", "TRACE_INCOMPLETE", "FAIL_HARNESS"),
+    ],
+)
+def test_failure_precedence_over_interruption_materializes_valid_contract_result(
+    contract: ContractSet,
+    winning_gate: str,
+    reason: str,
+    expected_label: str,
+):
+    value = make_pass_result("workstation_offline")
+    for gate in value["gates"][1:23]:
+        gate.update(status="NOT_RUN", reason="INTERRUPTED_BEFORE_GATE")
+    blocker = next(gate for gate in value["gates"] if gate["id"] == winning_gate)
+    blocker.update(status="FAIL", reason=reason)
+
+    decision = ResultPolicy(contract).decide(
+        "workstation_offline", value["gates"], signal="TERM"
+    )
+    assert decision.label == expected_label
+    value.update(
+        label=decision.label,
+        status=decision.status,
+        exit_class=decision.exit_class,
+        process_exit_code=decision.exit_code,
+        primary_blocking_gate=decision.primary,
+        blocking_gates=list(decision.blocking_gates),
+        qualifications=list(decision.qualifications),
+    )
+
+    validation = contract.validate_result(value)
+    assert validation.ok, validation.errors
+
+
+@pytest.mark.parametrize("mode", tuple(PROFILE_GATES))
+def test_safety_override_still_rejects_a_mixed_not_run_interruption_suffix(
+    contract: ContractSet, mode: str
+):
+    value = make_pass_result(mode)
+    roles = dict(PROFILE_GATES[mode])
+    action_gates = [gate for gate in value["gates"] if roles[gate["id"]] != "finalizer"]
+    action_gates[0].update(status="FAIL", reason="SOURCE_MISMATCH")
+    for gate in action_gates[1:]:
+        gate.update(status="NOT_RUN", reason="INTERRUPTED_BEFORE_GATE")
+    safety_gate_id = (
+        "safety.pc2_postflight"
+        if mode.startswith("pc2_")
+        else "safety.workstation_postflight"
+    )
+    safety_gate = next(gate for gate in value["gates"] if gate["id"] == safety_gate_id)
+    safety_gate.update(status="FAIL", reason="POSTFLIGHT_FAILED")
+
+    decision = ResultPolicy(contract).decide(mode, value["gates"], signal="TERM")
+    assert decision.label == "FAIL_SAFETY"
+    action_gates[1]["reason"] = "EARLIER_BLOCKING_GATE"
+    with pytest.raises(ResultPolicyError, match="exact action interruption marker"):
+        ResultPolicy(contract).decide(mode, value["gates"], signal="TERM")
+    value.update(
+        label=decision.label,
+        status=decision.status,
+        exit_class=decision.exit_class,
+        process_exit_code=decision.exit_code,
+        primary_blocking_gate=decision.primary,
+        blocking_gates=list(decision.blocking_gates),
+        qualifications=list(decision.qualifications),
+    )
+
+    assert not contract.validate_result(value).ok
