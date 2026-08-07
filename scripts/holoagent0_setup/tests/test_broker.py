@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import socket
 import time
 
@@ -16,6 +17,8 @@ from holoagent0_setup.broker import (
     read_frame,
     write_frame,
 )
+from holoagent0_setup.contract import ContractSet
+from holoagent0_setup.ledger import _build_generation_zero
 
 
 IDENTITY = {
@@ -70,13 +73,16 @@ def test_canonical_frame_round_trip_over_anonymous_pipe():
     read_fd, write_fd = os.pipe()
     try:
         write_frame(write_fd, ready_message(), deadline=time.monotonic() + 0.2)
+        os.close(write_fd)
+        write_fd = -1
         assert (
             read_frame(read_fd, deadline=time.monotonic() + 0.2, exact_one=True)
             == ready_message()
         )
     finally:
         os.close(read_fd)
-        os.close(write_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
 
 
 @pytest.mark.parametrize(
@@ -141,6 +147,27 @@ def test_reader_times_out_on_partial_payload_while_writer_remains_open():
     payload = canonical_json_bytes(ready_message())
     with pytest.raises(BrokerProtocolError, match="timeout"):
         _read_raw(len(payload).to_bytes(4, "big") + payload[:3], keep_writer=True)
+
+
+def test_exact_one_requires_channel_eof_by_deadline():
+    read_fd, write_fd = os.pipe()
+    try:
+        write_frame(write_fd, ready_message(), deadline=time.monotonic() + 0.2)
+        with pytest.raises(BrokerProtocolError, match="timeout"):
+            read_frame(read_fd, deadline=time.monotonic() + 0.02, exact_one=True)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_multi_frame_channel_does_not_require_eof():
+    read_fd, write_fd = os.pipe()
+    try:
+        write_frame(write_fd, ready_message(), deadline=time.monotonic() + 0.2)
+        assert read_frame(read_fd, deadline=time.monotonic() + 0.2) == ready_message()
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
 
 
 def test_reader_and_writer_reject_socket_or_wrong_pipe_end_misuse():
@@ -213,25 +240,36 @@ def test_deadlines_and_exact_builtin_fd_and_message_types_are_enforced():
             write_frame(write_fd, dict(ready_message()), deadline=True)
         with pytest.raises(BrokerProtocolError, match="deadline"):
             read_frame(read_fd, deadline=time.monotonic() - 1)
+        with pytest.raises(BrokerProtocolError, match="interval"):
+            write_frame(write_fd, ready_message(), deadline=time.monotonic() + 3600)
+        with pytest.raises(BrokerProtocolError):
+            write_frame(write_fd, ready_message(), deadline=10**10000)
     finally:
         os.close(read_fd)
         os.close(write_fd)
 
 
 def test_writer_rejects_payload_over_reviewed_bound():
+    nonce = "b" * 64
     message = {
         "type": MessageType.LEDGER_CANDIDATE.value,
-        "run_nonce": "nonce",
+        "run_nonce": nonce,
         "sequence": 1,
         "generation": 1,
         "previous_generation": 0,
         "previous_digest": "a" * 64,
-        "candidate": {"padding": "x" * 4096},
+        "candidate": {
+            "ledger_nonce": nonce,
+            "generation": 1,
+            "previous_generation": 0,
+            "previous_digest": "a" * 64,
+            "padding": "x" * 4096,
+        },
     }
     read_fd, write_fd = os.pipe()
     try:
         with pytest.raises(BrokerProtocolError, match="bound"):
-            write_frame(write_fd, message)
+            write_frame(write_fd, message, ledger_validator=lambda _value: True)
     finally:
         os.close(read_fd)
         os.close(write_fd)
@@ -247,3 +285,45 @@ def test_validate_message_rejects_surrogate_ownership_role():
     }
     with pytest.raises(BrokerProtocolError):
         broker_module.validate_message(message)
+
+
+def test_ledger_candidate_requires_semantic_validator_and_exact_outer_binding():
+    contract_root = Path(__file__).resolve().parents[1]
+    contract = ContractSet(contract_root)
+    nonce = "b" * 64
+    ledger = _build_generation_zero("offline-run", nonce, contract)
+    message = {
+        "type": MessageType.LEDGER_CANDIDATE.value,
+        "run_nonce": nonce,
+        "sequence": 1,
+        "generation": 0,
+        "previous_generation": None,
+        "previous_digest": None,
+        "candidate": ledger,
+    }
+
+    with pytest.raises(BrokerProtocolError, match="validator"):
+        broker_module.validate_message(message)
+
+    def validate_ledger(value):
+        return contract.validate_document("holoagent0-offline-ledger-v1", value).ok
+
+    assert (
+        broker_module.validate_message(message, ledger_validator=validate_ledger)
+        == message
+    )
+    for field, wrong in [
+        ("run_nonce", "c" * 64),
+        ("generation", 1),
+        ("previous_generation", 0),
+        ("previous_digest", "d" * 64),
+    ]:
+        malformed = dict(message)
+        malformed[field] = wrong
+        with pytest.raises(BrokerProtocolError, match="binding"):
+            broker_module.validate_message(malformed, ledger_validator=validate_ledger)
+
+    malformed = dict(message)
+    malformed["candidate"] = dict(ledger, unexpected=True)
+    with pytest.raises(BrokerProtocolError, match="ledger"):
+        broker_module.validate_message(malformed, ledger_validator=validate_ledger)

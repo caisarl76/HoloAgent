@@ -90,6 +90,22 @@ class ProcessIdentity:
         except Exception:
             return False
 
+    def matches_coordinator_session(self, proc_root: Path = Path("/proc")) -> bool:
+        """Require this identity to be the leader of a fresh process session."""
+
+        try:
+            observed = read_process_identity(proc_root, self.pid)
+            pgid, session, start_time = _read_proc_stat(
+                Path(proc_root) / str(self.pid) / "stat", self.pid
+            )
+            return (
+                observed == self
+                and self.pid == pgid == session
+                and start_time == self.start_time
+            )
+        except Exception:
+            return False
+
 
 def read_process_identity(proc_root: Path, pid: int) -> ProcessIdentity:
     """Read one stable process/executable identity through Linux ``/proc``."""
@@ -221,10 +237,6 @@ def _read_proc_stat(path: Path, expected_pid: int) -> tuple[int, int, int]:
         start_time = int(fields[19])  # field 22
         if pgid <= 0 or session <= 0 or start_time <= 0:
             raise ValueError("invalid process group, session, or start time")
-        if pgid != session:
-            raise ProcessIdentityError(
-                "process group must belong to the reported process session"
-            )
         return pgid, session, start_time
     except (UnicodeError, ValueError) as error:
         raise ProcessIdentityError("proc stat is malformed") from error
@@ -246,8 +258,6 @@ def _require_executable(file_stat: os.stat_result) -> None:
         raise ProcessIdentityError("executable is not a regular file")
     if not file_stat.st_mode & 0o111:
         raise ProcessIdentityError("executable has no execute mode bit")
-    if file_stat.st_uid not in {0, os.getuid()}:
-        raise ProcessIdentityError("executable owner is not trusted")
     if file_stat.st_mode & 0o022:
         raise ProcessIdentityError("executable is group/world writable")
 

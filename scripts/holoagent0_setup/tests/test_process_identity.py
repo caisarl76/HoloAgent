@@ -121,14 +121,35 @@ def test_malformed_proc_stat_is_normalized(malformation, tmp_path):
         read_process_identity(proc_root, 321)
 
 
-def test_rejects_process_group_outside_reported_session(tmp_path):
+def test_generic_identity_accepts_process_group_distinct_from_session(tmp_path):
     executable = tmp_path / "coordinator"
     executable.write_bytes(b"stable")
     executable.chmod(0o700)
     proc_root = tmp_path / "proc"
     _write_proc_fixture(proc_root, executable, pgid=300, session=299)
-    with pytest.raises(ProcessIdentityError, match="session"):
-        read_process_identity(proc_root, 321)
+    identity = read_process_identity(proc_root, 321)
+    assert identity.pid == 321
+    assert identity.pgid == 300
+
+
+def test_reads_live_non_session_leader_process_group():
+    pid = os.posix_spawn(
+        "/usr/bin/python3.10",
+        ["/usr/bin/python3.10", "-c", "import time; time.sleep(0.4)"],
+        os.environ,
+        setpgroup=0,
+    )
+    try:
+        assert os.getpgid(pid) == pid
+        assert os.getsid(pid) != pid
+        identity = read_process_identity(Path("/proc"), pid)
+        assert identity.pid == identity.pgid == pid
+        assert identity.matches_proc()
+        assert not identity.matches_coordinator_session()
+    finally:
+        waited_pid, status = os.waitpid(pid, 0)
+        assert waited_pid == pid
+        assert os.waitstatus_to_exitcode(status) == 0
 
 
 def test_rejects_symlinked_executable_target_non_executable_and_content_change(

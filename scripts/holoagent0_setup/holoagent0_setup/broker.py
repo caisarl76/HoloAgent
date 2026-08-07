@@ -10,6 +10,7 @@ from pathlib import Path
 import select
 import stat
 import time
+from typing import Callable
 
 from holoagent0_setup.atomic_io import (
     AtomicIOError,
@@ -34,6 +35,7 @@ class MessageType(str, Enum):
 
 MAX_PAYLOAD_BYTES = 4096
 _DEFAULT_TIMEOUT_SECONDS = 1.0
+_MAX_DEADLINE_INTERVAL_SECONDS = 30.0
 _SIGNALS = ["HUP", "INT", "TERM"]
 _IDENTITY_KEYS = {
     "pid",
@@ -85,21 +87,25 @@ _MESSAGE_KEYS = {
 
 
 def write_frame(
-    fd: int, message: object, *, deadline: int | float | None = None
+    fd: int,
+    message: object,
+    *,
+    deadline: int | float | None = None,
+    ledger_validator: Callable[[dict[str, object]], bool] | None = None,
 ) -> None:
     """Write one canonical length-prefixed message before an absolute deadline."""
 
     _require_fd(fd)
     _require_anonymous_pipe(fd, readable=False)
     absolute_deadline = _deadline(deadline)
-    validated = validate_message(message)
+    validated = validate_message(message, ledger_validator=ledger_validator)
     try:
         payload = canonical_json_bytes(validated)
     except (CanonicalJSONError, RuntimeError) as error:
         raise BrokerProtocolError("message cannot be encoded canonically") from error
     if not payload or len(payload) > MAX_PAYLOAD_BYTES:
         raise BrokerProtocolError("frame exceeds reviewed bound")
-    _decode_canonical_message(payload)
+    _decode_canonical_message(payload, ledger_validator=ledger_validator)
     _write_all(fd, len(payload).to_bytes(4, "big") + payload, absolute_deadline)
 
 
@@ -108,6 +114,7 @@ def read_frame(
     *,
     deadline: int | float | None = None,
     exact_one: bool = False,
+    ledger_validator: Callable[[dict[str, object]], bool] | None = None,
 ) -> dict[str, object]:
     """Read and validate one canonical message from an anonymous pipe."""
 
@@ -123,13 +130,17 @@ def read_frame(
     if length > MAX_PAYLOAD_BYTES:
         raise BrokerProtocolError("frame exceeds reviewed bound")
     payload = _read_exact(fd, length, absolute_deadline, "payload")
-    message = _decode_canonical_message(payload)
+    message = _decode_canonical_message(payload, ledger_validator=ledger_validator)
     if exact_one:
-        _reject_trailing_data(fd)
+        _require_channel_eof(fd, absolute_deadline)
     return message
 
 
-def validate_message(message: object) -> dict[str, object]:
+def validate_message(
+    message: object,
+    *,
+    ledger_validator: Callable[[dict[str, object]], bool] | None = None,
+) -> dict[str, object]:
     """Validate and return one exact closed protocol object."""
 
     if type(message) is not dict:
@@ -181,6 +192,22 @@ def validate_message(message: object) -> dict[str, object]:
             _require_digest(digest, "previous_digest")
         if type(message["candidate"]) is not dict:
             raise BrokerProtocolError("ledger candidate must be an exact object")
+        candidate = message["candidate"]
+        if ledger_validator is None:
+            raise BrokerProtocolError("ledger candidate validator is required")
+        try:
+            valid_ledger = ledger_validator(candidate)
+        except Exception as error:
+            raise BrokerProtocolError("ledger candidate validator failed") from error
+        if valid_ledger is not True:
+            raise BrokerProtocolError("ledger candidate failed closed validation")
+        if (
+            candidate.get("ledger_nonce") != message["run_nonce"]
+            or candidate.get("generation") != message["generation"]
+            or candidate.get("previous_generation") != message["previous_generation"]
+            or candidate.get("previous_digest") != message["previous_digest"]
+        ):
+            raise BrokerProtocolError("ledger candidate outer binding mismatch")
     elif message_type is MessageType.LEDGER_ACCEPTED:
         _require_sequence(message["sequence"], "sequence")
         _require_nonnegative_integer(message["generation"], "generation")
@@ -194,10 +221,14 @@ def validate_message(message: object) -> dict[str, object]:
     return message
 
 
-def _decode_canonical_message(payload: bytes) -> dict[str, object]:
+def _decode_canonical_message(
+    payload: bytes,
+    *,
+    ledger_validator: Callable[[dict[str, object]], bool] | None = None,
+) -> dict[str, object]:
     try:
         value = _decode_canonical_json(payload, Path("<broker-frame>"))
-        return validate_message(value)
+        return validate_message(value, ledger_validator=ledger_validator)
     except BrokerProtocolError:
         raise
     except AtomicIOError as error:
@@ -272,11 +303,20 @@ def _require_anonymous_pipe(fd: int, *, readable: bool) -> None:
 def _deadline(value: int | float | None) -> float:
     if value is None:
         return time.monotonic() + _DEFAULT_TIMEOUT_SECONDS
-    if type(value) not in {int, float} or not math.isfinite(value):
+    if type(value) not in {int, float}:
         raise BrokerProtocolError("deadline must be an exact finite number")
-    absolute = float(value)
-    if absolute <= time.monotonic():
+    try:
+        finite = math.isfinite(value)
+        absolute = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise BrokerProtocolError("deadline conversion failed") from error
+    if not finite:
+        raise BrokerProtocolError("deadline must be an exact finite number")
+    now = time.monotonic()
+    if absolute <= now:
         raise BrokerProtocolError("broker deadline has expired")
+    if absolute - now > _MAX_DEADLINE_INTERVAL_SECONDS:
+        raise BrokerProtocolError("broker deadline exceeds the reviewed interval")
     return absolute
 
 
@@ -291,7 +331,7 @@ def _wait(fd: int, *, readable: bool, deadline: float) -> None:
             )
         except InterruptedError:
             continue
-        except OSError as error:
+        except (OSError, OverflowError, ValueError) as error:
             raise BrokerProtocolError("broker descriptor polling failed") from error
         if readers or writers:
             return
@@ -332,16 +372,21 @@ def _write_all(fd: int, data: bytes, deadline: float) -> None:
         offset += written
 
 
-def _reject_trailing_data(fd: int) -> None:
+def _require_channel_eof(fd: int, deadline: float) -> None:
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BrokerProtocolError("broker timeout waiting for channel EOF")
         try:
-            readers, _writers, _errors = select.select([fd], [], [], 0)
+            readers, _writers, _errors = select.select([fd], [], [], remaining)
             if not readers:
-                return
+                raise BrokerProtocolError("broker timeout waiting for channel EOF")
             trailing = os.read(fd, 1)
         except InterruptedError:
             continue
-        except OSError as error:
+        except BrokerProtocolError:
+            raise
+        except (OSError, OverflowError, ValueError) as error:
             raise BrokerProtocolError("broker trailing-data check failed") from error
         if trailing:
             raise BrokerProtocolError("broker frame has trailing data")
