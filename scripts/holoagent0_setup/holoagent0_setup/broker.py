@@ -1,0 +1,348 @@
+"""Bounded canonical messages over reviewed anonymous pipes only."""
+
+from __future__ import annotations
+
+from enum import Enum
+import fcntl
+import math
+import os
+from pathlib import Path
+import select
+import stat
+import time
+
+from holoagent0_setup.atomic_io import (
+    AtomicIOError,
+    CanonicalJSONError,
+    _decode_canonical_json,
+    canonical_json_bytes,
+)
+from holoagent0_setup.process_identity import ProcessIdentity, ProcessIdentityError
+
+
+class BrokerProtocolError(RuntimeError):
+    """A broker frame or local pipe operation violated the closed protocol."""
+
+
+class MessageType(str, Enum):
+    SIGNAL_READY = "SIGNAL_READY"
+    SIGNAL_READY_ACCEPTED = "SIGNAL_READY_ACCEPTED"
+    LEDGER_CANDIDATE = "LEDGER_CANDIDATE"
+    LEDGER_ACCEPTED = "LEDGER_ACCEPTED"
+    OWNERSHIP_RECORD = "OWNERSHIP_RECORD"
+
+
+MAX_PAYLOAD_BYTES = 4096
+_DEFAULT_TIMEOUT_SECONDS = 1.0
+_SIGNALS = ["HUP", "INT", "TERM"]
+_IDENTITY_KEYS = {
+    "pid",
+    "pgid",
+    "start_time",
+    "executable_path",
+    "executable_sha256",
+}
+_MESSAGE_KEYS = {
+    MessageType.SIGNAL_READY: {
+        "type",
+        "run_nonce",
+        "sequence",
+        "identity",
+        "blocked_signals",
+        "dispositions",
+    },
+    MessageType.SIGNAL_READY_ACCEPTED: {
+        "type",
+        "run_nonce",
+        "identity",
+        "request_sequence",
+        "request_sha256",
+    },
+    MessageType.LEDGER_CANDIDATE: {
+        "type",
+        "run_nonce",
+        "sequence",
+        "generation",
+        "previous_generation",
+        "previous_digest",
+        "candidate",
+    },
+    MessageType.LEDGER_ACCEPTED: {
+        "type",
+        "run_nonce",
+        "sequence",
+        "generation",
+        "ledger_sha256",
+    },
+    MessageType.OWNERSHIP_RECORD: {
+        "type",
+        "run_nonce",
+        "sequence",
+        "identity",
+        "role",
+    },
+}
+
+
+def write_frame(
+    fd: int, message: object, *, deadline: int | float | None = None
+) -> None:
+    """Write one canonical length-prefixed message before an absolute deadline."""
+
+    _require_fd(fd)
+    _require_anonymous_pipe(fd, readable=False)
+    absolute_deadline = _deadline(deadline)
+    validated = validate_message(message)
+    try:
+        payload = canonical_json_bytes(validated)
+    except (CanonicalJSONError, RuntimeError) as error:
+        raise BrokerProtocolError("message cannot be encoded canonically") from error
+    if not payload or len(payload) > MAX_PAYLOAD_BYTES:
+        raise BrokerProtocolError("frame exceeds reviewed bound")
+    _decode_canonical_message(payload)
+    _write_all(fd, len(payload).to_bytes(4, "big") + payload, absolute_deadline)
+
+
+def read_frame(
+    fd: int,
+    *,
+    deadline: int | float | None = None,
+    exact_one: bool = False,
+) -> dict[str, object]:
+    """Read and validate one canonical message from an anonymous pipe."""
+
+    _require_fd(fd)
+    if type(exact_one) is not bool:
+        raise BrokerProtocolError("exact_one must be an exact boolean")
+    _require_anonymous_pipe(fd, readable=True)
+    absolute_deadline = _deadline(deadline)
+    prefix = _read_exact(fd, 4, absolute_deadline, "length prefix")
+    length = int.from_bytes(prefix, "big")
+    if length == 0:
+        raise BrokerProtocolError("zero-length frames are prohibited")
+    if length > MAX_PAYLOAD_BYTES:
+        raise BrokerProtocolError("frame exceeds reviewed bound")
+    payload = _read_exact(fd, length, absolute_deadline, "payload")
+    message = _decode_canonical_message(payload)
+    if exact_one:
+        _reject_trailing_data(fd)
+    return message
+
+
+def validate_message(message: object) -> dict[str, object]:
+    """Validate and return one exact closed protocol object."""
+
+    if type(message) is not dict:
+        raise BrokerProtocolError("broker message must be an exact object")
+    message_type_value = message.get("type")
+    if type(message_type_value) is not str:
+        raise BrokerProtocolError("broker message type must be an exact string")
+    try:
+        message_type = MessageType(message_type_value)
+    except ValueError as error:
+        raise BrokerProtocolError("unknown broker message type") from error
+    if set(message) != _MESSAGE_KEYS[message_type] or any(
+        type(key) is not str for key in message
+    ):
+        raise BrokerProtocolError("broker message keys are not closed")
+    _require_nonce(message["run_nonce"])
+
+    if message_type is MessageType.SIGNAL_READY:
+        _require_sequence(message["sequence"], "sequence")
+        _require_identity(message["identity"])
+        if (
+            type(message["blocked_signals"]) is not list
+            or message["blocked_signals"] != _SIGNALS
+        ):
+            raise BrokerProtocolError("blocked signal mask is not exact")
+        dispositions = message["dispositions"]
+        if (
+            type(dispositions) is not dict
+            or set(dispositions) != set(_SIGNALS)
+            or any(
+                type(value) is not bool or not value for value in dispositions.values()
+            )
+        ):
+            raise BrokerProtocolError(
+                "signal dispositions are not exact and successful"
+            )
+    elif message_type is MessageType.SIGNAL_READY_ACCEPTED:
+        _require_identity(message["identity"])
+        _require_sequence(message["request_sequence"], "request_sequence")
+        _require_digest(message["request_sha256"], "request_sha256")
+    elif message_type is MessageType.LEDGER_CANDIDATE:
+        _require_sequence(message["sequence"], "sequence")
+        _require_nonnegative_integer(message["generation"], "generation")
+        previous = message["previous_generation"]
+        if previous is not None:
+            _require_nonnegative_integer(previous, "previous_generation")
+        digest = message["previous_digest"]
+        if digest is not None:
+            _require_digest(digest, "previous_digest")
+        if type(message["candidate"]) is not dict:
+            raise BrokerProtocolError("ledger candidate must be an exact object")
+    elif message_type is MessageType.LEDGER_ACCEPTED:
+        _require_sequence(message["sequence"], "sequence")
+        _require_nonnegative_integer(message["generation"], "generation")
+        _require_digest(message["ledger_sha256"], "ledger_sha256")
+    else:
+        _require_sequence(message["sequence"], "sequence")
+        _require_identity(message["identity"])
+        role = message["role"]
+        if type(role) is not str or not role or _utf8_length(role, "role") > 128:
+            raise BrokerProtocolError("ownership role is invalid")
+    return message
+
+
+def _decode_canonical_message(payload: bytes) -> dict[str, object]:
+    try:
+        value = _decode_canonical_json(payload, Path("<broker-frame>"))
+        return validate_message(value)
+    except BrokerProtocolError:
+        raise
+    except AtomicIOError as error:
+        raise BrokerProtocolError("frame contains invalid canonical JSON") from error
+
+
+def _require_identity(value: object) -> None:
+    if type(value) is not dict or set(value) != _IDENTITY_KEYS:
+        raise BrokerProtocolError("process identity is not a closed object")
+    try:
+        ProcessIdentity.from_dict(value)
+    except ProcessIdentityError as error:
+        raise BrokerProtocolError("process identity is invalid") from error
+
+
+def _require_nonce(value: object) -> None:
+    if type(value) is not str or not value or _utf8_length(value, "run nonce") > 256:
+        raise BrokerProtocolError("run nonce is invalid")
+
+
+def _utf8_length(value: str, name: str) -> int:
+    try:
+        return len(value.encode("utf-8", errors="strict"))
+    except UnicodeError as error:
+        raise BrokerProtocolError(f"{name} contains invalid Unicode") from error
+
+
+def _require_sequence(value: object, name: str) -> None:
+    if type(value) is not int or value <= 0:
+        raise BrokerProtocolError(f"{name} must be an exact positive integer")
+
+
+def _require_nonnegative_integer(value: object, name: str) -> None:
+    if type(value) is not int or value < 0:
+        raise BrokerProtocolError(f"{name} must be an exact nonnegative integer")
+
+
+def _require_digest(value: object, name: str) -> None:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise BrokerProtocolError(f"{name} must be lowercase SHA-256")
+
+
+def _require_fd(fd: object) -> None:
+    if type(fd) is not int or fd < 0:
+        raise BrokerProtocolError(
+            "file descriptor must be an exact nonnegative integer"
+        )
+
+
+def _require_anonymous_pipe(fd: int, *, readable: bool) -> None:
+    try:
+        file_stat = os.fstat(fd)
+        target = os.readlink(f"/proc/self/fd/{fd}")
+        access_mode = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+    except OSError as error:
+        raise BrokerProtocolError("broker descriptor is invalid") from error
+    if (
+        not stat.S_ISFIFO(file_stat.st_mode)
+        or not target.startswith("pipe:[")
+        or not target.endswith("]")
+    ):
+        raise BrokerProtocolError("broker descriptor is not an anonymous pipe")
+    expected_mode = os.O_RDONLY if readable else os.O_WRONLY
+    if access_mode != expected_mode:
+        raise BrokerProtocolError("broker descriptor uses the wrong pipe end")
+
+
+def _deadline(value: int | float | None) -> float:
+    if value is None:
+        return time.monotonic() + _DEFAULT_TIMEOUT_SECONDS
+    if type(value) not in {int, float} or not math.isfinite(value):
+        raise BrokerProtocolError("deadline must be an exact finite number")
+    absolute = float(value)
+    if absolute <= time.monotonic():
+        raise BrokerProtocolError("broker deadline has expired")
+    return absolute
+
+
+def _wait(fd: int, *, readable: bool, deadline: float) -> None:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BrokerProtocolError("broker timeout")
+        try:
+            readers, writers, _errors = select.select(
+                [fd] if readable else [], [] if readable else [fd], [], remaining
+            )
+        except InterruptedError:
+            continue
+        except OSError as error:
+            raise BrokerProtocolError("broker descriptor polling failed") from error
+        if readers or writers:
+            return
+        raise BrokerProtocolError("broker timeout")
+
+
+def _read_exact(fd: int, size: int, deadline: float, part: str) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        _wait(fd, readable=True, deadline=deadline)
+        try:
+            chunk = os.read(fd, remaining)
+        except InterruptedError:
+            continue
+        except OSError as error:
+            raise BrokerProtocolError(f"broker {part} read failed") from error
+        if not chunk:
+            raise BrokerProtocolError(f"broker EOF during {part}")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _write_all(fd: int, data: bytes, deadline: float) -> None:
+    view = memoryview(data)
+    offset = 0
+    while offset < len(view):
+        _wait(fd, readable=False, deadline=deadline)
+        try:
+            written = os.write(fd, view[offset:])
+        except InterruptedError:
+            continue
+        except OSError as error:
+            raise BrokerProtocolError("broker frame write failed") from error
+        if written <= 0:
+            raise BrokerProtocolError("broker frame write made no progress")
+        offset += written
+
+
+def _reject_trailing_data(fd: int) -> None:
+    while True:
+        try:
+            readers, _writers, _errors = select.select([fd], [], [], 0)
+            if not readers:
+                return
+            trailing = os.read(fd, 1)
+        except InterruptedError:
+            continue
+        except OSError as error:
+            raise BrokerProtocolError("broker trailing-data check failed") from error
+        if trailing:
+            raise BrokerProtocolError("broker frame has trailing data")
+        return

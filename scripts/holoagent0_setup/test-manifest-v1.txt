@@ -3,3 +3,6 @@ scripts/holoagent0_setup/tests/test_contract.py
 scripts/holoagent0_setup/tests/test_atomic_io.py
 scripts/holoagent0_setup/tests/test_result_policy.py
 scripts/holoagent0_setup/tests/test_ledger.py
+scripts/holoagent0_setup/tests/test_broker.py
+scripts/holoagent0_setup/tests/test_process_identity.py
+scripts/holoagent0_setup/tests/test_signal_handoff.py
