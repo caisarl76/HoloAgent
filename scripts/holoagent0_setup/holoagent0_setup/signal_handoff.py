@@ -542,7 +542,7 @@ class SupervisorSignalHandoff:
         """Read one request and authorize only after complete response write."""
 
         with self._lock:
-            self._require_nonterminal()
+            self._require_ready_acceptance_open()
         try:
             message = read_frame(request_read_fd, deadline=deadline, exact_one=True)
             request = SignalReady.from_message(message)
@@ -552,7 +552,7 @@ class SupervisorSignalHandoff:
                     self._fail_locked("ready request read failed")
             raise SignalHandoffError("ready request read failed") from error
         with self._lock:
-            self._require_nonterminal()
+            self._require_ready_acceptance_open()
             try:
                 self._validate_request(request)
             except SignalHandoffError as error:
@@ -569,7 +569,7 @@ class SupervisorSignalHandoff:
             except (BrokerProtocolError, OSError, SignalHandoffError) as error:
                 self._fail_locked("acceptance response write failed")
                 raise SignalHandoffError("acceptance response write failed") from error
-            self._acceptance_count += 1
+            self._acceptance_count = 1
             self._next_sequence += 1
             self._last_accepted_identity = request.identity
             self._state = "READY"
@@ -659,6 +659,14 @@ class SupervisorSignalHandoff:
             raise SignalHandoffError(
                 f"terminal supervisor state is immutable: {self._terminal_state}"
             )
+
+    def _require_ready_acceptance_open(self) -> None:
+        self._require_nonterminal()
+        if self._acceptance_count != 0 or self._state not in {
+            "AWAITING_READY",
+            "PENDING_FORWARD",
+        }:
+            raise SignalHandoffError("readiness already accepted")
 
     def _event(self, name: str) -> None:
         self._events.append(HandoffEvent(len(self._events), name, self._state))

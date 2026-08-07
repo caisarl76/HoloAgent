@@ -9,6 +9,7 @@ import time
 
 import pytest
 
+import holoagent0_setup.signal_handoff as signal_handoff_module
 from holoagent0_setup.broker import write_frame
 from holoagent0_setup.process_identity import ProcessIdentity
 from holoagent0_setup.signal_handoff import (
@@ -480,52 +481,50 @@ def test_valid_trace_evidence_finalizes_zero_and_nonzero_functional_runs(identit
     )
 
 
-def test_supervisor_tracks_multiple_sequences_then_rejects_replay(identity):
-    supervisor = _supervisor(identity)
-    requests = []
-    for sequence in (1, 2):
-        coordinator = _coordinator(identity, first_sequence=sequence)
-        request, request_read = _send_request(coordinator)
-        requests.append(request)
-        try:
-            _acceptance, response_read = _accept_request(supervisor, request_read)
-            os.close(response_read)
-        finally:
-            os.close(request_read)
-    assert supervisor.snapshot().acceptance_count == 2
-    assert supervisor.snapshot().next_sequence == 3
+def test_supervisor_rejects_later_readiness_without_mutating_authorization(
+    identity, monkeypatch
+):
+    forwarded = []
+    supervisor = _supervisor(identity, forwarded=forwarded)
+    supervisor.collect_signal("TERM")
+    _first_request, first_read = _send_request(_coordinator(identity))
+    _second_request, second_read = _send_request(
+        _coordinator(identity, first_sequence=2)
+    )
+    writer_calls = []
+    real_write_frame = signal_handoff_module.write_frame
 
-    replay_read, replay_write = os.pipe()
-    response_read, response_write = os.pipe()
+    def count_write(*args, **kwargs):
+        writer_calls.append((args, kwargs))
+        return real_write_frame(*args, **kwargs)
+
+    monkeypatch.setattr(signal_handoff_module, "write_frame", count_write)
     try:
-        write_frame(
-            replay_write,
-            requests[0].as_message(),
-            deadline=time.monotonic() + 0.2,
-        )
-        os.close(replay_write)
-        replay_write = -1
-        with pytest.raises(SignalHandoffError, match="sequence"):
-            supervisor.receive_and_accept(
-                replay_read,
-                response_write,
-                deadline=time.monotonic() + 0.2,
-            )
+        _acceptance, first_response_read = _accept_request(supervisor, first_read)
+        os.close(first_response_read)
+        accepted = supervisor.snapshot()
+
+        with pytest.raises(SignalHandoffError, match="already accepted"):
+            _accept_request(supervisor, second_read)
     finally:
-        os.close(replay_read)
-        os.close(response_read)
-        os.close(response_write)
-        if replay_write >= 0:
-            os.close(replay_write)
-    assert supervisor.snapshot().acceptance_count == 2
-    assert supervisor.snapshot().terminal_state == "FAILED"
+        os.close(first_read)
+        os.close(second_read)
+    assert accepted.acceptance_count == accepted.forward_count == 1
+    assert accepted.next_sequence == 2
+    assert supervisor.snapshot() == accepted
+    assert len(writer_calls) == 1
+    assert forwarded == [(identity.pgid, "TERM")]
 
 
-def test_concurrent_duplicate_requests_authorize_exactly_one(identity):
+def test_concurrent_duplicate_requests_authorize_exactly_one_without_loser_mutation(
+    identity, monkeypatch
+):
     source = _coordinator(identity)
     request, original_read = _send_request(source)
     os.close(original_read)
-    supervisor = _supervisor(identity)
+    forwarded = []
+    supervisor = _supervisor(identity, forwarded=forwarded)
+    supervisor.collect_signal("INT")
     channels = []
     for _index in range(2):
         request_read, request_write = os.pipe()
@@ -538,6 +537,15 @@ def test_concurrent_duplicate_requests_authorize_exactly_one(identity):
         os.close(request_write)
         channels.append((request_read, response_read, response_write))
 
+    writer_calls = []
+    real_write_frame = signal_handoff_module.write_frame
+
+    def count_write(*args, **kwargs):
+        writer_calls.append((args, kwargs))
+        return real_write_frame(*args, **kwargs)
+
+    monkeypatch.setattr(signal_handoff_module, "write_frame", count_write)
+
     def accept(channel):
         request_read, _response_read, response_write = channel
         try:
@@ -547,8 +555,8 @@ def test_concurrent_duplicate_requests_authorize_exactly_one(identity):
                 deadline=time.monotonic() + 0.5,
             )
             return "accepted"
-        except SignalHandoffError:
-            return "rejected"
+        except SignalHandoffError as error:
+            return str(error)
 
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -558,9 +566,20 @@ def test_concurrent_duplicate_requests_authorize_exactly_one(identity):
             os.close(request_read)
             os.close(response_read)
             os.close(response_write)
-    assert sorted(outcomes) == ["accepted", "rejected"]
-    assert supervisor.snapshot().acceptance_count == 1
-    assert supervisor.snapshot().terminal_state == "FAILED"
+    assert sorted(outcomes) == ["accepted", "readiness already accepted"]
+    snapshot = supervisor.snapshot()
+    assert snapshot.state == "READY"
+    assert snapshot.terminal_state is None
+    assert snapshot.next_sequence == 2
+    assert snapshot.acceptance_count == snapshot.forward_count == 1
+    assert [event.name for event in snapshot.events] == [
+        "signal_latched",
+        "ready_request_validated",
+        "acceptance_write",
+        "signal_forward",
+    ]
+    assert len(writer_calls) == 1
+    assert forwarded == [(identity.pgid, "INT")]
 
 
 def test_terminal_role_states_are_immutable(identity):
