@@ -1,4 +1,4 @@
-"""Thread-safe, pipe-bound signal-readiness and forwarding barrier."""
+"""Separate coordinator and supervisor roles for signal-readiness handoff."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from holoagent0_setup.process_identity import ProcessIdentity, ProcessIdentityEr
 
 
 class SignalHandoffError(RuntimeError):
-    """The signal-readiness barrier failed closed."""
+    """A role-local signal-readiness transition failed closed."""
 
 
 _SIGNAL_SET = frozenset({"HUP", "INT", "TERM"})
@@ -30,24 +30,21 @@ _SIGNAL_NUMBERS = {
     "INT": signal.SIGINT,
     "TERM": signal.SIGTERM,
 }
-_LIVE_STATES = {
-    "AWAITING_READY",
-    "AWAITING_ACCEPTANCE",
-    "PENDING_FORWARD",
-    "READY",
-}
 
 
 @dataclass(frozen=True)
 class SignalObservation:
-    """One actual or narrowly injected signal-mask/disposition observation."""
+    """Observed state of the three reviewed signals in the current thread."""
 
     blocked_signals: frozenset[str]
     dispositions: tuple[tuple[str, bool], tuple[str, bool], tuple[str, bool]]
+    handler_tokens: tuple[object, object, object] | None = None
 
     def __post_init__(self) -> None:
-        if type(self.blocked_signals) is not frozenset or any(
-            type(name) is not str for name in self.blocked_signals
+        if (
+            type(self.blocked_signals) is not frozenset
+            or not self.blocked_signals.issubset(_SIGNAL_SET)
+            or any(type(name) is not str for name in self.blocked_signals)
         ):
             raise SignalHandoffError("observed signal mask is not exact")
         if type(self.dispositions) is not tuple or any(
@@ -60,6 +57,12 @@ class SignalObservation:
             raise SignalHandoffError("observed dispositions are not exact")
         if tuple(item[0] for item in self.dispositions) != _SIGNAL_ORDER:
             raise SignalHandoffError("observed dispositions are not closed")
+        if (
+            self.handler_tokens is None
+            or type(self.handler_tokens) is not tuple
+            or len(self.handler_tokens) != 3
+        ):
+            raise SignalHandoffError("observed handler identities are not exact")
 
 
 @dataclass(frozen=True)
@@ -97,11 +100,10 @@ class SignalReady:
             value = validate_message(message)
             if value["type"] != MessageType.SIGNAL_READY.value:
                 raise SignalHandoffError("pipe message is not SIGNAL_READY")
-            identity = ProcessIdentity.from_dict(value["identity"])
             return cls(
                 run_nonce=value["run_nonce"],
                 sequence=value["sequence"],
-                identity=identity,
+                identity=ProcessIdentity.from_dict(value["identity"]),
                 blocked_signals=tuple(value["blocked_signals"]),
                 dispositions=tuple(
                     (name, value["dispositions"][name]) for name in _SIGNAL_ORDER
@@ -158,37 +160,35 @@ class SignalReadyAccepted:
 
 @dataclass(frozen=True)
 class TraceUnblockEvidence:
-    """Immutable binding asserted by a later trace-observation boundary."""
+    """Untrusted trace claim passed to a mandatory trusted verifier."""
 
     run_nonce: str
     identity: ProcessIdentity
     request_sequence: int
     request_sha256: str
-    unblocked_signals: tuple[str, str, str]
-    trace_record_index: int
+    unblock_trace_record_index: int
+    first_functional_trace_record_index: int | None
+    functional_count: int
 
     def __post_init__(self) -> None:
-        if type(self.run_nonce) is not str or not self.run_nonce:
-            raise SignalHandoffError("trace evidence nonce is invalid")
+        _require_nonce(self.run_nonce)
         if type(self.identity) is not ProcessIdentity:
             raise SignalHandoffError("trace evidence identity is invalid")
         if type(self.request_sequence) is not int or self.request_sequence <= 0:
             raise SignalHandoffError("trace evidence sequence is invalid")
+        _require_digest(self.request_sha256, "trace evidence request digest")
         if (
-            type(self.request_sha256) is not str
-            or len(self.request_sha256) != 64
-            or any(
-                character not in "0123456789abcdef" for character in self.request_sha256
-            )
+            type(self.unblock_trace_record_index) is not int
+            or self.unblock_trace_record_index < 0
         ):
-            raise SignalHandoffError("trace evidence digest is invalid")
-        if (
-            type(self.unblocked_signals) is not tuple
-            or self.unblocked_signals != _SIGNAL_ORDER
+            raise SignalHandoffError("trace unblock index is invalid")
+        functional_index = self.first_functional_trace_record_index
+        if functional_index is not None and (
+            type(functional_index) is not int or functional_index < 0
         ):
-            raise SignalHandoffError("trace evidence unblock mask is invalid")
-        if type(self.trace_record_index) is not int or self.trace_record_index < 0:
-            raise SignalHandoffError("trace evidence index is invalid")
+            raise SignalHandoffError("first functional trace index is invalid")
+        if type(self.functional_count) is not int or self.functional_count < 0:
+            raise SignalHandoffError("trace functional count is invalid")
 
 
 @dataclass(frozen=True)
@@ -198,409 +198,265 @@ class HandoffEvent:
     state: str
 
 
-class SignalHandoff:
-    """One lock protects immutable bindings, callbacks, counts, and event order."""
+@dataclass(frozen=True)
+class CoordinatorSnapshot:
+    role: str
+    state: str
+    terminal_state: str | None
+    request_sequence: int | None
+    request_sha256: str | None
+    acceptance_validated: bool
+    unblock_count: int
+    functional_count: int
+    events: tuple[HandoffEvent, ...]
+
+
+@dataclass(frozen=True)
+class SupervisorSnapshot:
+    role: str
+    state: str
+    terminal_state: str | None
+    next_sequence: int
+    acceptance_count: int
+    forward_count: int
+    pending_signal: str | None
+    forward_target_pgid: int | None
+    events: tuple[HandoffEvent, ...]
+
+
+class _OSSignalOperations:
+    def observe(self) -> SignalObservation:
+        try:
+            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            blocked_names = frozenset(
+                name for name, number in _SIGNAL_NUMBERS.items() if number in blocked
+            )
+            handlers = tuple(
+                signal.getsignal(number) for number in _SIGNAL_NUMBERS.values()
+            )
+            dispositions = tuple(
+                (name, callable(handler))
+                for name, handler in zip(_SIGNAL_ORDER, handlers)
+            )
+            return SignalObservation(blocked_names, dispositions, handlers)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise SignalHandoffError(
+                "could not observe current signal state"
+            ) from error
+
+    def unblock_reviewed(self) -> None:
+        try:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, set(_SIGNAL_NUMBERS.values()))
+        except (OSError, RuntimeError, ValueError) as error:
+            raise SignalHandoffError("could not unblock reviewed signals") from error
+
+
+class CoordinatorSignalHandoff:
+    """Coordinator-local request, acceptance, unblock, and progression state."""
 
     def __init__(
         self,
         run_nonce: str,
+        identity: ProcessIdentity,
         *,
-        identity_validator: Callable[[ProcessIdentity], bool] | None = None,
-        signal_observer: Callable[[], SignalObservation] | None = None,
-        acceptance_writer: Callable[[SignalReadyAccepted], object] | None = None,
-        forwarder: Callable[[int, str], object] | None = None,
+        trace_verifier: Callable[[TraceUnblockEvidence], bool] | None = None,
+        signal_operations: object | None = None,
         first_sequence: int = 1,
     ) -> None:
-        if type(run_nonce) is not str or not run_nonce:
-            raise SignalHandoffError("run nonce must be a non-empty exact string")
-        try:
-            nonce_size = len(run_nonce.encode("utf-8", errors="strict"))
-        except UnicodeError as error:
-            raise SignalHandoffError("run nonce contains invalid Unicode") from error
-        if nonce_size > 256:
-            raise SignalHandoffError("run nonce exceeds the reviewed byte bound")
+        _require_nonce(run_nonce)
+        if type(identity) is not ProcessIdentity or identity.pid != identity.pgid:
+            raise SignalHandoffError("coordinator identity must lead its process group")
+        if trace_verifier is None or not callable(trace_verifier):
+            raise SignalHandoffError("a trusted trace verifier is mandatory")
         if type(first_sequence) is not int or first_sequence <= 0:
-            raise SignalHandoffError("first sequence must be an exact positive integer")
-        for callback in (
-            identity_validator,
-            signal_observer,
-            acceptance_writer,
-            forwarder,
+            raise SignalHandoffError("first sequence must be positive")
+        operations = signal_operations or _OSSignalOperations()
+        if not callable(getattr(operations, "observe", None)) or not callable(
+            getattr(operations, "unblock_reviewed", None)
         ):
-            if callback is not None and not callable(callback):
-                raise SignalHandoffError("handoff callbacks must be callable")
+            raise SignalHandoffError("signal operations interface is incomplete")
         self._lock = RLock()
         self._run_nonce = run_nonce
-        self._identity_validator = identity_validator or (
-            lambda identity: identity.matches_coordinator_session()
-        )
-        self._signal_observer = signal_observer or _observe_current_signals
-        self._acceptance_writer = acceptance_writer or (lambda _acceptance: None)
-        self._forwarder = forwarder or (lambda _pgid, _signal_name: None)
+        self._identity = identity
+        self._trace_verifier = trace_verifier
+        self._signal_operations = operations
         self._next_sequence = first_sequence
         self._state = "AWAITING_READY"
         self._terminal_state: str | None = None
-        self._request: SignalReady | None = None
-        self._expected_acceptance: SignalReadyAccepted | None = None
-        self._acceptance_written = False
+        self._sent_request: SignalReady | None = None
+        self._installed_dispositions: (
+            tuple[tuple[str, bool], tuple[str, bool], tuple[str, bool]] | None
+        ) = None
+        self._installed_handler_tokens: tuple[object, object, object] | None = None
         self._acceptance_validated = False
-        self._trace_evidence: TraceUnblockEvidence | None = None
-        self._pending_signal: str | None = None
-        self._acceptance_count = 0
-        self._forward_count = 0
         self._unblock_count = 0
         self._functional_count = 0
         self._events: list[HandoffEvent] = []
 
-    @classmethod
-    def not_applicable(cls, run_nonce: str) -> SignalHandoff:
-        handoff = cls(run_nonce)
-        with handoff._lock:
-            handoff._state = "NOT_APPLICABLE"
-            handoff._terminal_state = "NOT_APPLICABLE"
-            handoff._event("not_applicable")
-        return handoff
-
-    @property
-    def state(self) -> str:
-        with self._lock:
-            return self._state
-
-    @property
-    def terminal_state(self) -> str | None:
-        with self._lock:
-            return self._terminal_state
-
-    @property
-    def pending_signal(self) -> str | None:
-        with self._lock:
-            return self._pending_signal
-
-    @property
-    def acceptance_count(self) -> int:
-        with self._lock:
-            return self._acceptance_count
-
-    @property
-    def forward_count(self) -> int:
-        with self._lock:
-            return self._forward_count
-
-    @property
-    def unblock_count(self) -> int:
-        with self._lock:
-            return self._unblock_count
-
-    @property
-    def functional_count(self) -> int:
-        with self._lock:
-            return self._functional_count
-
-    @property
-    def events(self) -> tuple[HandoffEvent, ...]:
-        with self._lock:
-            return tuple(self._events)
-
-    def coordinator_ready(
+    def send_ready(
         self,
-        identity: ProcessIdentity,
+        write_fd: int,
         *,
         blocked: set[str] | frozenset[str],
-        dispositions: dict[str, bool] | None = None,
+        dispositions: dict[str, bool] | None,
+        deadline: int | float | None = None,
     ) -> SignalReady:
+        """Observe and write one request; the descriptor remains caller-owned."""
+
         with self._lock:
             self._require_nonterminal()
-            if self._request is not None or self._state not in {
-                "AWAITING_READY",
-                "PENDING_FORWARD",
-            }:
-                return self._reject("ready request is out of order")
-            if type(identity) is not ProcessIdentity:
-                return self._reject("ready identity must be exact ProcessIdentity")
-            if identity.pid != identity.pgid:
-                return self._reject("coordinator must be the process-group leader")
-            if type(blocked) not in {set, frozenset} or blocked != _SIGNAL_SET:
-                return self._reject("blocked mask must contain exactly HUP/INT/TERM")
-            if dispositions is None:
-                return self._reject("explicit disposition proof is required")
-            if (
-                type(dispositions) is not dict
-                or set(dispositions) != _SIGNAL_SET
-                or any(
-                    type(value) is not bool or not value
-                    for value in dispositions.values()
-                )
-            ):
+            if self._sent_request is not None or self._state != "AWAITING_READY":
+                return self._reject("coordinator ready request is out of order")
+            proof = _require_signal_proof(blocked, dispositions)
+            observed = self._observe()
+            if observed.blocked_signals != _SIGNAL_SET:
+                return self._reject("reviewed signals are not all blocked")
+            if observed.dispositions != proof:
                 return self._reject(
-                    "all reviewed signal dispositions must be installed"
+                    "caller dispositions differ from actual handler observation"
                 )
-            try:
-                observed = self._signal_observer()
-            except Exception as error:
-                self._fail_locked("signal observation failed")
-                raise SignalHandoffError("signal observation failed") from error
-            if type(observed) is not SignalObservation:
-                return self._reject("signal observer returned an invalid object")
-            if (
-                observed.blocked_signals != frozenset(blocked)
-                or dict(observed.dispositions) != dispositions
-            ):
-                return self._reject("caller proof differs from observed signal state")
-            self._event("handlers_installed")
             request = SignalReady(
                 run_nonce=self._run_nonce,
                 sequence=self._next_sequence,
-                identity=identity,
+                identity=self._identity,
                 blocked_signals=_SIGNAL_ORDER,
-                dispositions=tuple(
-                    (name, dispositions[name]) for name in _SIGNAL_ORDER
-                ),
+                dispositions=proof,
             )
-            request.as_message()
-            self._request = request
+            self._event("handlers_observed")
+            try:
+                write_frame(write_fd, request.as_message(), deadline=deadline)
+            except (BrokerProtocolError, OSError, SignalHandoffError) as error:
+                self._fail_locked("ready request write failed")
+                raise SignalHandoffError("ready request write failed") from error
+            self._sent_request = request
+            self._installed_dispositions = observed.dispositions
+            self._installed_handler_tokens = observed.handler_tokens
             self._next_sequence += 1
-            self._event("ready_request")
-            if self._pending_signal is None:
-                self._state = "AWAITING_ACCEPTANCE"
+            self._state = "AWAITING_ACCEPTANCE"
+            self._event("ready_request_write")
             return request
 
-    def coordinator_ready_to_pipe(
-        self,
-        write_fd: int,
-        identity: ProcessIdentity,
-        *,
-        blocked: set[str] | frozenset[str],
-        dispositions: dict[str, bool] | None = None,
-        deadline: int | float | None = None,
-    ) -> SignalReady:
-        request = self.coordinator_ready(
-            identity, blocked=blocked, dispositions=dispositions
-        )
-        try:
-            write_frame(write_fd, request.as_message(), deadline=deadline)
-        except (BrokerProtocolError, OSError) as error:
-            with self._lock:
-                if self._terminal_state is None:
-                    self._fail_locked("ready request write failed")
-            raise SignalHandoffError("ready request write failed") from error
-        with self._lock:
-            self._require_nonterminal()
-            self._event("ready_request_write")
-        return request
-
-    def supervisor_accept(self, request: SignalReady) -> SignalReadyAccepted:
-        return self._supervisor_accept_with_writer(request, self._acceptance_writer)
-
-    def supervisor_accept_from_pipe(
-        self,
-        request_read_fd: int,
-        response_write_fd: int,
-        *,
-        deadline: int | float | None = None,
-    ) -> SignalReadyAccepted:
-        with self._lock:
-            self._require_nonterminal()
-        try:
-            message = read_frame(request_read_fd, deadline=deadline, exact_one=True)
-            request = SignalReady.from_message(message)
-        except (BrokerProtocolError, SignalHandoffError) as error:
-            with self._lock:
-                if self._terminal_state is None:
-                    self._fail_locked("ready request read failed")
-            raise SignalHandoffError("ready request read failed") from error
-
-        def pipe_writer(acceptance: SignalReadyAccepted) -> None:
-            write_frame(response_write_fd, acceptance.as_message(), deadline=deadline)
-
-        return self._supervisor_accept_with_writer(request, pipe_writer)
-
-    def _supervisor_accept_with_writer(
-        self,
-        request: SignalReady,
-        writer: Callable[[SignalReadyAccepted], object],
-    ) -> SignalReadyAccepted:
-        with self._lock:
-            self._require_nonterminal()
-            if self._state not in {"AWAITING_ACCEPTANCE", "PENDING_FORWARD"}:
-                return self._reject("acceptance request is out of order")
-            if self._acceptance_written or self._expected_acceptance is not None:
-                return self._reject("duplicate supervisor acceptance")
-            if type(request) is not SignalReady or request != self._request:
-                return self._reject("acceptance request does not match bound request")
-            if request.run_nonce != self._run_nonce:
-                return self._reject("ready nonce mismatch")
-            if request.sequence != self._next_sequence - 1:
-                return self._reject("ready sequence is not monotonic")
-            if not self._validate_identity(request.identity):
-                return self._reject("ready process identity or session mismatch")
-            request.as_message()
-            self._event("acceptance_request_validated")
-            acceptance = SignalReadyAccepted(
-                run_nonce=self._run_nonce,
-                identity=request.identity,
-                request_sequence=request.sequence,
-                request_sha256=request.canonical_sha256,
-            )
-            acceptance.as_message()
-            try:
-                writer_result = writer(acceptance)
-            except Exception as error:
-                self._fail_locked("acceptance write failed")
-                raise SignalHandoffError("acceptance write failed") from error
-            if writer_result is not None:
-                return self._reject("acceptance write was partial")
-            self._expected_acceptance = acceptance
-            self._acceptance_written = True
-            self._event("acceptance_write")
-            if self._pending_signal is None:
-                self._state = "AWAITING_ACCEPTANCE"
-            return acceptance
-
-    def coordinator_validate(self, acceptance: SignalReadyAccepted) -> None:
-        with self._lock:
-            self._require_nonterminal()
-            if self._acceptance_validated:
-                return self._reject("duplicate acceptance")
-            if (
-                not self._acceptance_written
-                or self._expected_acceptance is None
-                or type(acceptance) is not SignalReadyAccepted
-            ):
-                return self._reject("acceptance is missing")
-            if acceptance != self._expected_acceptance:
-                return self._reject(
-                    "acceptance does not match immutable request binding"
-                )
-            acceptance.as_message()
-            self._acceptance_validated = True
-            self._acceptance_count = 1
-            self._state = "READY"
-            self._event("acceptance_validated")
-            if self._pending_signal is not None:
-                self._forward_locked()
-
-    def coordinator_validate_from_pipe(
+    def receive_acceptance(
         self, read_fd: int, *, deadline: int | float | None = None
-    ) -> None:
-        with self._lock:
-            self._require_nonterminal()
-        try:
-            message = read_frame(read_fd, deadline=deadline, exact_one=True)
-            acceptance = SignalReadyAccepted.from_message(message)
-        except (BrokerProtocolError, SignalHandoffError) as error:
-            with self._lock:
-                if self._terminal_state is None:
-                    self._fail_locked("acceptance response read failed")
-            raise SignalHandoffError("acceptance response read failed") from error
-        self.coordinator_validate(acceptance)
+    ) -> SignalReadyAccepted:
+        """Read exact acceptance, unblock in the OS, and re-observe the mask."""
 
-    def coordinator_unblocked(self, evidence: TraceUnblockEvidence) -> None:
         with self._lock:
             self._require_nonterminal()
+            if self._state != "AWAITING_ACCEPTANCE" or self._sent_request is None:
+                return self._reject("coordinator is not awaiting acceptance")
+            try:
+                message = read_frame(read_fd, deadline=deadline, exact_one=True)
+                acceptance = SignalReadyAccepted.from_message(message)
+            except (BrokerProtocolError, SignalHandoffError) as error:
+                self._fail_locked("acceptance response read failed")
+                raise SignalHandoffError("acceptance response read failed") from error
+            expected = _acceptance_for(self._sent_request)
+            if acceptance != expected:
+                return self._reject("coordinator acceptance binding mismatch")
+            self._acceptance_validated = True
+            self._event("acceptance_validated")
+            try:
+                self._signal_operations.unblock_reviewed()
+                observed = self._observe()
+            except Exception as error:
+                self._fail_locked("reviewed signal unblock failed")
+                raise SignalHandoffError("reviewed signal unblock failed") from error
+            if observed.blocked_signals:
+                return self._reject("reviewed signals remain blocked after unblock")
             if (
-                not self._acceptance_validated
-                or self._acceptance_count != 1
-                or self._unblock_count != 0
-                or self._request is None
+                observed.dispositions != self._installed_dispositions
+                or observed.handler_tokens != self._installed_handler_tokens
             ):
-                return self._reject("unblock is not authorized")
-            if type(evidence) is not TraceUnblockEvidence:
-                return self._reject("trace unblock evidence is required")
-            expected = self._request
-            if (
-                evidence.run_nonce != self._run_nonce
-                or evidence.identity != expected.identity
-                or evidence.request_sequence != expected.sequence
-                or evidence.request_sha256 != expected.canonical_sha256
-                or evidence.unblocked_signals != _SIGNAL_ORDER
-            ):
-                return self._reject("trace unblock evidence binding mismatch")
-            self._trace_evidence = evidence
+                return self._reject("handler dispositions changed during unblock")
             self._unblock_count = 1
             self._state = "READY"
-            self._event("trace_unblock")
+            self._event("signals_unblocked")
+            return acceptance
 
     def record_functional_progress(self) -> None:
         with self._lock:
             self._require_nonterminal()
-            if (
-                self._state != "READY"
-                or self._trace_evidence is None
-                or self._unblock_count != 1
-            ):
-                return self._reject(
-                    "functional progression preceded trace-proven unblock"
-                )
+            if self._state != "READY" or self._unblock_count != 1:
+                return self._reject("functional progress preceded OS unblock")
             self._functional_count += 1
             self._event("functional")
 
-    def finalize_ready(self) -> None:
+    def finalize_ready(self, evidence: TraceUnblockEvidence) -> None:
         with self._lock:
             self._require_nonterminal()
             if (
-                not self._acceptance_validated
-                or self._acceptance_count != 1
-                or self._trace_evidence is None
+                self._state != "READY"
+                or not self._acceptance_validated
                 or self._unblock_count != 1
+                or self._sent_request is None
             ):
-                return self._reject("terminal READY requires trace-unblock evidence")
-            self._state = "READY"
+                return self._reject("coordinator is not live-ready")
+            if type(evidence) is not TraceUnblockEvidence:
+                return self._reject("trusted trace evidence is required")
+            request = self._sent_request
+            if (
+                evidence.run_nonce != request.run_nonce
+                or evidence.identity != request.identity
+                or evidence.request_sequence != request.sequence
+                or evidence.request_sha256 != request.canonical_sha256
+                or evidence.functional_count != self._functional_count
+            ):
+                return self._reject("trace evidence binding or count mismatch")
+            functional_index = evidence.first_functional_trace_record_index
+            if self._functional_count == 0:
+                if functional_index is not None:
+                    return self._reject(
+                        "trace evidence has an unexpected functional index"
+                    )
+            elif functional_index is None or not (
+                evidence.unblock_trace_record_index < functional_index
+            ):
+                return self._reject("trace evidence functional ordering is invalid")
+            try:
+                trusted = self._trace_verifier(evidence)
+            except Exception as error:
+                self._fail_locked("trusted trace verifier failed")
+                raise SignalHandoffError("trusted trace verifier failed") from error
+            if trusted is not True:
+                return self._reject("trusted trace verifier rejected evidence")
             self._terminal_state = "READY"
             self._event("terminal_ready")
-
-    def collect_signal(self, signal_name: str) -> None:
-        with self._lock:
-            self._require_nonterminal()
-            if type(signal_name) is not str or signal_name not in _SIGNAL_SET:
-                raise SignalHandoffError("signal must be exactly HUP, INT, or TERM")
-            if self._pending_signal is not None:
-                return
-            self._pending_signal = signal_name
-            self._event("signal_latched")
-            if self._acceptance_validated and self._acceptance_count == 1:
-                self._forward_locked()
-            elif self._state in _LIVE_STATES:
-                self._state = "PENDING_FORWARD"
 
     def fail(self, reason: str) -> None:
         with self._lock:
             self._require_nonterminal()
-            if type(reason) is not str or not reason:
-                raise SignalHandoffError("failure reason must be a non-empty string")
+            _require_reason(reason)
             self._fail_locked(reason)
 
-    def _forward_locked(self) -> None:
-        if self._forward_count or self._pending_signal is None:
-            return
-        if (
-            not self._acceptance_validated
-            or self._acceptance_count != 1
-            or self._request is None
-        ):
-            return self._reject("forward preceded coordinator acceptance validation")
-        identity = self._request.identity
-        if not self._validate_identity(identity):
-            return self._reject("process identity changed before forward")
-        try:
-            forward_result = self._forwarder(identity.pgid, self._pending_signal)
-        except Exception as error:
-            self._fail_locked("modeled signal forward failed")
-            raise SignalHandoffError("modeled signal forward failed") from error
-        if forward_result is not None:
-            return self._reject("modeled signal forward was not exact")
-        self._forward_count = 1
-        self._event("signal_forward")
+    def snapshot(self) -> CoordinatorSnapshot:
+        with self._lock:
+            request = self._sent_request
+            return CoordinatorSnapshot(
+                role="COORDINATOR",
+                state=self._state,
+                terminal_state=self._terminal_state,
+                request_sequence=None if request is None else request.sequence,
+                request_sha256=None if request is None else request.canonical_sha256,
+                acceptance_validated=self._acceptance_validated,
+                unblock_count=self._unblock_count,
+                functional_count=self._functional_count,
+                events=tuple(self._events),
+            )
 
-    def _validate_identity(self, identity: ProcessIdentity) -> bool:
+    def _observe(self) -> SignalObservation:
         try:
-            return self._identity_validator(identity) is True
-        except Exception:
-            return False
+            observed = self._signal_operations.observe()
+        except Exception as error:
+            raise SignalHandoffError("signal observation failed") from error
+        if type(observed) is not SignalObservation:
+            raise SignalHandoffError("signal observer returned an invalid object")
+        return observed
 
     def _require_nonterminal(self) -> None:
         if self._terminal_state is not None:
             raise SignalHandoffError(
-                f"terminal handoff state is immutable: {self._terminal_state}"
+                f"terminal coordinator state is immutable: {self._terminal_state}"
             )
 
     def _event(self, name: str) -> None:
@@ -618,19 +474,260 @@ class SignalHandoff:
         self._event(f"failed:{reason}")
 
 
-def _observe_current_signals() -> SignalObservation:
-    try:
-        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-        blocked_names = frozenset(
-            name for name, number in _SIGNAL_NUMBERS.items() if number in blocked
+class SupervisorSignalHandoff:
+    """Supervisor-local sequence, acceptance-write, and forwarding state."""
+
+    def __init__(
+        self,
+        run_nonce: str,
+        *,
+        forwarder: Callable[[int, str], object] | None = None,
+        identity_validator: Callable[[ProcessIdentity], bool] | None = None,
+        first_sequence: int = 1,
+    ) -> None:
+        _require_nonce(run_nonce)
+        if forwarder is None or not callable(forwarder):
+            raise SignalHandoffError("an explicit modeled forwarder is mandatory")
+        if identity_validator is not None and not callable(identity_validator):
+            raise SignalHandoffError("identity validator must be callable")
+        if type(first_sequence) is not int or first_sequence <= 0:
+            raise SignalHandoffError("first sequence must be positive")
+        self._lock = RLock()
+        self._run_nonce = run_nonce
+        self._forwarder = forwarder
+        self._identity_validator = identity_validator or (
+            lambda identity: identity.matches_coordinator_session()
         )
-        dispositions = tuple(
-            (
-                name,
-                callable(signal.getsignal(number)),
+        self._next_sequence = first_sequence
+        self._state = "AWAITING_READY"
+        self._terminal_state: str | None = None
+        self._acceptance_count = 0
+        self._forward_count = 0
+        self._pending_signal: str | None = None
+        self._forward_target_pgid: int | None = None
+        self._last_accepted_identity: ProcessIdentity | None = None
+        self._events: list[HandoffEvent] = []
+
+    @classmethod
+    def not_applicable(cls, run_nonce: str) -> SupervisorSignalHandoff:
+        def prohibited_forward(_pgid: int, _name: str) -> object:
+            raise SignalHandoffError("NOT_APPLICABLE cannot forward")
+
+        handoff = cls(
+            run_nonce,
+            forwarder=prohibited_forward,
+            identity_validator=lambda _identity: False,
+        )
+        with handoff._lock:
+            handoff._state = "NOT_APPLICABLE"
+            handoff._terminal_state = "NOT_APPLICABLE"
+            handoff._event("not_applicable")
+        return handoff
+
+    def build_acceptance(self, request: SignalReady) -> SignalReadyAccepted:
+        """Build a response without changing authorization or sequence state."""
+
+        with self._lock:
+            self._require_nonterminal()
+            self._validate_request(request)
+            return _acceptance_for(request)
+
+    def receive_and_accept(
+        self,
+        request_read_fd: int,
+        response_write_fd: int,
+        *,
+        deadline: int | float | None = None,
+    ) -> SignalReadyAccepted:
+        """Read one request and authorize only after complete response write."""
+
+        with self._lock:
+            self._require_nonterminal()
+        try:
+            message = read_frame(request_read_fd, deadline=deadline, exact_one=True)
+            request = SignalReady.from_message(message)
+        except (BrokerProtocolError, SignalHandoffError) as error:
+            with self._lock:
+                if self._terminal_state is None:
+                    self._fail_locked("ready request read failed")
+            raise SignalHandoffError("ready request read failed") from error
+        with self._lock:
+            self._require_nonterminal()
+            try:
+                self._validate_request(request)
+            except SignalHandoffError as error:
+                self._fail_locked(str(error))
+                raise
+            acceptance = _acceptance_for(request)
+            self._event("ready_request_validated")
+            try:
+                write_frame(
+                    response_write_fd,
+                    acceptance.as_message(),
+                    deadline=deadline,
+                )
+            except (BrokerProtocolError, OSError, SignalHandoffError) as error:
+                self._fail_locked("acceptance response write failed")
+                raise SignalHandoffError("acceptance response write failed") from error
+            self._acceptance_count += 1
+            self._next_sequence += 1
+            self._last_accepted_identity = request.identity
+            self._state = "READY"
+            self._event("acceptance_write")
+            if self._pending_signal is not None:
+                self._forward_locked(request.identity)
+            return acceptance
+
+    def collect_signal(self, signal_name: str) -> None:
+        with self._lock:
+            self._require_nonterminal()
+            if type(signal_name) is not str or signal_name not in _SIGNAL_SET:
+                raise SignalHandoffError("signal must be exactly HUP, INT, or TERM")
+            if self._pending_signal is not None:
+                return
+            self._pending_signal = signal_name
+            self._event("signal_latched")
+            identity = self._last_accepted_identity
+            if identity is None:
+                self._state = "PENDING_FORWARD"
+            else:
+                self._forward_locked(identity)
+
+    def fail(self, reason: str) -> None:
+        with self._lock:
+            self._require_nonterminal()
+            _require_reason(reason)
+            self._fail_locked(reason)
+
+    def snapshot(self) -> SupervisorSnapshot:
+        with self._lock:
+            return SupervisorSnapshot(
+                role="SUPERVISOR",
+                state=self._state,
+                terminal_state=self._terminal_state,
+                next_sequence=self._next_sequence,
+                acceptance_count=self._acceptance_count,
+                forward_count=self._forward_count,
+                pending_signal=self._pending_signal,
+                forward_target_pgid=self._forward_target_pgid,
+                events=tuple(self._events),
             )
-            for name, number in _SIGNAL_NUMBERS.items()
+
+    def _validate_request(self, request: SignalReady) -> None:
+        if type(request) is not SignalReady:
+            raise SignalHandoffError("request must be an exact SignalReady")
+        request.as_message()
+        if request.run_nonce != self._run_nonce:
+            raise SignalHandoffError("request nonce mismatch")
+        if request.sequence != self._next_sequence:
+            raise SignalHandoffError("request sequence mismatch")
+        if request.identity.pid != request.identity.pgid:
+            raise SignalHandoffError("coordinator is not process-group leader")
+        if request.blocked_signals != _SIGNAL_ORDER or any(
+            value is not True for _name, value in request.dispositions
+        ):
+            raise SignalHandoffError("request signal proof is invalid")
+        if not self._validate_identity(request.identity):
+            raise SignalHandoffError("request process identity mismatch")
+
+    def _validate_identity(self, identity: ProcessIdentity) -> bool:
+        try:
+            return self._identity_validator(identity) is True
+        except Exception:
+            return False
+
+    def _forward_locked(self, identity: ProcessIdentity) -> None:
+        if self._forward_count or self._pending_signal is None:
+            return
+        if self._acceptance_count <= 0:
+            return self._reject("forward preceded complete acceptance write")
+        if not self._validate_identity(identity):
+            return self._reject("process identity changed before forward")
+        try:
+            result = self._forwarder(identity.pgid, self._pending_signal)
+        except Exception as error:
+            self._fail_locked("modeled signal forward failed")
+            raise SignalHandoffError("modeled signal forward failed") from error
+        if result is not None:
+            return self._reject("modeled signal forward was not exact")
+        self._forward_count = 1
+        self._forward_target_pgid = identity.pgid
+        self._event("signal_forward")
+
+    def _require_nonterminal(self) -> None:
+        if self._terminal_state is not None:
+            raise SignalHandoffError(
+                f"terminal supervisor state is immutable: {self._terminal_state}"
+            )
+
+    def _event(self, name: str) -> None:
+        self._events.append(HandoffEvent(len(self._events), name, self._state))
+
+    def _reject(self, reason: str):
+        self._require_nonterminal()
+        self._fail_locked(reason)
+        raise SignalHandoffError(reason)
+
+    def _fail_locked(self, reason: str) -> None:
+        self._require_nonterminal()
+        self._state = "FAILED"
+        self._terminal_state = "FAILED"
+        self._event(f"failed:{reason}")
+
+
+class SignalHandoff:
+    """Fail-closed compatibility marker for the removed shared-role API."""
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise SignalHandoffError(
+            "use explicit coordinator/supervisor signal handoff roles"
         )
-        return SignalObservation(blocked_names, dispositions)
-    except (OSError, RuntimeError, ValueError) as error:
-        raise SignalHandoffError("could not observe current signal state") from error
+
+
+def _acceptance_for(request: SignalReady) -> SignalReadyAccepted:
+    return SignalReadyAccepted(
+        run_nonce=request.run_nonce,
+        identity=request.identity,
+        request_sequence=request.sequence,
+        request_sha256=request.canonical_sha256,
+    )
+
+
+def _require_signal_proof(
+    blocked: set[str] | frozenset[str], dispositions: dict[str, bool] | None
+) -> tuple[tuple[str, bool], tuple[str, bool], tuple[str, bool]]:
+    if type(blocked) not in {set, frozenset} or blocked != _SIGNAL_SET:
+        raise SignalHandoffError("blocked mask must contain exactly HUP/INT/TERM")
+    if (
+        dispositions is None
+        or type(dispositions) is not dict
+        or set(dispositions) != _SIGNAL_SET
+        or any(type(value) is not bool or not value for value in dispositions.values())
+    ):
+        raise SignalHandoffError("explicit successful disposition proof is required")
+    return tuple((name, dispositions[name]) for name in _SIGNAL_ORDER)
+
+
+def _require_nonce(value: object) -> None:
+    if type(value) is not str or not value:
+        raise SignalHandoffError("run nonce must be a non-empty exact string")
+    try:
+        size = len(value.encode("utf-8", errors="strict"))
+    except UnicodeError as error:
+        raise SignalHandoffError("run nonce contains invalid Unicode") from error
+    if size > 256:
+        raise SignalHandoffError("run nonce exceeds the reviewed byte bound")
+
+
+def _require_digest(value: object, name: str) -> None:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise SignalHandoffError(f"{name} must be lowercase SHA-256")
+
+
+def _require_reason(reason: object) -> None:
+    if type(reason) is not str or not reason:
+        raise SignalHandoffError("failure reason must be a non-empty exact string")
