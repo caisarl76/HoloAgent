@@ -1,5 +1,4 @@
 import hashlib
-import importlib
 import io
 import json
 import os
@@ -106,6 +105,19 @@ def _source_section(name: str) -> str:
     match = re.search(rf"# BEGIN_{name}\n(.*?)\n# END_{name}", source, flags=re.DOTALL)
     assert match is not None, f"provisioner must expose its exact {name} helpers"
     return match.group(1)
+
+
+def _publication_namespace():
+    source = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(
+        r"# BEGIN_PUBLICATION_HELPER\n(.*?)\n# END_PUBLICATION_HELPER",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match is not None, "publication code must be embedded in the pinned recipe"
+    namespace = {"__name__": "holoagent0_embedded_publication_test"}
+    exec(compile(match.group(1), str(SCRIPT), "exec"), namespace)
+    return namespace
 
 
 def _process_exists(pid: int) -> bool:
@@ -389,14 +401,17 @@ set -euo pipefail
 
 
 def test_candidate_and_install_publication_are_atomic_no_replace(tmp_path):
-    publication = importlib.import_module("holoagent0_setup.strace_publication")
+    publication = _publication_namespace()
     candidate = tmp_path / "candidate.json"
+    candidate_stage = tmp_path / ".candidate-stage"
     evidence = {"schema_version": "candidate.v1", "nested": {"value": 1}}
-    publication.publish_candidate_evidence(candidate, evidence)
+    publication["publish_candidate_evidence"](candidate, candidate_stage, evidence)
     assert json.loads(candidate.read_text()) == evidence
     assert candidate.stat().st_mode & 0o777 == 0o600
     with pytest.raises(FileExistsError):
-        publication.publish_candidate_evidence(candidate, {"attacker": True})
+        publication["publish_candidate_evidence"](
+            candidate, candidate_stage, {"attacker": True}
+        )
     assert json.loads(candidate.read_text()) == evidence
 
     staged = tmp_path / ".install-staged"
@@ -404,29 +419,34 @@ def test_candidate_and_install_publication_are_atomic_no_replace(tmp_path):
     (staged / "strace").write_bytes(b"reviewed-elf")
     staged_inode = staged.stat().st_ino
     installed = tmp_path / "install"
-    publication.publish_install_directory(staged, installed)
+    quarantine = tmp_path / ".install-quarantine"
+    publication["publish_install_directory"](staged, installed, quarantine)
     assert installed.stat().st_ino == staged_inode
     assert (installed / "strace").read_bytes() == b"reviewed-elf"
+    assert (installed / ".holoagent0-install-approved.json").is_file()
 
 
 def test_install_publication_rejects_empty_destination_race_and_cross_filesystem_shape(
     tmp_path,
 ):
-    publication = importlib.import_module("holoagent0_setup.strace_publication")
+    publication = _publication_namespace()
     staged = tmp_path / ".install-staged"
     staged.mkdir()
     destination = tmp_path / "install"
     destination.mkdir()
     destination_inode = destination.stat().st_ino
+    quarantine = tmp_path / ".install-quarantine"
     with pytest.raises(FileExistsError):
-        publication.publish_install_directory(staged, destination)
+        publication["publish_install_directory"](staged, destination, quarantine)
     assert destination.stat().st_ino == destination_inode
     assert staged.is_dir()
 
     other_parent = tmp_path / "other"
     other_parent.mkdir()
-    with pytest.raises(publication.PublicationError, match="same parent"):
-        publication.publish_install_directory(staged, other_parent / "install")
+    with pytest.raises(publication["PublicationError"], match="same parent"):
+        publication["publish_install_directory"](
+            staged, other_parent / "install", other_parent / ".quarantine"
+        )
 
 
 @pytest.mark.parametrize(
@@ -490,9 +510,11 @@ def test_candidate_measurement_is_separate_from_reviewed_install_and_never_edits
     assert "candidate-evidence" in source
     assert "CANDIDATE_MEASUREMENT" in source
     assert "runtime pins are required for reviewed install" in source
-    assert "atomic_write_json_no_replace" in source
+    assert "publish_candidate_evidence" in source
     assert "/usr/bin/mv --" not in source
     assert "run_owned_publication" in source
+    assert "holoagent0_setup.strace_publication" not in source
+    assert "holoagent0_setup.atomic_io" not in source
     assert (
         "policy_path.write" not in source
         and "POLICY_PATH"
