@@ -2,7 +2,7 @@
 set -euo pipefail
 PATH='/usr/bin:/bin'
 export PATH
-exec /usr/bin/python3.10 - "$0" "$@" <<'PY'
+exec /usr/bin/python3.10 -I -S - "$0" "$@" <<'PY'
 # BEGIN_PROVISIONER_PYTHON
 from contextlib import contextmanager
 import ctypes
@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from typing import Sequence
 
@@ -39,6 +40,7 @@ BLOCKING_PHASES = frozenset(
     }
 )
 APPROVAL_MARKER = ".holoagent0-install-approved.json"
+MAX_CAPTURE_BYTES = 8 * 1024 * 1024
 USAGE = "usage: {script} [--archive ARCHIVE] (--output-dir OUTPUT_DIR | --candidate-evidence FILE)"
 
 
@@ -57,6 +59,10 @@ class OwnedProcessTimeout(ProvisioningError):
 
 
 class OwnedCleanupError(ProvisioningError):
+    pass
+
+
+class OwnedOutputLimitError(OwnedCleanupError):
     pass
 
 
@@ -81,13 +87,80 @@ class CliError(ProvisioningError):
 
 
 class PublicationError(ProvisioningError):
-    pass
+    def __init__(self, message, *, transition=None):
+        super().__init__(message)
+        self.transition = transition
 
 
 class ProvisioningInterrupted(ProvisioningError):
     def __init__(self, status: int):
         super().__init__(f"interrupted with status {status}")
         self.status = status
+
+
+@dataclass(frozen=True)
+class CleanupReport:
+    failures: tuple
+
+    @property
+    def succeeded(self):
+        return not self.failures
+
+
+@dataclass(frozen=True)
+class PublicationTransition:
+    state: str
+    destination: str
+    quarantine: str
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class DockerIdentity:
+    container_id: str
+    name: str
+    nonce: str
+
+
+def aggregate_cleanup(actions):
+    failures = []
+    for name, action in actions:
+        try:
+            action()
+        except BaseException:
+            failures.append(name)
+    return CleanupReport(tuple(failures))
+
+
+def closed_command_env(extra=None):
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "LANG": "C",
+        "TZ": "UTC",
+        "SOURCE_DATE_EPOCH": "0",
+    }
+    if extra:
+        allowed = {
+            "DOCKER_HOST",
+            "FAKE_DOCKER_STATE",
+            "FAKE_DOCKER_BEHAVIOR",
+        }
+        unknown = set(extra) - allowed
+        if unknown:
+            raise ProvisioningError(f"unapproved command environment: {sorted(unknown)}")
+        docker_host = extra.get("DOCKER_HOST")
+        if docker_host is not None:
+            socket_path = Path(docker_host.removeprefix("unix://"))
+            if (
+                not docker_host.startswith("unix:///")
+                or ".." in socket_path.parts
+                or not socket_path.is_absolute()
+            ):
+                raise ProvisioningError("DOCKER_HOST must be an absolute Unix socket")
+        environment.update(extra)
+    return environment
 
 
 @dataclass(frozen=True)
@@ -178,6 +251,14 @@ class OwnedSessionRunner:
         self.identity_reader = identity_reader
         self.signal_latch = signal_latch
 
+    def for_cleanup(self):
+        return OwnedSessionRunner(
+            term_grace=self.term_grace,
+            kill_grace=self.kill_grace,
+            identity_reader=self.identity_reader,
+            signal_latch=None,
+        )
+
     def run(self, argv, *, timeout, env=None, on_verified=None, pass_fds=()):
         if not argv or timeout <= 0:
             raise ValueError("owned command and positive timeout are required")
@@ -185,6 +266,8 @@ class OwnedSessionRunner:
             raise OwnedCleanupError("pidfd process ownership is unavailable")
         if self.signal_latch is not None and self.signal_latch.status:
             raise ProvisioningInterrupted(self.signal_latch.status)
+        _enable_subreaper()
+        baseline = _direct_child_identities(os.getpid())
         release_read, release_write = os.pipe2(os.O_CLOEXEC)
         inherited = tuple(sorted({release_read, *(int(fd) for fd in pass_fds)}))
         command = [
@@ -237,12 +320,28 @@ class OwnedSessionRunner:
             released = True
             os.close(release_write)
             release_write = -1
+            stdout_buffer = bytearray()
+            stderr_buffer = bytearray()
+            output_overflow = threading.Event()
+            capture_budget = CaptureBudget()
+            drainers = (
+                _start_drain(
+                    process.stdout, stdout_buffer, output_overflow, capture_budget
+                ),
+                _start_drain(
+                    process.stderr, stderr_buffer, output_overflow, capture_budget
+                ),
+            )
+            tracked = {}
             deadline = time.monotonic() + timeout
             timed_out = False
             interrupted = 0
             while process.poll() is None:
+                self._discover_descendants(identity, baseline, tracked)
                 if self.signal_latch is not None and self.signal_latch.status:
                     interrupted = self.signal_latch.status
+                    break
+                if output_overflow.is_set():
                     break
                 if time.monotonic() >= deadline:
                     timed_out = True
@@ -254,9 +353,17 @@ class OwnedSessionRunner:
                 returncode = process.poll()
             else:
                 self._cleanup_descendants(identity)
-            stdout, stderr = process.communicate(timeout=0.2)
+            self._cleanup_tracked(identity, baseline, tracked)
+            for drainer in drainers:
+                drainer.join(self.kill_grace)
+                if drainer.is_alive():
+                    raise OwnedCleanupError("owned output drainer did not terminate")
+            stdout = bytes(stdout_buffer)
+            stderr = bytes(stderr_buffer)
             if interrupted:
                 raise ProvisioningInterrupted(interrupted)
+            if output_overflow.is_set():
+                raise OwnedOutputLimitError("owned output exceeded capture policy")
             if timed_out:
                 raise OwnedProcessTimeout(argv)
             return subprocess.CompletedProcess(tuple(argv), returncode, stdout, stderr)
@@ -347,6 +454,61 @@ class OwnedSessionRunner:
                         "owned descendant survived SIGKILL deadline"
                     )
 
+    def _discover_descendants(self, leader, baseline, tracked):
+        records = _process_records()
+        owned = {leader.pid, *(value.identity.pid for value in tracked.values())}
+        changed = True
+        while changed:
+            changed = False
+            for identity, parent_pid in records.values():
+                key = (identity.pid, identity.start_time)
+                if key in baseline or identity.pid in owned:
+                    continue
+                adopted = parent_pid == os.getpid() and identity.start_time >= leader.start_time
+                if parent_pid not in owned and not adopted:
+                    continue
+                try:
+                    pidfd = os.pidfd_open(identity.pid, 0)
+                except ProcessLookupError:
+                    continue
+                tracked[key] = TrackedProcess(identity, pidfd)
+                owned.add(identity.pid)
+                changed = True
+
+    def _cleanup_tracked(self, leader, baseline, tracked):
+        self._discover_descendants(leader, baseline, tracked)
+        if not tracked:
+            return
+        self._signal_tracked(tracked, signal.SIGTERM)
+        deadline = time.monotonic() + self.term_grace
+        while time.monotonic() < deadline:
+            self._discover_descendants(leader, baseline, tracked)
+            if not _live_tracked(tracked):
+                _close_tracked(tracked)
+                return
+            time.sleep(0.005)
+        self._signal_tracked(tracked, signal.SIGKILL)
+        deadline = time.monotonic() + self.kill_grace
+        while time.monotonic() < deadline:
+            self._discover_descendants(leader, baseline, tracked)
+            if not _live_tracked(tracked):
+                _close_tracked(tracked)
+                return
+            time.sleep(0.005)
+        _close_tracked(tracked)
+        raise OwnedCleanupError("escaped descendant survived SIGKILL deadline")
+
+    @staticmethod
+    def _signal_tracked(tracked, signum):
+        for value in tracked.values():
+            try:
+                current = read_process_identity(value.identity.pid)
+                if not _same_process_identity(current, value.identity):
+                    raise ProcessIdentityError("tracked descendant identity changed")
+                signal.pidfd_send_signal(value.pidfd, signum)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+
 
 _RELEASE_TRAMPOLINE = r"""
 import os
@@ -373,6 +535,111 @@ def _same_process_identity(left, right):
         right.sid,
         right.start_time,
     )
+
+
+@dataclass
+class TrackedProcess:
+    identity: ProcessIdentity
+    pidfd: int
+
+
+class CaptureBudget:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.used = 0
+
+    def append(self, destination, block, overflow):
+        with self.lock:
+            available = MAX_CAPTURE_BYTES - self.used
+            if available <= 0:
+                overflow.set()
+                return
+            accepted = block[:available]
+            destination.extend(accepted)
+            self.used += len(accepted)
+            if len(accepted) != len(block):
+                overflow.set()
+
+
+def _start_drain(stream, destination, overflow, budget):
+    def drain():
+        while True:
+            block = stream.read(65536)
+            if not block:
+                return
+            budget.append(destination, block, overflow)
+
+    thread = threading.Thread(target=drain, daemon=True)
+    thread.start()
+    return thread
+
+
+def _enable_subreaper():
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
+        number = ctypes.get_errno()
+        raise OwnedCleanupError(f"PR_SET_CHILD_SUBREAPER failed: {number}")
+
+
+def _process_records():
+    records = {}
+    for item in Path("/proc").iterdir():
+        if not item.name.isdigit():
+            continue
+        try:
+            text = (item / "stat").read_text(encoding="ascii")
+            closing = text.rfind(")")
+            fields = text[closing + 2 :].split()
+            identity = ProcessIdentity(
+                int(item.name),
+                int(fields[2]),
+                int(fields[3]),
+                int(fields[19]),
+                fields[0],
+            )
+            records[identity.pid] = (identity, int(fields[1]))
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+            continue
+    return records
+
+
+def _direct_child_identities(parent_pid):
+    return {
+        (identity.pid, identity.start_time)
+        for identity, candidate_parent in _process_records().values()
+        if candidate_parent == parent_pid
+    }
+
+
+def _live_tracked(tracked):
+    live = False
+    for key, value in tuple(tracked.items()):
+        try:
+            current = read_process_identity(value.identity.pid)
+        except (FileNotFoundError, ProcessLookupError):
+            os.close(value.pidfd)
+            tracked.pop(key)
+            continue
+        if current.state == "Z":
+            try:
+                os.waitpid(current.pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            os.close(value.pidfd)
+            tracked.pop(key)
+            continue
+        if not _same_process_identity(current, value.identity):
+            os.close(value.pidfd)
+            tracked.pop(key)
+            raise ProcessIdentityError("tracked descendant PID was reused")
+        live = True
+    return live
+
+
+def _close_tracked(tracked):
+    for value in tracked.values():
+        os.close(value.pidfd)
+    tracked.clear()
 
 
 @dataclass
@@ -549,10 +816,50 @@ class OwnedPathRegistry:
         os.fsync(directory_fd)
 
 
+def retained_fd_path(fd, suffix=None):
+    value = f"/proc/{os.getpid()}/fd/{int(fd)}"
+    if suffix is None:
+        return Path(value)
+    relative = PurePosixPath(suffix)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise PathIdentityError("retained FD suffix must be a safe relative path")
+    return Path(value).joinpath(*relative.parts)
+
+
+def create_owned_file_at(directory_fd, name, *, mode):
+    OwnedPathRegistry._validate_name(name)
+    fd = os.open(
+        name,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        mode,
+        dir_fd=directory_fd,
+    )
+    os.fchmod(fd, mode)
+    value = os.fstat(fd)
+    return OwnedPath(name, value.st_dev, value.st_ino, fd, False)
+
+
+def close_owned_path(entry):
+    if entry is not None and entry.fd >= 0:
+        os.close(entry.fd)
+        entry.fd = -1
+
+
 class DockerOwner:
-    def __init__(self, docker, runner, *, name, nonce, stabilization, command_timeout):
+    def __init__(
+        self,
+        docker,
+        runner,
+        *,
+        cleanup_runner=None,
+        name,
+        nonce,
+        stabilization,
+        command_timeout,
+    ):
         self.docker = docker
         self.runner = runner
+        self.cleanup_runner = cleanup_runner or runner.for_cleanup()
         self.name = name
         self.nonce = nonce
         self.stabilization = float(stabilization)
@@ -566,16 +873,31 @@ class DockerOwner:
         primary = None
         result = None
         try:
-            result = self.runner.run(
+            created = self.runner.run(
                 [
                     self.docker,
-                    "run",
+                    "create",
                     "--name",
                     self.name,
                     "--label",
                     f"holoagent0.strace.owner={self.nonce}",
                     *map(str, args),
                 ],
+                timeout=timeout,
+                env=env,
+            )
+            if created.returncode != 0:
+                raise DockerOwnershipError("docker create failed")
+            try:
+                container_id = created.stdout.decode("ascii", "strict").strip()
+            except UnicodeDecodeError as error:
+                raise DockerOwnershipError(
+                    "docker create returned an undecodable ID"
+                ) from error
+            if not _fullmatch_container_id(container_id):
+                raise DockerOwnershipError("docker create returned an invalid ID")
+            result = self.runner.run(
+                [self.docker, "start", "--attach", container_id],
                 timeout=timeout,
                 env=env,
             )
@@ -595,39 +917,46 @@ class DockerOwner:
         deadline = time.monotonic() + self.stabilization
         while True:
             rows = self._inventory(env)
-            for row_name, labels in rows:
-                if row_name != self.name:
+            for identity in rows:
+                if identity.name != self.name:
                     continue
-                expected = f"holoagent0.strace.owner={self.nonce}"
-                if expected not in labels.split(","):
+                if identity.nonce != self.nonce:
                     raise DockerOwnershipError("container name has a foreign owner")
                 inspected = self._command(
                     [
                         self.docker,
                         "inspect",
                         "--format",
-                        '{{ index .Config.Labels "holoagent0.strace.owner" }}',
-                        self.name,
+                        '{{.Id}}|{{.Name}}|{{ index .Config.Labels "holoagent0.strace.owner" }}',
+                        identity.container_id,
                     ],
                     env,
                 )
-                if inspected.stdout.decode("utf-8", "strict").strip() != self.nonce:
+                verified = _parse_inspected_identity(inspected.stdout)
+                if verified != identity:
                     raise DockerOwnershipError("container label identity changed")
+                current = self._inventory(env)
+                if current != [identity]:
+                    raise DockerOwnershipError("container identity changed before removal")
                 removed = self._command(
-                    [self.docker, "rm", "--force", self.name], env, cleanup=True
+                    [self.docker, "rm", "--force", identity.container_id],
+                    env,
+                    cleanup=True,
                 )
                 if removed.returncode != 0:
                     raise DockerCleanupError("docker rm failed")
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.02)
-        if any(name == self.name for name, _labels in self._inventory(env)):
+        if any(identity.name == self.name for identity in self._inventory(env)):
             raise DockerCleanupError("owned container remained after stabilization")
         self.attempted = False
 
     def _command(self, argv, env, *, cleanup=False):
         try:
-            result = self.runner.run(argv, timeout=self.command_timeout, env=env)
+            result = self.cleanup_runner.run(
+                argv, timeout=self.command_timeout, env=env
+            )
         except (OwnedProcessTimeout, OwnedCleanupError) as error:
             raise DockerCleanupError("bounded docker command failed") from error
         if result.returncode != 0 and not cleanup:
@@ -645,23 +974,58 @@ class DockerOwner:
                 "--filter",
                 f"name=^/{self.name}$",
                 "--format",
-                "{{.Names}}|{{.Labels}}",
+                "{{.Names}}|{{.Labels}}|{{.ID}}",
             ],
             env,
         )
         rows = []
-        for raw in result.stdout.decode("utf-8", "strict").splitlines():
+        try:
+            inventory = result.stdout.decode("utf-8", "strict")
+        except UnicodeDecodeError as error:
+            raise DockerCleanupError("undecodable docker inventory") from error
+        for raw in inventory.splitlines():
             if not raw:
                 continue
-            if raw.count("|") != 1:
+            if raw.count("|") != 2:
                 raise DockerCleanupError("undecodable docker inventory")
-            rows.append(tuple(raw.split("|", 1)))
+            name, labels, container_id = raw.split("|", 2)
+            expected = f"holoagent0.strace.owner={self.nonce}"
+            nonce = self.nonce if expected in labels.split(",") else ""
+            if not _fullmatch_container_id(container_id):
+                raise DockerCleanupError("docker inventory returned an invalid ID")
+            if name != self.name:
+                raise DockerCleanupError("docker inventory returned an unexpected name")
+            rows.append(DockerIdentity(container_id, name, nonce))
         return rows
+
+
+def _fullmatch_container_id(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _parse_inspected_identity(payload):
+    try:
+        text = payload.decode("utf-8", "strict").strip()
+    except UnicodeDecodeError as error:
+        raise DockerOwnershipError("undecodable docker identity") from error
+    if text.count("|") != 2:
+        raise DockerOwnershipError("undecodable docker identity")
+    container_id, name, nonce = text.split("|", 2)
+    if name.startswith("/"):
+        name = name[1:]
+    if not _fullmatch_container_id(container_id):
+        raise DockerOwnershipError("docker inspect returned an invalid ID")
+    return DockerIdentity(container_id, name, nonce)
 
 
 def run_blocking_phase(phase, argv, runner, *, deadline, **kwargs):
     if phase not in BLOCKING_PHASES or deadline <= 0:
         raise ProvisioningError("invalid blocking phase")
+    kwargs.setdefault("env", closed_command_env())
     return runner.run(argv, timeout=deadline, **kwargs)
 
 
@@ -733,6 +1097,8 @@ def build_container_argv(image_digest, source, build, install, *, uid, gid):
         f"{install}:/out",
         f"docker.io/library/gcc@{image_digest}",
         "/bin/sh",
+        "-eu",
+        "-c",
         command,
     ]
 
@@ -765,11 +1131,36 @@ def measure_elf_pins(path, runner, *, deadline):
     )
     if version.returncode != 0:
         raise PublicationError("runtime version command failed")
-    return ElfPins(
-        value.st_size,
-        _hash_path(path),
-        hashlib.sha256(version.stdout).hexdigest(),
-    )
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        digest = hash_retained_fd(fd, runner, deadline=deadline)
+    finally:
+        os.close(fd)
+    return ElfPins(value.st_size, digest, hashlib.sha256(version.stdout).hexdigest())
+
+
+def require_strace_6_6(output):
+    first_line = bytes(output).split(b"\n", 1)[0]
+    if first_line != b"strace -- version 6.6":
+        raise PublicationError("unexpected strace version output")
+
+
+def verify_strace_version(path, runner, *, deadline):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        result = run_blocking_phase(
+            "elf_version",
+            [f"/proc/self/fd/{fd}", "--version"],
+            runner,
+            deadline=deadline,
+            pass_fds=(fd,),
+        )
+    finally:
+        os.close(fd)
+    if result.returncode != 0:
+        raise PublicationError("runtime version command failed")
+    require_strace_6_6(result.stdout)
+    return hashlib.sha256(result.stdout).hexdigest()
 
 
 def retain_staged_install(path, pins, runner, *, deadline):
@@ -811,6 +1202,49 @@ def retain_staged_install(path, pins, runner, *, deadline):
         for fd in (elf_fd, root_fd, parent_fd):
             if fd >= 0:
                 os.close(fd)
+    _verify_retained_measurement(measurement, pins, runner, deadline)
+    return measurement
+
+
+def retain_owned_staged_install(
+    path, parent_fd, owned_root, pins, runner, *, deadline
+):
+    path = Path(path)
+    retained_parent = os.dup(parent_fd)
+    root_fd = os.dup(owned_root.fd)
+    bin_fd = elf_fd = -1
+    try:
+        root_value = os.fstat(root_fd)
+        if (root_value.st_dev, root_value.st_ino) != (
+            owned_root.device,
+            owned_root.inode,
+        ):
+            raise PublicationError("owned staging directory identity changed")
+        bin_fd = os.open(
+            "bin", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
+        )
+        elf_fd = os.open("strace", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=bin_fd)
+        elf_value = os.fstat(elf_fd)
+        if not stat.S_ISREG(elf_value.st_mode):
+            raise PublicationError("staged runtime is not a regular file")
+        measurement = StagedInstall(
+            path,
+            retained_parent,
+            root_fd,
+            elf_fd,
+            root_value.st_dev,
+            root_value.st_ino,
+            elf_value.st_dev,
+            elf_value.st_ino,
+        )
+        retained_parent = root_fd = elf_fd = -1
+    finally:
+        if bin_fd >= 0:
+            os.close(bin_fd)
+        for fd in (elf_fd, root_fd, retained_parent):
+            if fd >= 0:
+                os.close(fd)
+    _verify_staging_name(measurement)
     _verify_retained_measurement(measurement, pins, runner, deadline)
     return measurement
 
@@ -894,6 +1328,8 @@ def publish_install_directory(
     runner,
     *,
     deadline,
+    before_marker=None,
+    before_rename=None,
     after_rename=None,
     after_approval=None,
     signal_latch=None,
@@ -910,11 +1346,51 @@ def publish_install_directory(
     _raise_if_interrupted(signal_latch)
     committed = False
     installed_fd = -1
+    transition = PublicationTransition(
+        "STAGED",
+        str(destination),
+        str(quarantine),
+        measurement.root_device,
+        measurement.root_inode,
+    )
     try:
+        if before_marker is not None:
+            before_marker(staged)
+        _raise_if_interrupted(signal_latch)
+        marker = _approval_payload(measurement, pins)
+        marker_fd = os.open(
+            APPROVAL_MARKER,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=measurement.root_fd,
+        )
+        try:
+            _write_fd(marker_fd, marker)
+            os.fsync(marker_fd)
+        finally:
+            os.close(marker_fd)
+        os.fsync(measurement.root_fd)
+        _verify_approved_install_at(
+            measurement.parent_fd,
+            staged.name,
+            pins,
+            runner,
+            deadline=deadline,
+        )
+        if before_rename is not None:
+            before_rename(staged)
+        _raise_if_interrupted(signal_latch)
         _rename_no_replace(
             measurement.parent_fd, staged.name, measurement.parent_fd, destination.name
         )
         committed = True
+        transition = PublicationTransition(
+            "PUBLISHED",
+            str(destination),
+            str(quarantine),
+            measurement.root_device,
+            measurement.root_inode,
+        )
         os.fsync(measurement.parent_fd)
         installed_fd = os.open(
             destination.name,
@@ -930,19 +1406,6 @@ def publish_install_directory(
         if after_rename is not None:
             after_rename(destination)
         _raise_if_interrupted(signal_latch)
-        marker = _approval_payload(measurement, pins)
-        marker_fd = os.open(
-            APPROVAL_MARKER,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=installed_fd,
-        )
-        try:
-            _write_fd(marker_fd, marker)
-            os.fsync(marker_fd)
-        finally:
-            os.close(marker_fd)
-        os.fsync(installed_fd)
         if after_approval is not None:
             after_approval(destination)
         _raise_if_interrupted(signal_latch)
@@ -955,6 +1418,7 @@ def publish_install_directory(
         )
         _raise_if_interrupted(signal_latch)
         os.fsync(measurement.parent_fd)
+        return transition
     except BaseException as error:
         if committed:
             try:
@@ -975,13 +1439,69 @@ def publish_install_directory(
                     quarantine.name,
                 )
                 os.fsync(measurement.parent_fd)
+                quarantine_fd = os.open(
+                    quarantine.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=measurement.parent_fd,
+                )
+                try:
+                    _mark_quarantined(quarantine_fd)
+                finally:
+                    os.close(quarantine_fd)
+                os.fsync(measurement.parent_fd)
+                transition = PublicationTransition(
+                    "QUARANTINED",
+                    str(destination),
+                    str(quarantine),
+                    measurement.root_device,
+                    measurement.root_inode,
+                )
             except BaseException as rollback_error:
-                raise PublicationError("AMBIGUOUS_INSTALL_COMMIT") from rollback_error
-            raise PublicationError("ROLLED_BACK_INSTALL_COMMIT") from error
-        raise
+                raise PublicationError(
+                    "AMBIGUOUS_INSTALL_COMMIT", transition=transition
+                ) from rollback_error
+            raise PublicationError(
+                "ROLLED_BACK_INSTALL_COMMIT", transition=transition
+            ) from error
+        if isinstance(error, (FileExistsError, ProvisioningInterrupted)):
+            raise
+        if isinstance(error, PublicationError):
+            if error.transition is None:
+                error.transition = transition
+            raise
+        raise PublicationError(
+            "STAGED_INSTALL_NOT_PUBLISHED", transition=transition
+        ) from error
     finally:
         if installed_fd >= 0:
             os.close(installed_fd)
+
+
+def _mark_quarantined(directory_fd):
+    marker_fd = os.open(
+        APPROVAL_MARKER,
+        os.O_RDWR | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    try:
+        value = os.fstat(marker_fd)
+        if not stat.S_ISREG(value.st_mode):
+            raise PublicationError("quarantine marker identity changed")
+        payload = os.read(marker_fd, 8193)
+        if len(payload) > 8192:
+            raise PublicationError("oversized quarantine marker")
+        marker = _closed_json(payload)
+        marker["state"] = "QUARANTINED"
+        marker["rollback_state"] = "ROLLED_BACK"
+        encoded = (
+            json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        _write_fd(marker_fd, encoded)
+        os.fchmod(marker_fd, 0o600)
+        os.fsync(marker_fd)
+    finally:
+        os.close(marker_fd)
+    os.fsync(directory_fd)
 
 
 def verify_approved_install(destination, pins, runner, *, deadline):
@@ -1089,34 +1609,40 @@ def _write_fd(fd, payload):
         view = view[written:]
 
 
-def _hash_fd(fd):
-    position = os.lseek(fd, 0, os.SEEK_CUR)
-    os.lseek(fd, 0, os.SEEK_SET)
-    digest = hashlib.sha256()
-    while True:
-        block = os.read(fd, 1024 * 1024)
-        if not block:
-            break
-        digest.update(block)
-    os.lseek(fd, position, os.SEEK_SET)
-    return digest.hexdigest()
-
-
-def _hash_path(path):
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        while True:
-            block = stream.read(1024 * 1024)
-            if not block:
-                return digest.hexdigest()
-            digest.update(block)
+def hash_retained_fd(fd, runner, *, deadline, hasher="/usr/bin/sha256sum"):
+    before = os.fstat(fd)
+    result = run_blocking_phase(
+        "elf_validation",
+        [hasher, "--", f"/proc/self/fd/{fd}"],
+        runner,
+        deadline=deadline,
+        pass_fds=(fd,),
+    )
+    after = os.fstat(fd)
+    if (before.st_dev, before.st_ino, before.st_size) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+    ):
+        raise PublicationError("retained file changed during hashing")
+    if result.returncode != 0:
+        raise PublicationError("owned hasher failed")
+    try:
+        fields = result.stdout.decode("ascii", "strict").split()
+    except UnicodeDecodeError as error:
+        raise PublicationError("owned hasher returned undecodable output") from error
+    if len(fields) < 1 or len(fields[0]) != 64 or any(
+        character not in "0123456789abcdef" for character in fields[0]
+    ):
+        raise PublicationError("owned hasher returned invalid digest")
+    return fields[0]
 
 
 def _verify_elf_fd(fd, pins, runner, deadline):
     value = os.fstat(fd)
     if not stat.S_ISREG(value.st_mode) or value.st_size != pins.size:
         raise PublicationError("ELF size changed")
-    if _hash_fd(fd) != pins.sha256:
+    if hash_retained_fd(fd, runner, deadline=deadline) != pins.sha256:
         raise PublicationError("ELF digest changed")
     version = run_blocking_phase(
         "elf_version",
@@ -1310,39 +1836,53 @@ def candidate_evidence(recipe_sha256, container_image_digest, pins):
     }
 
 
-def transfer_archive(source, snapshot, runner, *, deadline):
+def archive_transfer_argv(source, snapshot):
     if source is None:
-        argv = [
+        return [
             "/usr/bin/curl",
+            "--disable",
             "--fail",
             "--location",
             "--proto",
             "=https",
             "--tlsv1.2",
+            "--noproxy",
+            "*",
             "--output",
             str(snapshot),
             SOURCE_URL,
         ]
-    else:
-        argv = [
-            "/usr/bin/cp",
-            "--reflink=never",
-            "--",
-            f"/proc/self/fd/{source.fd}",
-            str(snapshot),
-        ]
+    return [
+        "/usr/bin/cp",
+        "--reflink=never",
+        "--",
+        f"/proc/self/fd/{source.fd}",
+        str(snapshot),
+    ]
+
+
+def transfer_archive(source, snapshot, runner, *, deadline, snapshot_fd=None):
+    target = (
+        retained_fd_path(snapshot_fd)
+        if snapshot_fd is not None
+        else Path(snapshot)
+    )
+    argv = archive_transfer_argv(source, target)
+    passed = [] if source is None else [source.fd]
+    if snapshot_fd is not None:
+        passed.append(snapshot_fd)
     result = run_blocking_phase(
         "archive_transfer",
         argv,
         runner,
         deadline=deadline,
-        pass_fds=() if source is None else (source.fd,),
+        pass_fds=tuple(passed),
     )
     if result.returncode != 0:
         raise ArchiveValidationError("archive transfer failed")
 
 
-def validate_build_pins(row, script_path):
+def validate_build_pins(row, script_path, runner, deadline=10.0):
     build = row["build"]
     if (
         build["review_state"] != "REVIEWED"
@@ -1350,7 +1890,12 @@ def validate_build_pins(row, script_path):
         or not re_fullmatch_sha256_digest(build["container_image_digest"])
     ):
         raise ProvisioningError("PENDING_REPRODUCIBLE_BUILD")
-    if _hash_path(script_path) != build["recipe_sha256"]:
+    fd = os.open(script_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        digest = hash_retained_fd(fd, runner, deadline=deadline)
+    finally:
+        os.close(fd)
+    if digest != build["recipe_sha256"]:
         raise ProvisioningError("reviewed build recipe sha256 mismatch")
 
 
@@ -1464,33 +2009,29 @@ def _validate_local_source(path, runner, deadline):
         raise
 
 
-def _validate_snapshot(path, runner, deadline):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        size, digest = _bounded_file_measurement(
-            fd, runner, phase="archive_validation", deadline=deadline
-        )
-        if size != SOURCE_SIZE:
-            raise ArchiveValidationError("source archive size mismatch")
-        if digest != SOURCE_SHA256:
-            raise ArchiveValidationError("source archive sha256 mismatch")
-        result = run_blocking_phase(
-            "archive_validation",
-            [
-                PYTHON,
-                "-c",
-                _ARCHIVE_VALIDATOR_PROGRAM,
-                f"/proc/self/fd/{fd}",
-                TOP_DIRECTORY,
-            ],
-            runner,
-            deadline=deadline,
-            pass_fds=(fd,),
-        )
-        if result.returncode != 0:
-            raise ArchiveValidationError("source archive member validation failed")
-    finally:
-        os.close(fd)
+def _validate_snapshot_fd(fd, runner, deadline):
+    size, digest = _bounded_file_measurement(
+        fd, runner, phase="archive_validation", deadline=deadline
+    )
+    if size != SOURCE_SIZE:
+        raise ArchiveValidationError("source archive size mismatch")
+    if digest != SOURCE_SHA256:
+        raise ArchiveValidationError("source archive sha256 mismatch")
+    result = run_blocking_phase(
+        "archive_validation",
+        [
+            PYTHON,
+            "-c",
+            _ARCHIVE_VALIDATOR_PROGRAM,
+            f"/proc/self/fd/{fd}",
+            TOP_DIRECTORY,
+        ],
+        runner,
+        deadline=deadline,
+        pass_fds=(fd,),
+    )
+    if result.returncode != 0:
+        raise ArchiveValidationError("source archive member validation failed")
 
 
 def _bounded_file_measurement(fd, runner, *, phase, deadline):
@@ -1511,7 +2052,10 @@ def _bounded_file_measurement(fd, runner, *, phase, deadline):
         raise ArchiveValidationError("file identity changed during measurement")
     if result.returncode != 0:
         raise ArchiveValidationError("file digest command failed")
-    token = result.stdout.decode("ascii", "strict").split()
+    try:
+        token = result.stdout.decode("ascii", "strict").split()
+    except UnicodeDecodeError as error:
+        raise ArchiveValidationError("invalid file digest output") from error
     if (
         len(token) < 1
         or len(token[0]) != 64
@@ -1521,6 +2065,15 @@ def _bounded_file_measurement(fd, runner, *, phase, deadline):
     return before.st_size, token[0]
 
 
+def cleanup_publication_stage(registry, entry, transition):
+    if transition is not None and transition.state == "PUBLISHED":
+        raise PublicationError(
+            "published install has an unresolved cleanup transition",
+            transition=transition,
+        )
+    registry.remove_tree(entry)
+
+
 def provision(script_path: Path, argv: Sequence[str]) -> int:
     latch = SignalLatch()
     latch.install()
@@ -1528,9 +2081,10 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
     script_path = script_path.resolve(strict=True)
     row = _load_policy(script_path.parent / "policies/holoagent0-trace-tool-v1.json")
     runner = OwnedSessionRunner(signal_latch=latch)
+    cleanup_runner = runner.for_cleanup()
     source_archive = None
     if archive is None:
-        validate_build_pins(row, script_path)
+        validate_build_pins(row, script_path, runner)
     else:
         source_archive = _validate_local_source(archive, runner, 120.0)
 
@@ -1542,10 +2096,19 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
     )
     registry = None
     root = None
+    snapshot = None
     output_registry = None
     output_stage = None
     measurement = None
     docker_owner = None
+    publication_transition = None
+    docker_environment = closed_command_env(
+        {
+            key: os.environ[key]
+            for key in ("DOCKER_HOST",)
+            if key in os.environ
+        }
+    )
     cleanup_succeeded = True
     ordinary_status = 0
     try:
@@ -1554,9 +2117,14 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
         root = registry.create_directory(
             f".holoagent0-strace-{secrets.token_hex(16)}", mode=0o700
         )
-        root_path = registry.parent / root.name
-        snapshot = root_path / "strace-6.6.tar.xz"
-        transfer_archive(source_archive, snapshot, runner, deadline=120.0)
+        snapshot = create_owned_file_at(root.fd, "strace-6.6.tar.xz", mode=0o600)
+        transfer_archive(
+            source_archive,
+            retained_fd_path(snapshot.fd),
+            runner,
+            deadline=120.0,
+            snapshot_fd=snapshot.fd,
+        )
         if source_archive is not None:
             current = os.fstat(source_archive.fd)
             if (current.st_dev, current.st_ino) != (
@@ -1565,24 +2133,24 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
             ):
                 raise ArchiveValidationError("source archive identity changed")
             source_archive.close()
-        _validate_snapshot(snapshot, runner, 120.0)
+        _validate_snapshot_fd(snapshot.fd, runner, 120.0)
         if archive is not None:
-            validate_build_pins(row, script_path)
+            validate_build_pins(row, script_path, runner)
         if output is not None:
             runtime_pins = validate_runtime_pins(row)
             output_registry = OwnedPathRegistry(output.parent)
             output_stage = output_registry.create_directory(
                 f".holoagent0-strace-install-{secrets.token_hex(16)}", mode=0o700
             )
-            install_path = output.parent / output_stage.name
+            install_path = retained_fd_path(output_stage.fd)
         else:
             os.mkdir("install", 0o700, dir_fd=root.fd)
-            install_path = root_path / "install"
+            install_path = retained_fd_path(root.fd, "install")
             runtime_pins = None
         os.mkdir("source", 0o700, dir_fd=root.fd)
         os.mkdir("build", 0o700, dir_fd=root.fd)
-        source_path = root_path / "source"
-        build_path = root_path / "build"
+        source_path = retained_fd_path(root.fd, "source")
+        build_path = retained_fd_path(root.fd, "build")
         extraction = run_blocking_phase(
             "archive_extraction",
             [
@@ -1590,15 +2158,16 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
                 "--extract",
                 "--xz",
                 "--file",
-                str(snapshot),
+                str(retained_fd_path(snapshot.fd)),
                 "--directory",
-                str(source_path),
+                str(retained_fd_path(root.fd, "source")),
                 "--no-same-owner",
                 "--no-same-permissions",
                 TOP_DIRECTORY,
             ],
             runner,
             deadline=120.0,
+            pass_fds=(snapshot.fd, root.fd),
         )
         if extraction.returncode != 0:
             raise ArchiveValidationError("source extraction failed")
@@ -1614,17 +2183,23 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
         docker_owner = DockerOwner(
             DOCKER,
             runner,
+            cleanup_runner=cleanup_runner,
             name=f"holoagent0-strace-{nonce}",
             nonce=nonce,
             stabilization=1.0,
             command_timeout=3.0,
         )
         built = docker_owner.run_container(
-            build_argv[2:], timeout=3600.0, env={**os.environ, **BUILD_ENV}
+            build_argv[2:], timeout=3600.0, env=docker_environment
         )
         if built.returncode != 0:
             raise ProvisioningError("reproducible strace build failed")
         measured = measure_elf_pins(install_path / "bin/strace", runner, deadline=10.0)
+        version_digest = verify_strace_version(
+            install_path / "bin/strace", runner, deadline=10.0
+        )
+        if version_digest != measured.version_sha256:
+            raise PublicationError("runtime version output changed")
         measured = ElfPins(
             measured.size,
             measured.sha256,
@@ -1645,46 +2220,75 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
         else:
             if measured != runtime_pins:
                 raise ProvisioningError("built runtime does not match reviewed pins")
-            measurement = retain_staged_install(
-                install_path, runtime_pins, runner, deadline=10.0
+            measurement = retain_owned_staged_install(
+                output.parent / output_stage.name,
+                output_registry.parent_fd,
+                output_stage,
+                runtime_pins,
+                runner,
+                deadline=10.0,
             )
             quarantine = (
                 output.parent / f".holoagent0-strace-quarantine-{secrets.token_hex(16)}"
             )
-            publish_install_directory(
-                install_path,
-                output,
-                quarantine,
-                measurement,
-                runtime_pins,
-                runner,
-                deadline=10.0,
-                signal_latch=latch,
-            )
+            try:
+                publication_transition = publish_install_directory(
+                    output.parent / output_stage.name,
+                    output,
+                    quarantine,
+                    measurement,
+                    runtime_pins,
+                    runner,
+                    deadline=10.0,
+                    signal_latch=latch,
+                )
+            except PublicationError as error:
+                publication_transition = error.transition
+                if (
+                    publication_transition is not None
+                    and publication_transition.state == "QUARANTINED"
+                ):
+                    output_stage.name = Path(publication_transition.quarantine).name
+                raise
             output_registry.forget(output_stage)
             output_stage = None
     except ProvisioningInterrupted as error:
         ordinary_status = error.status
     finally:
         with latch.block_for_cleanup():
-            try:
-                if source_archive is not None:
-                    source_archive.close()
-                if docker_owner is not None:
-                    docker_owner.cleanup(env={**os.environ, **BUILD_ENV})
-                if measurement is not None:
-                    measurement.close()
-                if output_registry is not None and output_stage is not None:
-                    output_registry.remove_tree(output_stage)
-                if registry is not None and root is not None:
-                    registry.remove_tree(root)
-            except BaseException:
-                cleanup_succeeded = False
-            finally:
-                if output_registry is not None:
-                    output_registry.close()
-                if registry is not None:
-                    registry.close()
+            actions = []
+            if source_archive is not None:
+                actions.append(("source_archive", source_archive.close))
+            if docker_owner is not None:
+                actions.append(
+                    (
+                        "docker",
+                        lambda: docker_owner.cleanup(env=docker_environment),
+                    )
+                )
+            if measurement is not None:
+                actions.append(("measurement", measurement.close))
+            if snapshot is not None:
+                actions.append(("snapshot", lambda: close_owned_path(snapshot)))
+            if output_registry is not None and output_stage is not None:
+                actions.append(
+                    (
+                        "output",
+                        lambda: cleanup_publication_stage(
+                            output_registry,
+                            output_stage,
+                            publication_transition,
+                        ),
+                    )
+                )
+            if registry is not None and root is not None:
+                actions.append(("root", lambda: registry.remove_tree(root)))
+            if output_registry is not None:
+                actions.append(("output_registry", output_registry.close))
+            if registry is not None:
+                actions.append(("registry", registry.close))
+            report = aggregate_cleanup(actions)
+            cleanup_succeeded = report.succeeded
     return latch.final_status(
         cleanup_succeeded=cleanup_succeeded, ordinary_status=ordinary_status
     )
