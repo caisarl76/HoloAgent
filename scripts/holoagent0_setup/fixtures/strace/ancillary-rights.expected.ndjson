@@ -1,0 +1,1 @@
+{"control":{"scm_rights":[{"fd":9,"provenance":"/tmp/a"},{"fd":10,"provenance":"socket:[10]"}]},"duration":"0.000006","entry_index":0,"exit_index":0,"fds":[{"fd":8,"provenance":"socket:[80]"}],"flags":["MSG_NOSIGNAL"],"kind":"syscall","lengths":{"iov_count":1,"message":14},"pid":104,"record_index":0,"result":{"value":14},"syscall":"sendmsg","timestamp":"1700000003.000001"}

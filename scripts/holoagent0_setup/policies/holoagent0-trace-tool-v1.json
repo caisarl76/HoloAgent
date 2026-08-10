@@ -14,7 +14,7 @@
         "sha256": "421b4186c06b705163e64dc85f271ebdcf67660af8667283147d5e859fc8a96c"
       },
       "build": {
-        "recipe_path": "scripts/holoagent0_setup/trace/build-strace-6.6.sh",
+        "recipe_path": "scripts/holoagent0_setup/provision_strace_6_6.sh",
         "recipe_sha256": null,
         "container_image_digest": null,
         "digest_algorithm": "sha256",
@@ -29,10 +29,10 @@
         "review_state": "PENDING_REPRODUCIBLE_BUILD"
       },
       "parser": {
-        "path": "scripts/holoagent0_setup/holoagent0_setup/trace_parser.py",
-        "sha256": null,
+        "path": "scripts/holoagent0_setup/holoagent0_setup/trace_normalizer.py",
+        "sha256": "a34851683c13066d79f3ab83bb34ecb36114c08588e78b319e0e8641af30c992",
         "digest_algorithm": "sha256",
-        "review_state": "PENDING_IMPLEMENTATION_REVIEW"
+        "review_state": "REVIEWED"
       },
       "argv": {
         "options": [
@@ -75,15 +75,15 @@
           "LC_ALL": "C",
           "TZ": "UTC"
         },
-        "canonical_sha256": null,
+        "canonical_sha256": "c0f9ef1f4680ab2d8b660b4c38ff666c01ae5da5c9391efba4b9a89fd423c9cc",
         "digest_algorithm": "sha256",
-        "review_state": "PENDING_IMPLEMENTATION_REVIEW"
+        "review_state": "REVIEWED"
       },
       "fixtures": {
-        "manifest_path": "scripts/holoagent0_setup/trace/fixtures/manifest-v1.json",
-        "manifest_sha256": null,
+        "manifest_path": "scripts/holoagent0_setup/fixtures/strace/manifest-v1.json",
+        "manifest_sha256": "016c0437c7ec04b70fdfbf581f835d9d0b41b1c8efcf8e1a37218167fd278f8b",
         "digest_algorithm": "sha256",
-        "review_state": "PENDING_IMPLEMENTATION_REVIEW"
+        "review_state": "REVIEWED"
       }
     }
   ],

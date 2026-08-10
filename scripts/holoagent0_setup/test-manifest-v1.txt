@@ -6,3 +6,5 @@ scripts/holoagent0_setup/tests/test_ledger.py
 scripts/holoagent0_setup/tests/test_broker.py
 scripts/holoagent0_setup/tests/test_process_identity.py
 scripts/holoagent0_setup/tests/test_signal_handoff.py
+scripts/holoagent0_setup/tests/test_trace_normalizer.py
+scripts/holoagent0_setup/tests/test_strace_provisioner.py
