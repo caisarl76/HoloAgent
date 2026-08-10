@@ -1,8 +1,4 @@
-#!/bin/bash
-set -euo pipefail
-PATH='/usr/bin:/bin'
-export PATH
-exec /usr/bin/python3.10 -I -S - "$0" "$@" <<'PY'
+#!/usr/bin/env -S /usr/bin/python3.10 -I -S
 # BEGIN_PROVISIONER_PYTHON
 from contextlib import contextmanager
 import ctypes
@@ -150,7 +146,9 @@ def closed_command_env(extra=None):
         }
         unknown = set(extra) - allowed
         if unknown:
-            raise ProvisioningError(f"unapproved command environment: {sorted(unknown)}")
+            raise ProvisioningError(
+                f"unapproved command environment: {sorted(unknown)}"
+            )
         docker_host = extra.get("DOCKER_HOST")
         if docker_host is not None:
             socket_path = Path(docker_host.removeprefix("unix://"))
@@ -228,7 +226,9 @@ def seal_retained_archive(archive):
     value = os.fstat(archive.fd)
     if (value.st_dev, value.st_ino) != (archive.device, archive.inode):
         raise ArchiveValidationError("retained archive identity changed before sealing")
-    seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    seals = (
+        fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    )
     try:
         fcntl.fcntl(archive.fd, fcntl.F_ADD_SEALS, seals)
     except OSError as error:
@@ -241,7 +241,9 @@ def verify_sealed_archive(archive):
     value = os.fstat(archive.fd)
     if (value.st_dev, value.st_ino) != (archive.device, archive.inode):
         raise ArchiveValidationError("sealed archive identity changed")
-    required = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    required = (
+        fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    )
     try:
         actual = fcntl.fcntl(archive.fd, fcntl.F_GET_SEALS)
     except OSError as error:
@@ -328,7 +330,8 @@ class OwnedSessionRunner:
         baseline = _direct_child_identities(os.getpid())
         release_read, release_write = os.pipe2(os.O_CLOEXEC)
         inherited = tuple(sorted({release_read, *(int(fd) for fd in pass_fds)}))
-        command = isolated_python_argv(_RELEASE_TRAMPOLINE, str(release_read), *map(str, argv))
+        command = isolated_python_argv(_RELEASE_TRAMPOLINE)
+        command.extend((str(release_read), *map(str, argv)))
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -541,7 +544,10 @@ class OwnedSessionRunner:
                 key = (identity.pid, identity.start_time)
                 if key in baseline or identity.pid in owned:
                     continue
-                adopted = parent_pid == os.getpid() and identity.start_time >= leader.start_time
+                adopted = (
+                    parent_pid == os.getpid()
+                    and identity.start_time >= leader.start_time
+                )
                 if parent_pid not in owned and not adopted:
                     continue
                 try:
@@ -610,10 +616,80 @@ class OwnedSessionRunner:
 
 
 _RELEASE_TRAMPOLINE = r"""
+import ctypes
+import errno
 import os
 import sys
+
+class SockFilter(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_ushort),
+        ("jt", ctypes.c_ubyte),
+        ("jf", ctypes.c_ubyte),
+        ("k", ctypes.c_uint32),
+    ]
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_ushort),
+        ("filters", ctypes.POINTER(SockFilter)),
+    ]
+
+def install_escape_filter():
+    if os.uname().machine != "x86_64":
+        raise SystemExit(126)
+    load_word_absolute = 0x20
+    jump_equal = 0x15
+    jump_bits_set = 0x45
+    return_constant = 0x06
+    audit_arch_x86_64 = 0xC000003E
+    seccomp_allow = 0x7FFF0000
+    seccomp_errno = 0x00050000 | errno.EPERM
+    seccomp_kill_process = 0x80000000
+    namespace_flags = (
+        0x00020000
+        | 0x02000000
+        | 0x04000000
+        | 0x08000000
+        | 0x10000000
+        | 0x20000000
+        | 0x40000000
+    )
+    instructions = [
+        (load_word_absolute, 0, 0, 4),
+        (jump_equal, 1, 0, audit_arch_x86_64),
+        (return_constant, 0, 0, seccomp_kill_process),
+        (load_word_absolute, 0, 0, 0),
+    ]
+    for syscall_number in (112, 272, 308, 435):
+        instructions.extend(
+            [
+                (jump_equal, 0, 1, syscall_number),
+                (return_constant, 0, 0, seccomp_errno),
+            ]
+        )
+    instructions.extend(
+        [
+            (jump_equal, 0, 3, 56),
+            (load_word_absolute, 0, 0, 16),
+            (jump_bits_set, 0, 1, namespace_flags),
+            (return_constant, 0, 0, seccomp_errno),
+            (return_constant, 0, 0, seccomp_allow),
+        ]
+    )
+    filters = (SockFilter * len(instructions))(
+        *(SockFilter(*instruction) for instruction in instructions)
+    )
+    program = SockFprog(len(filters), filters)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(38, 1, 0, 0, 0) != 0:
+        raise SystemExit(126)
+    if libc.prctl(22, 2, ctypes.byref(program)) != 0:
+        raise SystemExit(126)
+
 release_fd = int(sys.argv[1])
 command = sys.argv[2:]
+install_escape_filter()
 token = os.read(release_fd, 1)
 os.close(release_fd)
 if token != b"G" or not command:
@@ -920,7 +996,9 @@ def retained_fd_path(fd, suffix=None):
     if suffix is None:
         return Path(value)
     relative = PurePosixPath(suffix)
-    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+    if relative.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative.parts
+    ):
         raise PathIdentityError("retained FD suffix must be a safe relative path")
     return Path(value).joinpath(*relative.parts)
 
@@ -1037,18 +1115,13 @@ class DockerOwner:
             rows = self._inventory(env)
             if self._active_identity is None:
                 if rows:
-                    if len(rows) != 1 or rows[0].nonce != self.nonce:
-                        raise DockerOwnershipError(
-                            "container name has a foreign or ambiguous owner"
-                        )
                     if not self.attempted:
-                        self._verify_bound_identity(rows[0], env)
-                        raise DockerCleanupError(
-                            "container was not created by this owner"
+                        raise DockerOwnershipError(
+                            "container name was not created by this owner"
                         )
-                    self._active_identity = rows[0]
-                    self.created_identity = rows[0]
-                    self._verify_bound_identity(rows[0], env)
+                    raise DockerCleanupError(
+                        "response-less docker create outcome remained unresolved"
+                    )
             elif rows:
                 if rows != [self._active_identity]:
                     raise DockerOwnershipError(
@@ -1267,30 +1340,57 @@ def re_fullmatch_sha256_digest(value):
     return all(character in "0123456789abcdef" for character in value[7:])
 
 
-def measure_elf_pins(path, runner, *, deadline):
+def measure_elf_pins(path, runner, *, deadline, require_exact=False):
     path = Path(path)
-    value = path.lstat()
-    if not stat.S_ISREG(value.st_mode) or path.is_symlink():
+    named = path.lstat()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise PublicationError("runtime must be a regular non-symlink ELF")
+        return _measure_elf_fd(fd, runner, deadline, require_exact=require_exact)
+    finally:
+        os.close(fd)
+
+
+def _measure_elf_fd(fd, runner, deadline, *, require_exact=False):
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode):
         raise PublicationError("runtime must be a regular non-symlink ELF")
+    retained = f"/proc/self/fd/{fd}"
     validation = run_blocking_phase(
         "elf_validation",
-        isolated_python_argv(_ELF_VALIDATOR, str(path)),
+        isolated_python_argv(_ELF_VALIDATOR, retained),
         runner,
         deadline=deadline,
+        pass_fds=(fd,),
     )
     if validation.returncode != 0:
         raise PublicationError("runtime is not linux-x86_64 ELF")
     version = run_blocking_phase(
-        "elf_version", [str(path), "--version"], runner, deadline=deadline
+        "elf_version",
+        [retained, "--version"],
+        runner,
+        deadline=deadline,
+        pass_fds=(fd,),
     )
     if version.returncode != 0:
         raise PublicationError("runtime version command failed")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        digest = hash_retained_fd(fd, runner, deadline=deadline)
-    finally:
-        os.close(fd)
-    return ElfPins(value.st_size, digest, hashlib.sha256(version.stdout).hexdigest())
+    if require_exact:
+        require_strace_6_6(version.stdout)
+    digest = hash_retained_fd(fd, runner, deadline=deadline)
+    after = os.fstat(fd)
+    if (before.st_dev, before.st_ino, before.st_size) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+    ):
+        raise PublicationError("runtime identity changed during measurement")
+    return ElfPins(before.st_size, digest, hashlib.sha256(version.stdout).hexdigest())
 
 
 def require_strace_6_6(output):
@@ -1360,9 +1460,18 @@ def retain_staged_install(path, pins, runner, *, deadline):
     return measurement
 
 
-def retain_owned_staged_install(
-    path, parent_fd, owned_root, pins, runner, *, deadline
-):
+def retain_owned_staged_install(path, parent_fd, owned_root, pins, runner, *, deadline):
+    measurement = open_owned_staged_install(path, parent_fd, owned_root)
+    try:
+        _verify_staging_name(measurement)
+        _verify_retained_measurement(measurement, pins, runner, deadline)
+    except BaseException:
+        measurement.close()
+        raise
+    return measurement
+
+
+def open_owned_staged_install(path, parent_fd, owned_root):
     path = Path(path)
     retained_parent = os.dup(parent_fd)
     root_fd = os.dup(owned_root.fd)
@@ -1398,8 +1507,6 @@ def retain_owned_staged_install(
         for fd in (elf_fd, root_fd, retained_parent):
             if fd >= 0:
                 os.close(fd)
-    _verify_staging_name(measurement)
-    _verify_retained_measurement(measurement, pins, runner, deadline)
     return measurement
 
 
@@ -1831,8 +1938,10 @@ def hash_retained_fd(fd, runner, *, deadline, hasher="/usr/bin/sha256sum"):
         fields = result.stdout.decode("ascii", "strict").split()
     except UnicodeDecodeError as error:
         raise PublicationError("owned hasher returned undecodable output") from error
-    if len(fields) < 1 or len(fields[0]) != 64 or any(
-        character not in "0123456789abcdef" for character in fields[0]
+    if (
+        len(fields) < 1
+        or len(fields[0]) != 64
+        or any(character not in "0123456789abcdef" for character in fields[0])
     ):
         raise PublicationError("owned hasher returned invalid digest")
     return fields[0]
@@ -2063,9 +2172,7 @@ def archive_transfer_argv(source, snapshot):
 
 def transfer_archive(source, snapshot, runner, *, deadline, snapshot_fd=None):
     target = (
-        retained_fd_path(snapshot_fd)
-        if snapshot_fd is not None
-        else Path(snapshot)
+        retained_fd_path(snapshot_fd) if snapshot_fd is not None else Path(snapshot)
     )
     argv = archive_transfer_argv(source, target)
     passed = [] if source is None else [source.fd]
@@ -2217,9 +2324,11 @@ def _validate_snapshot_fd(fd, runner, deadline):
         raise ArchiveValidationError("source archive size mismatch")
     if digest != SOURCE_SHA256:
         raise ArchiveValidationError("source archive sha256 mismatch")
+    validator_argv = isolated_python_argv(_ARCHIVE_VALIDATOR_PROGRAM)
+    validator_argv.extend((f"/proc/self/fd/{fd}", TOP_DIRECTORY))
     result = run_blocking_phase(
         "archive_validation",
-        isolated_python_argv(_ARCHIVE_VALIDATOR_PROGRAM, f"/proc/self/fd/{fd}", TOP_DIRECTORY),
+        validator_argv,
         runner,
         deadline=deadline,
         pass_fds=(fd,),
@@ -2297,11 +2406,7 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
     docker_owner = None
     publication_transition = None
     docker_environment = closed_command_env(
-        {
-            key: os.environ[key]
-            for key in ("DOCKER_HOST",)
-            if key in os.environ
-        }
+        {key: os.environ[key] for key in ("DOCKER_HOST",) if key in os.environ}
     )
     cleanup_succeeded = True
     ordinary_status = 0
@@ -2392,12 +2497,23 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
         )
         if built.returncode != 0:
             raise ProvisioningError("reproducible strace build failed")
-        measured = measure_elf_pins(install_path / "bin/strace", runner, deadline=10.0)
-        version_digest = verify_strace_version(
-            install_path / "bin/strace", runner, deadline=10.0
-        )
-        if version_digest != measured.version_sha256:
-            raise PublicationError("runtime version output changed")
+        if output is not None:
+            measurement = open_owned_staged_install(
+                output.parent / output_stage.name,
+                output_registry.parent_fd,
+                output_stage,
+            )
+            _verify_staging_name(measurement)
+            measured = _measure_elf_fd(
+                measurement.elf_fd, runner, 10.0, require_exact=True
+            )
+        else:
+            measured = measure_elf_pins(
+                install_path / "bin/strace",
+                runner,
+                deadline=10.0,
+                require_exact=True,
+            )
         measured = ElfPins(
             measured.size,
             measured.sha256,
@@ -2418,14 +2534,7 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
         else:
             if measured != runtime_pins:
                 raise ProvisioningError("built runtime does not match reviewed pins")
-            measurement = retain_owned_staged_install(
-                output.parent / output_stage.name,
-                output_registry.parent_fd,
-                output_stage,
-                runtime_pins,
-                runner,
-                deadline=10.0,
-            )
+            _verify_retained_measurement(measurement, runtime_pins, runner, 10.0)
             quarantine = (
                 output.parent / f".holoagent0-strace-quarantine-{secrets.token_hex(16)}"
             )
@@ -2498,6 +2607,10 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
             cleanup_succeeded = report.succeeded
     if not cleanup_succeeded:
         return 3
+    if latch.status:
+        return latch.final_status(
+            cleanup_succeeded=cleanup_succeeded, ordinary_status=ordinary_status
+        )
     if primary_error is not None and not isinstance(
         primary_error, ProvisioningInterrupted
     ):
@@ -2526,7 +2639,6 @@ def main(argv: Sequence[str]) -> int:
         return 3
 
 
-if __name__ == "__main__" and len(sys.argv) > 1:
-    raise SystemExit(main(sys.argv[1:]))
+if __name__ == "__main__" and "__file__" in globals():
+    raise SystemExit(main(sys.argv))
 # END_PROVISIONER_PYTHON
-PY
