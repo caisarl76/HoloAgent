@@ -304,7 +304,7 @@ def test_docker_rejects_same_label_id_replacement_and_never_removes_it(tmp_path)
     assert not (state / "rm-arg").exists()
 
 
-def test_approval_is_fsynced_in_staging_before_rename_and_rollback_is_quarantined(
+def test_approval_is_fsynced_in_staging_before_rename_and_rollback_is_disarmed(
     tmp_path,
 ):
     ns = _namespace()
@@ -333,10 +333,11 @@ def test_approval_is_fsynced_in_staging_before_rename_and_rollback_is_quarantine
             after_rename=after_rename,
         )
     assert observed == ["APPROVED"]
-    assert captured.value.transition.state == "QUARANTINED"
-    assert not destination.exists()
-    marker = json.loads((quarantine / ".holoagent0-install-approved.json").read_text())
-    assert marker["state"] == "QUARANTINED"
+    assert captured.value.transition.state == "ROLLBACK_PREPARED"
+    assert destination.is_dir()
+    assert not quarantine.exists()
+    marker = json.loads((destination / ".holoagent0-install-approved.json").read_text())
+    assert marker["state"] == "ROLLBACK_PREPARED"
     measurement.close()
 
 

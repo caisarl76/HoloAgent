@@ -129,7 +129,7 @@ def test_candidate_publish_failure_cleans_identity_bound_stage(tmp_path):
 
 
 @pytest.mark.parametrize("fault", ["post_rename_fsync", "post_rename_identity"])
-def test_post_rename_fault_rolls_install_out_of_consumer_path(tmp_path, fault):
+def test_post_rename_fault_marks_install_rollback_prepared(tmp_path, fault):
     ns = _namespace()
     staged, runner, pins, measurement = _elf_fixture(tmp_path, ns)
     destination = tmp_path / "install"
@@ -151,12 +151,14 @@ def test_post_rename_fault_rolls_install_out_of_consumer_path(tmp_path, fault):
             deadline=0.5,
             after_rename=fail_after_rename,
         )
-    assert not destination.exists()
-    assert quarantine.is_dir()
+    assert destination.is_dir()
+    assert not quarantine.exists()
+    marker = json.loads((destination / ns["APPROVAL_MARKER"]).read_text())
+    assert marker["state"] == "ROLLBACK_PREPARED"
     measurement.close()
 
 
-def test_signal_after_install_rename_rolls_back_before_exit(tmp_path):
+def test_signal_after_install_rename_marks_rollback_prepared_before_exit(tmp_path):
     ns = _namespace()
     staged, runner, pins, measurement = _elf_fixture(tmp_path, ns)
     destination = tmp_path / "install"
@@ -179,8 +181,10 @@ def test_signal_after_install_rename_rolls_back_before_exit(tmp_path):
             after_rename=signal_after_rename,
         )
     assert latch.final_status(cleanup_succeeded=True, ordinary_status=0) == 143
-    assert not destination.exists()
-    assert quarantine.is_dir()
+    assert destination.is_dir()
+    assert not quarantine.exists()
+    marker = json.loads((destination / ns["APPROVAL_MARKER"]).read_text())
+    assert marker["state"] == "ROLLBACK_PREPARED"
     measurement.close()
 
 

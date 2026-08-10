@@ -290,7 +290,7 @@ def test_validated_archive_is_sealed_and_same_bytes_reach_child(tmp_path):
         snapshot.close()
 
 
-def test_rollback_never_places_an_approved_marker_in_quarantine(tmp_path):
+def test_rollback_prepared_callback_observes_nonapproved_destination(tmp_path):
     ns = _namespace()
     staged, runner, pins, measurement = _elf_fixture(tmp_path, ns)
     destination = tmp_path / "install"
@@ -300,10 +300,10 @@ def test_rollback_never_places_an_approved_marker_in_quarantine(tmp_path):
     def fail_functionally(_installed):
         raise OSError("force rollback")
 
-    def fail_after_quarantine_rename(path):
+    def fail_after_rollback_prepared(path):
         marker = json.loads((path / ns["APPROVAL_MARKER"]).read_text())
         seen.append(marker["state"])
-        raise OSError("crash before quarantine finalization")
+        raise OSError("crash after rollback preparation")
 
     try:
         with pytest.raises(ns["PublicationError"]) as captured:
@@ -316,12 +316,13 @@ def test_rollback_never_places_an_approved_marker_in_quarantine(tmp_path):
                 runner,
                 deadline=0.5,
                 after_rename=fail_functionally,
-                after_quarantine_rename=fail_after_quarantine_rename,
+                after_rollback_prepared=fail_after_rollback_prepared,
             )
         assert seen == ["ROLLBACK_PREPARED"]
-        assert captured.value.transition.state == "QUARANTINE_PREPARED"
-        assert not destination.exists()
-        marker = json.loads((quarantine / ns["APPROVAL_MARKER"]).read_text())
+        assert captured.value.transition.state == "ROLLBACK_PREPARED"
+        assert destination.is_dir()
+        assert not quarantine.exists()
+        marker = json.loads((destination / ns["APPROVAL_MARKER"]).read_text())
         assert marker["state"] != "APPROVED"
     finally:
         measurement.close()
@@ -389,10 +390,11 @@ def test_signal_survives_successful_publication_rollback(tmp_path):
                 signal_latch=latch,
             )
         assert captured.value.status == 143
-        assert captured.value.transition.state == "QUARANTINED"
-        assert not destination.exists()
-        marker = json.loads((quarantine / ns["APPROVAL_MARKER"]).read_text())
-        assert marker["state"] == "QUARANTINED"
+        assert captured.value.transition.state == "ROLLBACK_PREPARED"
+        assert destination.is_dir()
+        assert not quarantine.exists()
+        marker = json.loads((destination / ns["APPROVAL_MARKER"]).read_text())
+        assert marker["state"] == "ROLLBACK_PREPARED"
     finally:
         measurement.close()
 
@@ -422,7 +424,11 @@ def test_explicit_interruption_survives_rollback_without_latch(tmp_path):
             )
         assert isinstance(captured.value, ns["PublicationError"])
         assert captured.value.status == 143
-        assert captured.value.transition.state == "QUARANTINED"
+        assert captured.value.transition.state == "ROLLBACK_PREPARED"
+        assert destination.is_dir()
+        assert not quarantine.exists()
+        marker = json.loads((destination / ns["APPROVAL_MARKER"]).read_text())
+        assert marker["state"] == "ROLLBACK_PREPARED"
     finally:
         measurement.close()
 

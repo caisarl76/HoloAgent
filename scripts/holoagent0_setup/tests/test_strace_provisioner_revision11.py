@@ -290,7 +290,7 @@ def _elf_fixture(tmp_path: Path, ns):
     return staged, runner, pins, measurement
 
 
-def test_quarantine_name_replacement_never_mutates_or_confuses_foreign_tree(tmp_path):
+def test_destination_replacement_after_rollback_prepared_remains_untouched(tmp_path):
     ns = _namespace()
     staged, runner, pins, measurement = _elf_fixture(tmp_path, ns)
     destination = tmp_path / "install"
@@ -301,7 +301,7 @@ def test_quarantine_name_replacement_never_mutates_or_confuses_foreign_tree(tmp_
     def fail_functionally(_installed):
         raise OSError("force rollback")
 
-    def replace_quarantine_name(path):
+    def replace_destination_name(path):
         os.rename(path, moved_expected)
         path.mkdir(mode=0o700)
         (path / ns["APPROVAL_MARKER"]).write_bytes(foreign_payload)
@@ -318,11 +318,12 @@ def test_quarantine_name_replacement_never_mutates_or_confuses_foreign_tree(tmp_
                 runner,
                 deadline=1.0,
                 after_rename=fail_functionally,
-                after_quarantine_rename=replace_quarantine_name,
+                after_rollback_prepared=replace_destination_name,
             )
-        assert captured.value.transition.state == "QUARANTINE_PREPARED"
-        assert (quarantine / ns["APPROVAL_MARKER"]).read_bytes() == foreign_payload
-        assert (quarantine / "foreign-content").read_text() == "untouched"
+        assert captured.value.transition.state == "ROLLBACK_PREPARED"
+        assert (destination / ns["APPROVAL_MARKER"]).read_bytes() == foreign_payload
+        assert (destination / "foreign-content").read_text() == "untouched"
+        assert not quarantine.exists()
         expected_marker = json.loads(
             (moved_expected / ns["APPROVAL_MARKER"]).read_text()
         )

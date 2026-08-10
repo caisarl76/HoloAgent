@@ -430,9 +430,10 @@ def test_approval_binds_identity_and_pins_and_final_verify_detects_mutation(tmp_
             deadline=0.5,
             after_approval=mutate_after_approval,
         )
-    assert not destination.exists()
-    assert quarantine.is_dir()
-    marker = json.loads((quarantine / ".holoagent0-install-approved.json").read_text())
+    assert destination.is_dir()
+    assert not quarantine.exists()
+    marker = json.loads((destination / ".holoagent0-install-approved.json").read_text())
+    assert marker["state"] == "ROLLBACK_PREPARED"
     assert marker["elf_size"] == pins.size
     assert marker["elf_sha256"] == pins.sha256
     assert marker["version_output_sha256"] == pins.version_sha256

@@ -202,3 +202,65 @@ def test_rollback_swap_after_prepared_never_moves_foreign_destination(tmp_path):
         assert marker["state"] == "ROLLBACK_PREPARED"
     finally:
         measurement.close()
+
+
+def test_finalizer_removes_only_the_retained_rollback_destination(tmp_path):
+    ns = _namespace()
+    registry = ns["OwnedPathRegistry"](tmp_path)
+    retained = registry.create_directory(".stage", mode=0o700)
+    os.rename(
+        retained.name,
+        "install",
+        src_dir_fd=registry.parent_fd,
+        dst_dir_fd=registry.parent_fd,
+    )
+    retained.name = "install"
+    transition = ns["PublicationTransition"](
+        "ROLLBACK_PREPARED",
+        str(tmp_path / "install"),
+        str(tmp_path / ".unused-quarantine"),
+        retained.device,
+        retained.inode,
+    )
+
+    try:
+        ns["cleanup_publication_stage"](registry, retained, transition)
+        assert not (tmp_path / "install").exists()
+    finally:
+        registry.close()
+
+
+def test_finalizer_rejects_and_preserves_a_replacement_destination(tmp_path):
+    ns = _namespace()
+    registry = ns["OwnedPathRegistry"](tmp_path)
+    retained = registry.create_directory(".stage", mode=0o700)
+    os.rename(
+        retained.name,
+        "install",
+        src_dir_fd=registry.parent_fd,
+        dst_dir_fd=registry.parent_fd,
+    )
+    retained.name = "install"
+    moved_original = tmp_path / ".retained-original"
+    os.rename(tmp_path / "install", moved_original)
+    replacement = tmp_path / "install"
+    replacement.mkdir(mode=0o700)
+    foreign_payload = b"foreign finalizer target must remain untouched\n"
+    (replacement / "foreign-content").write_bytes(foreign_payload)
+    transition = ns["PublicationTransition"](
+        "ROLLBACK_PREPARED",
+        str(replacement),
+        str(tmp_path / ".unused-quarantine"),
+        retained.device,
+        retained.inode,
+    )
+
+    try:
+        with pytest.raises(ns["PathIdentityError"]):
+            ns["cleanup_publication_stage"](registry, retained, transition)
+        assert replacement.is_dir()
+        assert (replacement / "foreign-content").read_bytes() == foreign_payload
+        moved = moved_original.stat()
+        assert (moved.st_dev, moved.st_ino) == (retained.device, retained.inode)
+    finally:
+        registry.close()
