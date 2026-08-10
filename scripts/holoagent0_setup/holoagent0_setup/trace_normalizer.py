@@ -653,6 +653,28 @@ def _output_length(value: str, code: str) -> int | None:
     return int(length.group(2) or length.group(1))
 
 
+def _ipv4_inet_addr(value: str, code: str) -> str:
+    match = re.fullmatch(r'inet_addr\("([^"\\]+)"\)', value)
+    if match is None:
+        raise _fail(code)
+    try:
+        return str(ipaddress.IPv4Address(match.group(1)))
+    except ipaddress.AddressValueError as error:
+        raise _fail(code) from error
+
+
+def _ip_membership(value: str) -> dict[str, str]:
+    fields = _fields(value, "ip-membership-grammar")
+    if set(fields) != {"imr_multiaddr", "imr_interface"}:
+        raise _fail("ip-membership-fields")
+    return {
+        "group": _ipv4_inet_addr(fields["imr_multiaddr"], "ip-membership-group"),
+        "interface": _ipv4_inet_addr(
+            fields["imr_interface"], "ip-membership-interface"
+        ),
+    }
+
+
 def _address(value: str) -> dict[str, object] | None:
     if value == "NULL":
         return None
@@ -1164,6 +1186,11 @@ def _transition_metadata(
         )
         if name == "setsockopt":
             length = _integer(arguments[4], "setsockopt-length")
+            if level == "SOL_IP" and option in {
+                "IP_ADD_MEMBERSHIP",
+                "IP_DROP_MEMBERSHIP",
+            }:
+                transition["membership"] = _ip_membership(arguments[3])
         else:
             length = _output_length(arguments[4], "getsockopt-length")
         if length is not None and length < 0:

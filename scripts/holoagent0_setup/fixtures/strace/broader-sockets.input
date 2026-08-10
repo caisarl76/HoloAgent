@@ -7,3 +7,4 @@
 83    1700000052.000007 getsockopt(6<TCP:[127.0.0.1:7400]>, SOL_TCP, TCP_MAXSEG, [536], [4]) = 0 <0.000001>
 83    1700000052.000008 getsockopt(7<UNIX-STREAM:[707]>, SOL_SOCKET, SO_ACCEPTCONN, [1], [4]) = 0 <0.000001>
 83    1700000052.000009 setsockopt(7<UNIX-STREAM:[707]>, SOL_SOCKET, SO_PASSCRED, [1], 4) = 0 <0.000001>
+83    1700000052.000010 setsockopt(8<UDP:[127.0.0.1:26650]>, SOL_IP, IP_ADD_MEMBERSHIP, {imr_multiaddr=inet_addr("239.255.0.1"), imr_interface=inet_addr("127.0.0.1")}, 8) = 0 <0.000001>

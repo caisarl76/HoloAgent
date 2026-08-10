@@ -6,12 +6,15 @@ import copy
 from dataclasses import dataclass, field
 from typing import Literal, Mapping
 
+from .cyclone_policy import EXPECTED_CONFIG_SHA256
+
 
 META_PORTS = {0: 26660, 1: 26662, 2: 26664, 3: 26666}
 DATA_PORTS = {0: 26661, 1: 26663, 2: 26665, 3: 26667}
 _PARTICIPANT_INDEXES = frozenset(range(4))
 _LOCAL_ADDRESSES = frozenset({"0.0.0.0", "127.0.0.1"})
 _NEUTRAL_SOCKET_DOMAINS = frozenset({"AF_UNIX", "AF_NETLINK"})
+_REVIEWED_INHERITED_FD_KINDS = frozenset({"character_device", "pipe", "regular_file"})
 _SPDP_ADDRESS = "239.255.0.1"
 _SPDP_PORT = 26650
 
@@ -88,8 +91,54 @@ class _FdEntry:
 class FDProvenance:
     """Model Linux descriptor tables and shared open-file descriptions."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        initial_manifest: Mapping[int, object] | None = None,
+    ) -> None:
         self._tables: dict[int, dict[int, _FdEntry]] = {}
+        if initial_manifest is not None:
+            self._seed_initial_manifest(initial_manifest)
+
+    def _seed_initial_manifest(self, manifest: Mapping[int, object]) -> None:
+        if not isinstance(manifest, Mapping) or len(manifest) > 64:
+            raise ValueError("invalid initial FD manifest")
+        for raw_pid, raw_entries in manifest.items():
+            pid = _exact_int(raw_pid)
+            if pid is None or pid <= 0 or not isinstance(raw_entries, list):
+                raise ValueError("invalid initial FD manifest")
+            if len(raw_entries) > 256:
+                raise ValueError("invalid initial FD manifest")
+            table: dict[int, _FdEntry] = {}
+            for raw_entry in raw_entries:
+                if not isinstance(raw_entry, Mapping) or not {
+                    "fd",
+                    "kind",
+                    "cloexec",
+                }.issubset(raw_entry):
+                    raise ValueError("invalid initial FD manifest")
+                if set(raw_entry) - {"fd", "kind", "inode", "cloexec"}:
+                    raise ValueError("invalid initial FD manifest")
+                fd = _exact_int(raw_entry.get("fd"))
+                kind = raw_entry.get("kind")
+                cloexec = raw_entry.get("cloexec")
+                inode = raw_entry.get("inode")
+                if (
+                    fd is None
+                    or fd < 0
+                    or fd in table
+                    or kind not in _REVIEWED_INHERITED_FD_KINDS
+                    or type(cloexec) is not bool
+                    or (inode is not None and (_exact_int(inode) is None or inode < 0))
+                ):
+                    raise ValueError("invalid initial FD manifest")
+                table[fd] = _FdEntry(
+                    description=_OpenDescription(
+                        kind=str(kind),
+                        inode=None if inode is None else int(inode),
+                    ),
+                    cloexec=cloexec,
+                )
+            self._tables[pid] = table
 
     def describe(self, pid: int, fd: int) -> dict[str, object] | None:
         entry = self._entry(pid, fd)
@@ -331,7 +380,12 @@ class FDProvenance:
     ) -> None:
         if not _succeeded(record) or transition.get("cloexec_fds") != "closed":
             return
-        table = self._table(pid)
+        shared_table = self._table(pid)
+        table = {
+            fd: _FdEntry(entry.description, entry.cloexec)
+            for fd, entry in shared_table.items()
+        }
+        self._tables[pid] = table
         for fd in tuple(table):
             if table[fd].cloexec:
                 del table[fd]
@@ -386,7 +440,7 @@ class _MarkerWindow:
     def __init__(self, coordinator_pid: int, token: str) -> None:
         self._coordinator_pid = coordinator_pid
         self._token = token
-        self._state: Literal["BEFORE", "ACTIVE", "AFTER"] = "BEFORE"
+        self._state: Literal["BEFORE", "ACTIVE", "AFTER", "POISONED"] = "BEFORE"
         self._begin_entry_index: int | None = None
         self._begin_exit_index: int | None = None
 
@@ -425,13 +479,13 @@ class _MarkerWindow:
             or marker.get("token") != self._token
             or value != 0
         ):
-            return "INVALID_MARKER"
+            return self._poison()
         phase = marker.get("phase")
         if phase == "BEGIN" and self._state == "BEFORE":
             entry_index = _exact_int(record.get("entry_index"))
             exit_index = _exact_int(record.get("exit_index"))
             if entry_index is None or exit_index is None:
-                return "INVALID_MARKER"
+                return self._poison()
             self._state = "ACTIVE"
             self._begin_entry_index = entry_index
             self._begin_exit_index = exit_index
@@ -447,9 +501,13 @@ class _MarkerWindow:
                 or entry_index <= self._begin_entry_index
                 or exit_index <= self._begin_exit_index
             ):
-                return "INVALID_MARKER"
+                return self._poison()
             self._state = "AFTER"
             return None
+        return self._poison()
+
+    def _poison(self) -> str:
+        self._state = "POISONED"
         return "INVALID_MARKER"
 
 
@@ -462,16 +520,16 @@ class TracePolicy:
         coordinator_pid: int,
         marker_token: str,
         participants: Mapping[int, Mapping[str, object]],
-        expected_config_digests: Mapping[int, str],
         namespace_loopback_only: bool,
+        initial_fd_manifest: Mapping[int, object] | None = None,
     ) -> None:
         self._participants = copy.deepcopy(dict(participants))
-        self._expected_config_digests = copy.deepcopy(dict(expected_config_digests))
         self._namespace_loopback_only = namespace_loopback_only is True
         self._configuration_valid = self._validate_configuration()
-        self.provenance = FDProvenance()
+        self.provenance = FDProvenance(initial_fd_manifest)
         self.markers = _MarkerWindow(coordinator_pid, marker_token)
         self.journal = ViolationJournal()
+        self.trace_integrity_error: str | None = None
 
     def feed(self, record: CanonicalRecord) -> PolicyDecision:
         self.provenance.apply(record)
@@ -486,18 +544,15 @@ class TracePolicy:
         first = self.journal.first_violation
         if first is not None:
             return PolicyDecision("FAIL", first.reason, first.record_index)
-        if trace_integrity_ok:
+        if trace_integrity_ok and self.trace_integrity_error is None:
             return PolicyDecision("PASS", "OK", None)
         return PolicyDecision("SKIPPED", "DEPENDENCY_NOT_AVAILABLE", None)
 
     def _validate_configuration(self) -> bool:
         if (
-            set(self._expected_config_digests) != _PARTICIPANT_INDEXES
-            or any(type(index) is not int for index in self._expected_config_digests)
-            or any(
-                not _is_digest(digest)
-                for digest in self._expected_config_digests.values()
-            )
+            set(EXPECTED_CONFIG_SHA256) != _PARTICIPANT_INDEXES
+            or any(type(index) is not int for index in EXPECTED_CONFIG_SHA256)
+            or any(not _is_digest(digest) for digest in EXPECTED_CONFIG_SHA256.values())
         ):
             return False
         indexes: list[int] = []
@@ -510,9 +565,7 @@ class TracePolicy:
             digest = participant.get("config_digest")
             if index is None or index not in _PARTICIPANT_INDEXES:
                 return False
-            if not _is_digest(digest) or digest != self._expected_config_digests.get(
-                index
-            ):
+            if not _is_digest(digest) or digest != EXPECTED_CONFIG_SHA256.get(index):
                 return False
             indexes.append(index)
         return set(indexes) == _PARTICIPANT_INDEXES and len(indexes) == 4
@@ -531,7 +584,9 @@ class TracePolicy:
     def _classify(self, record: CanonicalRecord) -> str | None:
         marker_reason = self.markers.consume(record)
         if marker_reason is not None:
-            return marker_reason
+            if self.trace_integrity_error is None:
+                self.trace_integrity_error = marker_reason
+            return None
         if record.get("kind") != "syscall":
             return None
 
@@ -666,6 +721,15 @@ class TracePolicy:
         )
         if description is None:
             return self._missing_socket_reason(transition.get("fd"))
+        if (
+            operation == "setsockopt"
+            and transition.get("option") in {"IP_ADD_MEMBERSHIP", "IP_DROP_MEMBERSHIP"}
+            and (
+                description.domain != "AF_INET"
+                or not _valid_multicast_membership(transition)
+            )
+        ):
+            return "UNEXPECTED_NETWORK_ATTEMPT"
         if description.domain in _NEUTRAL_SOCKET_DOMAINS:
             return None
         if not self._descriptor_context_valid(pid, description, record):
@@ -813,6 +877,18 @@ def _bind_allowed(participant: int, endpoint: Endpoint) -> bool:
         META_PORTS[participant],
         DATA_PORTS[participant],
     }
+
+
+def _valid_multicast_membership(transition: Mapping[str, object]) -> bool:
+    membership = transition.get("membership")
+    return (
+        transition.get("level") == "SOL_IP"
+        and transition.get("length") == 8
+        and isinstance(membership, Mapping)
+        and set(membership) == {"group", "interface"}
+        and membership.get("group") == _SPDP_ADDRESS
+        and membership.get("interface") == "127.0.0.1"
+    )
 
 
 def _inbound_allowed(participant: int, local: Endpoint, remote: Endpoint) -> bool:

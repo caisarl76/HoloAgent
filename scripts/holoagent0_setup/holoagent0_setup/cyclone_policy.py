@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
 
@@ -115,10 +117,14 @@ class _ParsedConfig:
     ports: tuple[tuple[str, int], ...]
 
 
-def load_pinned_cyclone_configs(config_dir: Path | str) -> CycloneConfigSet:
+def load_pinned_cyclone_configs(
+    config_dir: Path | str,
+    *,
+    repository_root: Path | str,
+) -> CycloneConfigSet:
     """Measure and parse exactly the four reviewed Cyclone configuration files."""
 
-    root = _resolve_config_directory(config_dir)
+    root = _resolve_config_directory(config_dir, repository_root)
     _require_closed_inventory(root)
 
     descriptors: list[CycloneConfigDescriptor] = []
@@ -268,19 +274,31 @@ def validate_cyclonedds_uri(
     return descriptor
 
 
-def _resolve_config_directory(config_dir: Path | str) -> Path:
+def _resolve_config_directory(
+    config_dir: Path | str,
+    repository_root: Path | str,
+) -> Path:
     path = Path(config_dir)
-    if path.is_symlink():
-        raise CycloneConfigError("Cyclone configuration directory cannot be a symlink")
+    trusted_root = Path(repository_root)
+    if path.is_symlink() or trusted_root.is_symlink():
+        raise CycloneConfigError(
+            "Cyclone configuration and repository roots cannot be symlinks"
+        )
     try:
         resolved = path.resolve(strict=True)
+        resolved_repository = trusted_root.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise CycloneConfigError(
-            f"Cyclone configuration directory is unavailable: {path}"
+            "Cyclone configuration or repository directory is unavailable"
         ) from error
-    if not resolved.is_dir():
+    expected = resolved_repository / _REPOSITORY_CONFIG_PREFIX
+    if not resolved_repository.is_dir() or not resolved.is_dir():
         raise CycloneConfigError(
             f"Cyclone configuration path is not a directory: {resolved}"
+        )
+    if resolved != expected:
+        raise CycloneConfigError(
+            "Cyclone configuration directory is outside the trusted repository"
         )
     return resolved
 
@@ -305,18 +323,47 @@ def _require_closed_inventory(root: Path) -> None:
 def _read_regular_file(path: Path) -> bytes:
     if path.is_symlink():
         raise CycloneConfigError(f"Cyclone configuration cannot be a symlink: {path}")
+    fd = -1
     try:
-        if not path.is_file():
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
             raise CycloneConfigError(
                 f"Cyclone configuration is not a regular file: {path}"
             )
-        return path.read_bytes()
+        chunks = []
+        size = 0
+        while True:
+            chunk = os.read(fd, 8192)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 65_536:
+                raise CycloneConfigError(
+                    f"Cyclone configuration exceeds the reviewed bound: {path}"
+                )
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        named = os.stat(path, follow_symlinks=False)
+        if (
+            (before.st_dev, before.st_ino, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_size)
+            or (after.st_dev, after.st_ino) != (named.st_dev, named.st_ino)
+            or size != after.st_size
+        ):
+            raise CycloneConfigError(
+                f"Cyclone configuration identity changed during read: {path}"
+            )
+        return b"".join(chunks)
     except CycloneConfigError:
         raise
     except OSError as error:
         raise CycloneConfigError(
             f"cannot read Cyclone configuration: {path}"
         ) from error
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _parse_config(payload: bytes, name: str) -> _ParsedConfig:
