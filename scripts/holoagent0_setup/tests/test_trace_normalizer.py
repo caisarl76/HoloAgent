@@ -109,6 +109,7 @@ def test_exact_reviewed_invocation_and_platform_contract():
         "--string-limit=1048576",
         "--quiet=none",
         "--trace=all",
+        "--raw=read,readv,pread64,preadv,preadv2,write,writev,pwrite64,pwritev,pwritev2,sendfile,splice,vmsplice,tee,copy_file_range",
     )
     assert STRACE_ENVIRONMENT == {"LC_ALL": "C", "TZ": "UTC"}
     assert RAW_PAYLOAD_SYSCALLS == frozenset(
@@ -133,6 +134,139 @@ def test_exact_reviewed_invocation_and_platform_contract():
     assert DECODED_ADDRESS_SYSCALLS == frozenset(
         {"sendto", "recvfrom", "sendmsg", "recvmsg", "sendmmsg", "recvmmsg"}
     )
+
+
+def test_payload_text_cannot_spoof_endpoint_or_scm_rights_metadata():
+    source = (
+        '301 1700000020.000001 sendmsg(0x7<socket:[7]>, '
+        '{msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="SPOOF_SECRET '
+        'sa_family=AF_INET, sin_port=htons(31337), sin_addr=inet_addr(\\"203.0.113.9\\") '
+        'cmsg_type=SCM_RIGHTS, cmsg_data=[99</secret>]}", iov_len=160}], msg_iovlen=1, '
+        'msg_control=NULL, msg_controllen=0, msg_flags=0}, 0) = 0x1 <0.000001>\n'
+    ).encode()
+    rendered = canonical_ndjson(normalize_bytes(source))
+    record = json.loads(rendered)
+    assert "address" not in record and "control" not in record
+    assert "203.0.113.9" not in rendered
+    assert "SPOOF_SECRET" not in rendered and "secret" not in rendered
+
+
+@pytest.mark.parametrize("name", ["sendmmsg", "recvmmsg"])
+def test_message_vectors_preserve_every_structural_endpoint_and_rights_group(name):
+    timeout = ", NULL" if name == "recvmmsg" else ""
+    source = (
+        f'302 1700000020.000002 {name}(0x8<socket:[8]>, ['
+        '{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(80), '
+        'sin_addr=inet_addr("192.0.2.10")}, msg_namelen=16, msg_iov=[], msg_iovlen=0, '
+        'msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, '
+        'cmsg_data=[0x9</private/a>]}, {cmsg_len=20, cmsg_level=SOL_SOCKET, '
+        'cmsg_type=SCM_RIGHTS, cmsg_data=[0xa<socket:[10]>]}], msg_controllen=48, '
+        'msg_flags=0}, msg_len=0}, {msg_hdr={msg_name={sa_family=AF_INET6, '
+        'sin6_port=htons(443), sin6_addr=inet_pton(AF_INET6, "2001:db8::2")}, '
+        'msg_namelen=28, msg_iov=[], msg_iovlen=0, msg_control=NULL, '
+        f'msg_controllen=0, msg_flags=0}, msg_len=0}], 0x2, 0{timeout}) = 0x2 <0.000002>\n'
+    ).encode()
+    record = normalize_bytes(source)[0]
+    assert [message["address"]["ip"] for message in record["messages"]] == [
+        "192.0.2.10",
+        "2001:db8::2",
+    ]
+    assert record["messages"][0]["control"]["scm_rights"] == [
+        [{"fd": 9, "provenance": {"kind": "path"}}],
+        [{"fd": 10, "provenance": {"inode": 10, "kind": "socket"}}],
+    ]
+    assert "private" not in canonical_ndjson([record])
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "expected_fds", "length_key", "length"),
+    [
+        ("read", "0x3</private/in>, 0x7fff0000, 0x10", [3], "count", 16),
+        ("readv", "0x3</private/in>, 0x7fff0000, 0x2", [3], "iov_count", 2),
+        ("pread64", "0x3</private/in>, 0x7fff0000, 0x10, 0x20", [3], "count", 16),
+        ("preadv", "0x3</private/in>, 0x7fff0000, 0x2, 0x20", [3], "iov_count", 2),
+        ("preadv2", "0x3</private/in>, 0x7fff0000, 0x2, 0x20, 0, 0x8", [3], "iov_count", 2),
+        ("write", "0x4</private/out>, 0x7fff0000, 0x10", [4], "count", 16),
+        ("writev", "0x4</private/out>, 0x7fff0000, 0x2", [4], "iov_count", 2),
+        ("pwrite64", "0x4</private/out>, 0x7fff0000, 0x10, 0x20", [4], "count", 16),
+        ("pwritev", "0x4</private/out>, 0x7fff0000, 0x2, 0x20", [4], "iov_count", 2),
+        ("pwritev2", "0x4</private/out>, 0x7fff0000, 0x2, 0x20, 0, 0x2", [4], "iov_count", 2),
+        ("sendfile", "0x4</private/out>, 0x3</private/in>, 0, 0x10", [4, 3], "count", 16),
+        ("splice", "0x3</private/in>, 0, 0x4</private/out>, 0, 0x10, 0x1", [3, 4], "count", 16),
+        ("vmsplice", "0x4</private/out>, 0x7fff0000, 0x2, 0x2", [4], "iov_count", 2),
+        ("tee", "0x3</private/in>, 0x4</private/out>, 0x10, 0x2", [3, 4], "count", 16),
+        ("copy_file_range", "0x3</private/in>, 0, 0x4</private/out>, 0, 0x10, 0", [3, 4], "count", 16),
+    ],
+)
+def test_exact_raw_hex_grammar_preserves_all_fd_operands(
+    name, arguments, expected_fds, length_key, length
+):
+    source = f"303 1700000021.000001 {name}({arguments}) = 0x10 <0.000001>\n".encode()
+    record = normalize_bytes(source)[0]
+    assert [item["fd"] for item in record["fds"]] == expected_fds
+    assert record["lengths"][length_key] == length
+    assert record["result"]["value"] == 16
+    assert "private" not in canonical_ndjson([record])
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"303 1.0 sendfile(0x4</out>, 0x7fff0000, 0x10) = 0x10 <0.1>\n",
+        b'303 1.0 read(0x3</in>, "decoded payload", 0x10) = 0x10 <0.1>\n',
+        b"303 1.0 splice(0x3</in>, 0, 0x4</out>, 0x10, 0x1) = 0x10 <0.1>\n",
+    ],
+)
+def test_malformed_raw_shapes_fail_closed_without_fallback(source):
+    with pytest.raises(TraceDecodeError):
+        normalize_bytes(source)
+
+
+def test_fd_and_process_transitions_are_structured_and_path_secret_free():
+    source = b"".join(
+        line + b"\n"
+        for line in [
+            b"400 2.000001 socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP) = 0x3<socket:[33]> <0.1>",
+            b"400 2.000002 socketpair(AF_UNIX, SOCK_STREAM, 0, [0x4<socket:[44]>, 0x5<socket:[55]>]) = 0 <0.1>",
+            b'400 2.000003 accept(0x3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr("192.0.2.3")}, [16]) = 0x6<socket:[66]> <0.1>',
+            b'400 2.000004 accept4(0x3<socket:[33]>, {sa_family=AF_INET6, sin6_port=htons(443), sin6_addr=inet_pton(AF_INET6, "2001:db8::3")}, [28], SOCK_CLOEXEC) = 0x7<socket:[77]> <0.1>',
+            b'400 2.000005 bind(0x3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}, 16) = 0 <0.1>',
+            b'400 2.000006 connect(0x3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("192.0.2.53")}, 16) = 0 <0.1>',
+            b'400 2.000007 getsockname(0x3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}, [16]) = 0 <0.1>',
+            b"400 2.000008 dup(0x3</private/SECRET_PATH>) = 0x8</private/SECRET_PATH> <0.1>",
+            b"400 2.000009 dup2(0x3</private/SECRET_PATH>, 0x9) = 0x9</private/SECRET_PATH> <0.1>",
+            b"400 2.000010 dup3(0x3</private/SECRET_PATH>, 0xa, O_CLOEXEC) = 0xa</private/SECRET_PATH> <0.1>",
+            b"400 2.000011 fcntl(0x3</private/SECRET_PATH>, F_DUPFD_CLOEXEC, 0xb) = 0xb</private/SECRET_PATH> <0.1>",
+            b"400 2.000012 fork() = 0x1f4 <0.1>",
+            b"400 2.000013 vfork() = 0x1f5 <0.1>",
+            b"400 2.000014 clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|SIGCHLD) = 0x1f6 <0.1>",
+            b'400 2.000015 execve("/private/SECRET_PATH", ["SECRET_ARG"], 0x7fff0000) = 0 <0.1>',
+            b"400 2.000016 close(0x8</private/SECRET_PATH>) = 0 <0.1>",
+            b"400 2.000017 close_range(0x3, 0xffffffff, CLOSE_RANGE_CLOEXEC) = 0 <0.1>",
+            b"400 2.000018 unshare(CLONE_FILES) = 0 <0.1>",
+            b"400 2.000019 pidfd_getfd(0xb<anon_inode:[pidfd]>, 0x3, 0) = 0xc</private/SECRET_PATH> <0.1>",
+        ]
+    )
+    records = normalize_bytes(source)
+    operations = [record["transition"]["operation"] for record in records]
+    assert operations == [
+        "socket", "socketpair", "accept", "accept4", "bind", "connect",
+        "getsockname", "dup", "dup2", "dup3", "fcntl_dup", "fork", "vfork",
+        "clone", "exec", "close", "close_range", "unshare_files", "pidfd_getfd",
+    ]
+    assert records[1]["transition"]["created_fds"] == [
+        {"fd": 4, "provenance": {"inode": 44, "kind": "socket"}},
+        {"fd": 5, "provenance": {"inode": 55, "kind": "socket"}},
+    ]
+    assert records[13]["transition"]["fd_table"] == "shared"
+    assert records[-1]["result"]["fd"]["provenance"] == {"kind": "path"}
+    rendered = canonical_ndjson(records)
+    assert "SECRET_PATH" not in rendered and "SECRET_ARG" not in rendered
+
+
+def test_malformed_policy_relevant_transition_fails_closed():
+    with pytest.raises(TraceDecodeError):
+        normalize_bytes(b"1 1.0 socketpair(AF_UNIX, SOCK_STREAM, 0, SECRET) = 0 <0.1>\n")
 
 
 def test_policy_tracks_canonical_task5_paths_and_reviewed_byte_digests():

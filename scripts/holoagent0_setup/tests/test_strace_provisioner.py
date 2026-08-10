@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tarfile
 
@@ -46,12 +47,26 @@ def _tar(path: Path, members):
                 archive.addfile(info)
 
 
+def _validate_members(archive: Path):
+    source = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(
+        r"# BEGIN_ARCHIVE_VALIDATOR\n(.*?)\n# END_ARCHIVE_VALIDATOR",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match is not None, "provisioner must expose its exact embedded validator"
+    return subprocess.run(
+        ["/usr/bin/python3.10", "-c", match.group(1), str(archive), "strace-6.6"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 def test_script_has_exact_usage_and_fails_closed_for_bad_cli(tmp_path):
     completed = _run()
     assert completed.returncode == 2
     assert completed.stderr == (
-        f"usage: {SCRIPT} [--archive ARCHIVE] --output-dir OUTPUT_DIR "
-        "[--candidate-evidence FILE]\n"
+        f"usage: {SCRIPT} [--archive ARCHIVE] "
+        "(--output-dir OUTPUT_DIR | --candidate-evidence FILE)\n"
     )
     assert _run("--unknown").returncode == 2
     assert _run("--output-dir", "relative").returncode != 0
@@ -103,22 +118,7 @@ def test_tar_member_validation_rejects_unsafe_paths_types_and_wrong_top(
 ):
     archive = tmp_path / "bad.tar.xz"
     _tar(archive, [member])
-    shims = tmp_path / "shims"
-    shims.mkdir()
-    stat_shim = shims / "stat"
-    stat_shim.write_text("#!/bin/sh\nprintf '2420364\\n'\n", encoding="utf-8")
-    stat_shim.chmod(0o755)
-    sha_shim = shims / "sha256sum"
-    sha_shim.write_text(
-        f"#!/bin/sh\nprintf '{EXPECTED_SHA256}  %s\\n' \"$2\"\n",
-        encoding="utf-8",
-    )
-    sha_shim.chmod(0o755)
-    env = os.environ.copy()
-    env["PATH"] = f"{shims}:{env['PATH']}"
-    result = _run(
-        "--archive", str(archive), "--output-dir", str(tmp_path / "install"), env=env
-    )
+    result = _validate_members(archive)
     assert result.returncode != 0
     assert "archive" in result.stderr.lower()
     assert not (tmp_path / "install").exists()
@@ -147,6 +147,8 @@ def test_recipe_is_pinned_fail_closed_and_build_command_is_deterministic():
     assert "set -euo pipefail" in source
     assert 'SOURCE_URL="https://strace.io/files/6.6/strace-6.6.tar.xz"' in source
     assert "--network=none" in source
+    assert "--pull=never" in source
+    assert "cd /build" in source and "/src/configure" in source
     assert "LC_ALL=C" in source and "TZ=UTC" in source and "umask 0022" in source
     assert "PENDING_REPRODUCIBLE_BUILD" in source
     assert "docker" in source
@@ -159,3 +161,33 @@ def test_recipe_is_pinned_fail_closed_and_build_command_is_deterministic():
     assert row["runtime"]["elf_sha256"] is None
     assert row["build"]["review_state"] == "PENDING_REPRODUCIBLE_BUILD"
     assert row["runtime"]["review_state"] == "PENDING_REPRODUCIBLE_BUILD"
+
+
+def test_candidate_measurement_is_separate_from_reviewed_install_and_never_edits_policy():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert "candidate-evidence" in source
+    assert "CANDIDATE_MEASUREMENT" in source
+    assert "runtime pins are required for reviewed install" in source
+    assert "os.replace" in source
+    assert "policy_path.write" not in source and "POLICY_PATH" not in re.sub(
+        r'POLICY_PATH="[^"]+"', "", source
+    ).split("CANDIDATE_MEASUREMENT", 1)[-1]
+
+
+def test_no_archive_mode_cannot_download_before_recipe_and_container_validation():
+    source = SCRIPT.read_text(encoding="utf-8")
+    validation = source.index("validate_build_pins")
+    download = source.index('"$SOURCE_URL"')
+    assert validation < download
+    assert "/usr/bin/curl" in source
+
+
+def test_reviewed_commands_are_absolute_and_caller_path_cannot_replace_integrity_tools():
+    source = SCRIPT.read_text(encoding="utf-8")
+    for tool in (
+        "cp", "curl", "cut", "docker", "mkdir", "mktemp", "mv", "rm",
+        "sha256sum", "stat", "tar",
+    ):
+        assert f"/usr/bin/{tool}" in source
+    assert "docker run" not in source
+    assert re.search(r"(?m)^PATH='/usr/bin:/bin'$", source)
