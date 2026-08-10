@@ -766,6 +766,80 @@ def test_completed_response_linearizes_acceptance_before_reentrant_failure(
     assert coordinator.snapshot().unblock_count == 1
 
 
+@pytest.mark.parametrize("reentry", ["receive", "build", "finalize"])
+def test_publication_reentry_is_nonmutating_before_deferred_failure_commit(
+    identity, monkeypatch, reentry
+):
+    coordinator = _coordinator(identity)
+    supervisor = _supervisor(identity)
+    request, request_read = _send_request(coordinator)
+    response_read, response_write = os.pipe()
+    real_write_frame = signal_handoff_module.write_frame
+
+    def invoke_reentry():
+        if reentry == "receive":
+            supervisor.receive_and_accept(-1, -1)
+        elif reentry == "build":
+            supervisor.build_acceptance(request)
+        else:
+            supervisor.finalize_ready(
+                coordinator.snapshot(),
+                _evidence(request),
+                lambda _value: True,
+            )
+
+    def complete_then_reenter_and_fail(*args, **kwargs):
+        result = real_write_frame(*args, **kwargs)
+        before = supervisor.snapshot()
+        with pytest.raises(SignalHandoffError) as caught:
+            invoke_reentry()
+        assert supervisor.snapshot() == before
+        assert str(caught.value) == "supervisor acceptance publication reentry"
+        supervisor.fail("deferred publication failure")
+        return result
+
+    monkeypatch.setattr(
+        signal_handoff_module,
+        "write_frame",
+        complete_then_reenter_and_fail,
+    )
+    try:
+        with pytest.raises(
+            SignalHandoffError,
+            match="failed after acceptance publication",
+        ):
+            supervisor.receive_and_accept(
+                request_read,
+                response_write,
+                deadline=time.monotonic() + 0.2,
+            )
+    finally:
+        os.close(request_read)
+        os.close(response_write)
+    try:
+        coordinator.receive_acceptance(
+            response_read,
+            deadline=time.monotonic() + 0.2,
+        )
+    finally:
+        os.close(response_read)
+
+    terminal = supervisor.snapshot()
+    assert terminal.state == terminal.terminal_state == "FAILED"
+    assert terminal.acceptance_count == 1
+    assert terminal.next_sequence == 2
+    assert terminal.forward_count == 0
+    assert [event.name for event in terminal.events] == [
+        "ready_request_validated",
+        "acceptance_write",
+        "failed:deferred publication failure",
+    ]
+    assert coordinator.snapshot().state == "LIVE_READY"
+    with pytest.raises(SignalHandoffError, match="terminal supervisor state"):
+        invoke_reentry()
+    assert supervisor.snapshot() == terminal
+
+
 def test_signal_during_response_publication_is_preserved_and_forwarded_once(
     identity, monkeypatch
 ):

@@ -848,10 +848,12 @@ class SupervisorSignalHandoff:
 
     def _require_transition_idle(self) -> None:
         self._require_nonterminal()
+        self._require_not_publishing_locked()
         if self._transition is not None:
             self._reject("supervisor transition reentry")
 
     def _start_transition_locked(self, name: str) -> int:
+        self._require_not_publishing_locked()
         if self._transition is not None:
             self._reject("supervisor transition reentry")
         self._transition = name
@@ -874,6 +876,7 @@ class SupervisorSignalHandoff:
 
     def _require_ready_acceptance_open(self) -> None:
         self._require_nonterminal()
+        self._require_not_publishing_locked()
         if self._acceptance_count != 0 or self._state not in {
             "AWAITING_READY",
             "PENDING_FORWARD",
@@ -883,6 +886,10 @@ class SupervisorSignalHandoff:
             raise SignalHandoffError("readiness already accepted")
         if self._transition is not None:
             self._reject("supervisor transition reentry")
+
+    def _require_not_publishing_locked(self) -> None:
+        if self._transition == "acceptance publication":
+            raise SignalHandoffError("supervisor acceptance publication reentry")
 
     def _event(self, name: str) -> None:
         self._events.append(HandoffEvent(len(self._events), name, self._state))
