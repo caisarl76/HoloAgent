@@ -151,7 +151,7 @@ def test_reader_rejects_duplicates_noncanonical_json_and_non_objects(payload):
         b"",
         b"\x00\x00",
         b"\x00\x00\x00\x00",
-        (4097).to_bytes(4, "big"),
+        (65537).to_bytes(4, "big"),
         (12).to_bytes(4, "big") + b"{}",
         _raw_frame(canonical_json_bytes(ready_message())) + b"x",
     ],
@@ -406,7 +406,52 @@ def test_deadlines_and_exact_builtin_fd_and_message_types_are_enforced():
         os.close(write_fd)
 
 
-def test_writer_rejects_payload_over_reviewed_bound():
+def test_real_generation_zero_ledger_candidate_round_trips_above_control_bound():
+    contract_root = Path(__file__).resolve().parents[1]
+    contract = ContractSet(contract_root)
+    nonce = "b" * 64
+    ledger = _build_generation_zero("offline-run", nonce, contract)
+    message = {
+        "type": MessageType.LEDGER_CANDIDATE.value,
+        "run_nonce": nonce,
+        "sequence": 1,
+        "generation": 0,
+        "previous_generation": None,
+        "previous_digest": None,
+        "candidate": ledger,
+    }
+
+    def validate_ledger(value):
+        return contract.validate_document("holoagent0-offline-ledger-v1", value).ok
+
+    payload = canonical_json_bytes(message)
+    assert broker_module.MAX_PAYLOAD_BYTES < len(payload) <= 65536
+    read_fd, write_fd = os.pipe()
+    try:
+        write_frame(
+            write_fd,
+            message,
+            deadline=time.monotonic() + 0.2,
+            ledger_validator=validate_ledger,
+        )
+        os.close(write_fd)
+        write_fd = -1
+        assert (
+            read_frame(
+                read_fd,
+                deadline=time.monotonic() + 0.2,
+                exact_one=True,
+                ledger_validator=validate_ledger,
+            )
+            == message
+        )
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
+def test_writer_rejects_ledger_candidate_above_reviewed_ledger_bound():
     nonce = "b" * 64
     message = {
         "type": MessageType.LEDGER_CANDIDATE.value,
@@ -420,7 +465,7 @@ def test_writer_rejects_payload_over_reviewed_bound():
             "generation": 1,
             "previous_generation": 0,
             "previous_digest": "a" * 64,
-            "padding": "x" * 4096,
+            "padding": "x" * 65536,
         },
     }
     read_fd, write_fd = os.pipe()
@@ -430,6 +475,70 @@ def test_writer_rejects_payload_over_reviewed_bound():
     finally:
         os.close(read_fd)
         os.close(write_fd)
+
+
+def test_control_payload_over_4096_is_rejected_on_write_and_read():
+    message = {
+        "type": MessageType.OWNERSHIP_RECORD.value,
+        "run_nonce": "nonce",
+        "sequence": 1,
+        "identity": dict(IDENTITY),
+        "role": "x" * 5000,
+    }
+    payload = canonical_json_bytes(message)
+    assert 4096 < len(payload) <= 65536
+
+    read_fd, write_fd = os.pipe()
+    try:
+        with pytest.raises(BrokerProtocolError, match="bound"):
+            write_frame(write_fd, message, deadline=time.monotonic() + 0.2)
+        os.write(write_fd, _raw_frame(payload))
+        os.close(write_fd)
+        write_fd = -1
+        with pytest.raises(BrokerProtocolError, match="bound"):
+            read_frame(read_fd, deadline=time.monotonic() + 0.2)
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
+@pytest.mark.parametrize("direction", ["write", "read"])
+def test_ledger_validator_mutation_is_rejected_without_touching_original(
+    direction,
+):
+    message = ledger_candidate_message()
+    original = canonical_json_bytes(message)
+
+    def mutate_then_true(candidate):
+        candidate["injected"] = True
+        return True
+
+    read_fd, write_fd = os.pipe()
+    try:
+        if direction == "write":
+            with pytest.raises(BrokerProtocolError, match="mutat"):
+                write_frame(
+                    write_fd,
+                    message,
+                    deadline=time.monotonic() + 0.2,
+                    ledger_validator=mutate_then_true,
+                )
+        else:
+            os.write(write_fd, _raw_frame(original))
+            os.close(write_fd)
+            write_fd = -1
+            with pytest.raises(BrokerProtocolError, match="mutat"):
+                read_frame(
+                    read_fd,
+                    deadline=time.monotonic() + 0.2,
+                    ledger_validator=mutate_then_true,
+                )
+        assert canonical_json_bytes(message) == original
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
 
 
 def test_validate_message_rejects_surrogate_ownership_role():

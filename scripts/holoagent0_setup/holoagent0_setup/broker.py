@@ -34,6 +34,8 @@ class MessageType(str, Enum):
 
 
 MAX_PAYLOAD_BYTES = 4096
+MAX_LEDGER_CANDIDATE_PAYLOAD_BYTES = 65536
+MAX_FRAME_PAYLOAD_BYTES = 65536
 _DEFAULT_TIMEOUT_SECONDS = 1.0
 _MAX_DEADLINE_INTERVAL_SECONDS = 30.0
 _SIGNALS = ["HUP", "INT", "TERM"]
@@ -100,14 +102,13 @@ def write_frame(
     stable_fd = _duplicate_broker_fd(fd)
     try:
         _require_anonymous_pipe(stable_fd, readable=False)
-        validated = validate_message(message, ledger_validator=ledger_validator)
         try:
-            payload = canonical_json_bytes(validated)
+            payload = canonical_json_bytes(message)
         except (CanonicalJSONError, RuntimeError) as error:
             raise BrokerProtocolError(
                 "message cannot be encoded canonically"
             ) from error
-        if not payload or len(payload) > MAX_PAYLOAD_BYTES:
+        if not payload or len(payload) > _payload_limit(message):
             raise BrokerProtocolError("frame exceeds reviewed bound")
         _decode_canonical_message(payload, ledger_validator=ledger_validator)
         _write_all(
@@ -139,10 +140,13 @@ def read_frame(
         length = int.from_bytes(prefix, "big")
         if length == 0:
             raise BrokerProtocolError("zero-length frames are prohibited")
-        if length > MAX_PAYLOAD_BYTES:
+        if length > MAX_FRAME_PAYLOAD_BYTES:
             raise BrokerProtocolError("frame exceeds reviewed bound")
         payload = _read_exact(stable_fd, length, absolute_deadline, "payload")
-        message = _decode_canonical_message(payload, ledger_validator=ledger_validator)
+        value = _decode_canonical_value(payload)
+        if length > _payload_limit(value):
+            raise BrokerProtocolError("frame exceeds reviewed bound")
+        message = validate_message(value, ledger_validator=ledger_validator)
         if exact_one:
             _require_channel_eof(stable_fd, absolute_deadline)
         return message
@@ -210,9 +214,33 @@ def validate_message(
         if ledger_validator is None:
             raise BrokerProtocolError("ledger candidate validator is required")
         try:
-            valid_ledger = ledger_validator(candidate)
+            message_before = canonical_json_bytes(message)
+            candidate_before = canonical_json_bytes(candidate)
+            callback_candidate = _decode_canonical_json(
+                candidate_before, Path("<ledger-candidate-copy>")
+            )
+        except (AtomicIOError, CanonicalJSONError, RuntimeError) as error:
+            raise BrokerProtocolError("ledger candidate copy failed") from error
+        if type(callback_candidate) is not dict:
+            raise BrokerProtocolError("ledger candidate copy is invalid")
+        try:
+            valid_ledger = ledger_validator(callback_candidate)
         except Exception as error:
             raise BrokerProtocolError("ledger candidate validator failed") from error
+        try:
+            callback_after = canonical_json_bytes(callback_candidate)
+            candidate_after = canonical_json_bytes(candidate)
+            message_after = canonical_json_bytes(message)
+        except (CanonicalJSONError, RuntimeError) as error:
+            raise BrokerProtocolError(
+                "ledger candidate validator mutated input"
+            ) from error
+        if (
+            callback_after != candidate_before
+            or candidate_after != candidate_before
+            or message_after != message_before
+        ):
+            raise BrokerProtocolError("ledger candidate validator mutated input")
         if valid_ledger is not True:
             raise BrokerProtocolError("ledger candidate failed closed validation")
         if (
@@ -240,13 +268,24 @@ def _decode_canonical_message(
     *,
     ledger_validator: Callable[[dict[str, object]], bool] | None = None,
 ) -> dict[str, object]:
+    value = _decode_canonical_value(payload)
+    return validate_message(value, ledger_validator=ledger_validator)
+
+
+def _decode_canonical_value(payload: bytes) -> object:
     try:
-        value = _decode_canonical_json(payload, Path("<broker-frame>"))
-        return validate_message(value, ledger_validator=ledger_validator)
-    except BrokerProtocolError:
-        raise
+        return _decode_canonical_json(payload, Path("<broker-frame>"))
     except AtomicIOError as error:
         raise BrokerProtocolError("frame contains invalid canonical JSON") from error
+
+
+def _payload_limit(message: object) -> int:
+    if (
+        type(message) is dict
+        and message.get("type") == MessageType.LEDGER_CANDIDATE.value
+    ):
+        return MAX_LEDGER_CANDIDATE_PAYLOAD_BYTES
+    return MAX_PAYLOAD_BYTES
 
 
 def _require_identity(value: object) -> None:
