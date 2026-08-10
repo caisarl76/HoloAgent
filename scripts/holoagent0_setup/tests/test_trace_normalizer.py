@@ -172,7 +172,8 @@ def test_message_vectors_preserve_every_structural_endpoint_and_rights_group(nam
         "cmsg_data=[9</private/a>]}, {cmsg_len=20, cmsg_level=SOL_SOCKET, "
         "cmsg_type=SCM_RIGHTS, cmsg_data=[10<socket:[10]>]}], msg_controllen=48, "
         "msg_flags=0}, msg_len=0}, {msg_hdr={msg_name={sa_family=AF_INET6, "
-        'sin6_port=htons(443), sin6_addr=inet_pton(AF_INET6, "2001:db8::2")}, '
+        "sin6_port=htons(443), sin6_flowinfo=htonl(0), "
+        'inet_pton(AF_INET6, "2001:db8::2", &sin6_addr), sin6_scope_id=0}, '
         "msg_namelen=28, msg_iov=[], msg_iovlen=0, msg_control=NULL, "
         "msg_controllen=0, msg_flags=0}, msg_len=0}], 2, 0"
         + timeout
@@ -241,7 +242,7 @@ def test_fd_and_process_transitions_are_structured_and_path_secret_free():
             b"400 2.000001 socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP) = 3<socket:[33]> <0.1>",
             b"400 2.000002 socketpair(AF_UNIX, SOCK_STREAM, 0, [4<socket:[44]>, 5<socket:[55]>]) = 0 <0.1>",
             b'400 2.000003 accept(3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr("192.0.2.3")}, [16]) = 6<socket:[66]> <0.1>',
-            b'400 2.000004 accept4(3<socket:[33]>, {sa_family=AF_INET6, sin6_port=htons(443), sin6_addr=inet_pton(AF_INET6, "2001:db8::3")}, [28], SOCK_CLOEXEC) = 7<socket:[77]> <0.1>',
+            b'400 2.000004 accept4(3<socket:[33]>, {sa_family=AF_INET6, sin6_port=htons(443), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "2001:db8::3", &sin6_addr), sin6_scope_id=0}, [28], SOCK_CLOEXEC) = 7<socket:[77]> <0.1>',
             b'400 2.000005 bind(3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}, 16) = 0 <0.1>',
             b'400 2.000006 connect(3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("192.0.2.53")}, 16) = 0 <0.1>',
             b'400 2.000007 getsockname(3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}, [16]) = 0 <0.1>',
@@ -297,6 +298,290 @@ def test_malformed_policy_relevant_transition_fails_closed():
         normalize_bytes(
             b"1 1.0 socketpair(AF_UNIX, SOCK_STREAM, 0, SECRET) = 0 <0.1>\n"
         )
+
+
+@pytest.mark.parametrize(
+    ("source", "operation", "required"),
+    [
+        (
+            b"410 3.000001 socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP) = -1 EMFILE (Too many open files) <0.1>\n",
+            "socket",
+            {"domain": "AF_INET", "protocol": "IPPROTO_TCP"},
+        ),
+        (
+            b"410 3.000002 socketpair(AF_UNIX, SOCK_STREAM, 0, 0x7fff0000) = -1 EMFILE (Too many open files) <0.1>\n",
+            "socketpair",
+            {"domain": "AF_UNIX", "protocol": 0},
+        ),
+        (
+            b"410 3.000003 accept(3<socket:[33]>, NULL, NULL) = -1 EBADF (Bad file descriptor) <0.1>\n",
+            "accept",
+            {"source_fd": {"fd": 3, "provenance": {"kind": "socket", "inode": 33}}},
+        ),
+        (
+            b"410 3.000004 accept4(3<socket:[33]>, NULL, NULL, SOCK_CLOEXEC) = -1 EBADF (Bad file descriptor) <0.1>\n",
+            "accept4",
+            {"flags": ["SOCK_CLOEXEC"]},
+        ),
+        (
+            b"410 3.000005 dup(3</private/FAIL_SECRET>) = -1 EBADF (Bad file descriptor) <0.1>\n",
+            "dup",
+            {"source_fd": {"fd": 3, "provenance": {"kind": "path"}}},
+        ),
+        (
+            b"410 3.000006 dup2(3</private/FAIL_SECRET>, 9) = -1 EBADF (Bad file descriptor) <0.1>\n",
+            "dup2",
+            {"target_fd": {"fd": 9}},
+        ),
+        (
+            b"410 3.000007 dup3(3</private/FAIL_SECRET>, 10, O_CLOEXEC) = -1 EBADF (Bad file descriptor) <0.1>\n",
+            "dup3",
+            {"flags": ["O_CLOEXEC"]},
+        ),
+        (
+            b"410 3.000008 fcntl(3</private/FAIL_SECRET>, F_DUPFD_CLOEXEC, 11) = -1 EBADF (Bad file descriptor) <0.1>\n",
+            "fcntl_dup",
+            {"minimum_fd": 11, "cloexec": True},
+        ),
+        (
+            b"410 3.000009 fcntl(3</private/FAIL_SECRET>, F_DUPFD, 11) = -1 EBADF (Bad file descriptor) <0.1>\n",
+            "fcntl_dup",
+            {"minimum_fd": 11, "cloexec": False},
+        ),
+        (
+            b"410 3.000010 fork() = -1 EAGAIN (Resource temporarily unavailable) <0.1>\n",
+            "fork",
+            {},
+        ),
+        (
+            b"410 3.000011 vfork() = -1 EAGAIN (Resource temporarily unavailable) <0.1>\n",
+            "vfork",
+            {},
+        ),
+        (
+            b"410 3.000012 clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|SIGCHLD) = -1 EAGAIN (Resource temporarily unavailable) <0.1>\n",
+            "clone",
+            {"flags": ["CLONE_VM", "CLONE_FILES", "SIGCHLD"]},
+        ),
+        (
+            b"410 3.000013 pidfd_getfd(11<anon_inode:[pidfd]>, 3, 0) = -1 EPERM (Operation not permitted) <0.1>\n",
+            "pidfd_getfd",
+            {"target_fd": 3},
+        ),
+    ],
+)
+def test_failed_fd_and_process_attempts_remain_policy_visible_without_mutation(
+    source, operation, required
+):
+    record = normalize_bytes(source)[0]
+    assert record["result"]["value"] == -1
+    assert record["transition"]["operation"] == operation
+    assert record["transition"] | required == record["transition"]
+    assert "created_fd" not in record["transition"]
+    assert "created_fds" not in record["transition"]
+    assert "child_pid" not in record["transition"]
+    assert "fd_table" not in record["transition"]
+    assert "FAIL_SECRET" not in canonical_ndjson([record])
+
+
+def test_failed_pidfd_getfd_is_classifiable_as_prohibited_fd_acquisition():
+    record = normalize_bytes(
+        b"411 3.1 pidfd_getfd(11<anon_inode:[pidfd]>, 7, 0) = -1 EPERM (Operation not permitted) <0.1>\n"
+    )[0]
+    reason = (
+        "PROHIBITED_FD_ACQUISITION"
+        if record["transition"]["operation"] == "pidfd_getfd"
+        else "TRACE_DECODE_FAILED"
+    )
+    assert reason == "PROHIBITED_FD_ACQUISITION"
+    assert record["transition"] == {
+        "operation": "pidfd_getfd",
+        "pidfd": {
+            "fd": 11,
+            "provenance": {"kind": "anon_inode", "type": "pidfd"},
+        },
+        "target_fd": 7,
+    }
+
+
+def test_upstream_strace_6_6_ipv6_sockaddr_form_is_exact_and_structured():
+    # Derived verbatim from strace-6.6 tests/net-sockaddr.c::check_in6.
+    source = (
+        b"412 3.2 connect(3<socket:[33]>, {sa_family=AF_INET6, "
+        b"sin6_port=htons(12345), sin6_flowinfo=htonl(1234567890), "
+        b'inet_pton(AF_INET6, "12:34:56:78:90:ab:cd:ef", &sin6_addr), '
+        b"sin6_scope_id=4207869677}, 28) = 0 <0.1>\n"
+    )
+    record = normalize_bytes(source)[0]
+    assert record["transition"]["address"] == {
+        "family": "AF_INET6",
+        "port": 12345,
+        "flowinfo": 1234567890,
+        "ip": "12:34:56:78:90:ab:cd:ef",
+        "scope_id": 4207869677,
+    }
+
+
+def test_synthetic_ipv6_sockaddr_form_is_not_reviewed():
+    with pytest.raises(TraceDecodeError):
+        normalize_bytes(
+            b'412 3.3 connect(3<socket:[33]>, {sa_family=AF_INET6, sin6_port=htons(443), sin6_addr=inet_pton(AF_INET6, "2001:db8::3")}, 28) = 0 <0.1>\n'
+        )
+
+
+@pytest.mark.parametrize(
+    ("protocol", "expected"),
+    [("0", 0), ("IPPROTO_UDP", "IPPROTO_UDP"), ("IPPROTO_TCP", "IPPROTO_TCP")],
+)
+def test_socket_protocol_provenance_remains_distinct(protocol, expected):
+    record = normalize_bytes(
+        f"413 3.4 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, {protocol}) = 4<socket:[44]> <0.1>\n".encode()
+    )[0]
+    assert record["transition"]["protocol"] == expected
+
+
+def test_socketpair_protocol_provenance_is_retained():
+    record = normalize_bytes(
+        b"413 3.5 socketpair(AF_UNIX, SOCK_STREAM, 0, [4<socket:[44]>, 5<socket:[55]>]) = 0 <0.1>\n"
+    )[0]
+    assert record["transition"]["protocol"] == 0
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"413 3.6 socket(DOMAIN_SECRET, SOCK_STREAM, 0) = 4<socket:[44]> <0.1>\n",
+        b"413 3.6 socket(AF_INET, TYPE_SECRET, 0) = 4<socket:[44]> <0.1>\n",
+        b"413 3.6 socket(AF_INET, SOCK_STREAM, PROTOCOL_SECRET) = 4<socket:[44]> <0.1>\n",
+        b"413 3.6 socket(AF_INET, SOCK_STREAM|PAYLOAD_SECRET, 0) = 4<socket:[44]> <0.1>\n",
+    ],
+)
+def test_socket_domain_type_and_protocol_reject_unreviewed_tokens(source):
+    with pytest.raises(TraceDecodeError) as caught:
+        normalize_bytes(source)
+    assert "SECRET" not in str(caught.value)
+
+
+def test_fcntl_getfd_setfd_dup_and_closed_non_fd_commands_are_structured():
+    source = b"".join(
+        line + b"\n"
+        for line in [
+            b"414 3.700001 fcntl(3</private/FCNTL_SECRET>, F_GETFD) = 0x1 (flags FD_CLOEXEC) <0.1>",
+            b"414 3.700002 fcntl(3</private/FCNTL_SECRET>, F_SETFD, 0) = 0 <0.1>",
+            b"414 3.700003 fcntl(3</private/FCNTL_SECRET>, F_SETFD, FD_CLOEXEC) = 0 <0.1>",
+            b"414 3.700004 fcntl(3</private/FCNTL_SECRET>, F_GETFL) = 0x8002 (flags O_RDWR|O_LARGEFILE) <0.1>",
+            b"414 3.700005 fcntl(3</private/FCNTL_SECRET>, F_SETFL, O_NONBLOCK) = 0 <0.1>",
+            b"414 3.700006 fcntl(3</private/FCNTL_SECRET>, F_DUPFD, 12) = 12</private/FCNTL_SECRET> <0.1>",
+        ]
+    )
+    records = normalize_bytes(source)
+    assert [record["transition"]["operation"] for record in records] == [
+        "fcntl_getfd",
+        "fcntl_setfd",
+        "fcntl_setfd",
+        "fcntl_getfl",
+        "fcntl_setfl",
+        "fcntl_dup",
+    ]
+    assert records[0]["transition"]["cloexec"] is True
+    assert records[0]["result"] == {"value": 1, "flags": ["FD_CLOEXEC"]}
+    assert records[1]["transition"]["cloexec"] is False
+    assert records[2]["transition"]["cloexec"] is True
+    assert records[3]["result"] == {
+        "value": 32770,
+        "flags": ["O_RDWR", "O_LARGEFILE"],
+    }
+    assert records[4]["transition"]["status_flags"] == ["O_NONBLOCK"]
+    assert records[5]["transition"]["created_fd"]["fd"] == 12
+    assert "FCNTL_SECRET" not in canonical_ndjson(records)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"414 3.8 fcntl(3, F_UNKNOWN_FD_COMMAND, 0) = 4 <0.1>\n",
+        b"414 3.8 fcntl(3, F_GETOWN) = 7 <0.1>\n",
+    ],
+)
+def test_unreviewed_fcntl_commands_fail_closed(source):
+    with pytest.raises(TraceDecodeError):
+        normalize_bytes(source)
+
+
+def test_failed_mutations_preserve_attempt_metadata_without_state_effects():
+    source = b"".join(
+        line + b"\n"
+        for line in [
+            b"415 3.900001 fcntl(3</private/MUTATE_SECRET>, F_SETFD, FD_CLOEXEC) = -1 EBADF (Bad file descriptor) <0.1>",
+            b'415 3.900002 execve("/private/MUTATE_SECRET", ["arg"], 0x7fff0000) = -1 ENOENT (No such file or directory) <0.1>',
+            b"415 3.900003 close(3</private/MUTATE_SECRET>) = -1 EBADF (Bad file descriptor) <0.1>",
+        ]
+    )
+    records = normalize_bytes(source)
+    assert records[0]["transition"] == {
+        "operation": "fcntl_setfd",
+        "source_fd": {"fd": 3, "provenance": {"kind": "path"}},
+        "requested_cloexec": True,
+    }
+    assert records[1]["transition"] == {"operation": "exec"}
+    assert records[2]["transition"] == {
+        "operation": "close",
+        "fd": {"fd": 3, "provenance": {"kind": "path"}},
+    }
+    assert "MUTATE_SECRET" not in canonical_ndjson(records)
+
+
+def test_successful_execveat_closes_close_on_exec_descriptors():
+    record = normalize_bytes(
+        b'416 4.0 execveat(3</private/EXECVEAT_SECRET>, "child", ["child"], 0x7fff0000, AT_EMPTY_PATH) = 0 <0.1>\n'
+    )[0]
+    assert record["transition"] == {
+        "operation": "exec",
+        "dirfd": {"fd": 3, "provenance": {"kind": "path"}},
+        "flags": ["AT_EMPTY_PATH"],
+        "cloexec_fds": "closed",
+    }
+    assert "EXECVEAT_SECRET" not in canonical_ndjson([record])
+
+
+def test_recvmmsg_partial_return_uses_success_count_and_retains_requested_vlen():
+    source = (
+        b"417 4.1 recvmmsg(8<socket:[8]>, [{msg_hdr={msg_name=NULL, "
+        b'msg_namelen=0, msg_iov=[{iov_base="PARTIAL_SECRET", iov_len=1}], '
+        b"msg_iovlen=1, msg_controllen=0, msg_flags=0}, "
+        b"msg_len=1}], 3, MSG_DONTWAIT, NULL) = 1 <0.1>\n"
+    )
+    record = normalize_bytes(source)[0]
+    assert len(record["messages"]) == 1
+    assert record["lengths"] == {
+        "message_count": 1,
+        "requested_message_count": 3,
+    }
+    assert "PARTIAL_SECRET" not in canonical_ndjson([record])
+
+
+def test_failed_recvmmsg_retains_attempt_without_decoding_output_pointer():
+    record = normalize_bytes(
+        b"417 4.2 recvmmsg(8<socket:[8]>, 0x7fff0000, 3, MSG_DONTWAIT, NULL) = -1 EAGAIN (Resource temporarily unavailable) <0.1>\n"
+    )[0]
+    assert record["messages"] == []
+    assert record["lengths"] == {
+        "message_count": 0,
+        "requested_message_count": 3,
+    }
+    assert record["result"]["errno"] == "EAGAIN"
+
+
+def test_recvmmsg_rejects_decoded_vector_count_different_from_successful_return():
+    source = (
+        b"417 4.3 recvmmsg(8<socket:[8]>, [{msg_hdr={msg_name=NULL, "
+        b'msg_namelen=0, msg_iov=[{iov_base="COUNT_SECRET", iov_len=1}], '
+        b"msg_iovlen=1, msg_control=NULL, msg_controllen=0, msg_flags=0}, "
+        b"msg_len=1}], 3, MSG_DONTWAIT, NULL) = 2 <0.1>\n"
+    )
+    with pytest.raises(TraceDecodeError) as caught:
+        normalize_bytes(source)
+    assert "COUNT_SECRET" not in str(caught.value)
 
 
 def test_policy_tracks_canonical_task5_paths_and_reviewed_byte_digests():
