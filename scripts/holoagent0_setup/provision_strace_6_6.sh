@@ -1723,7 +1723,7 @@ def publish_install_directory(
     before_rename=None,
     after_rename=None,
     after_approval=None,
-    after_quarantine_rename=None,
+    after_rollback_prepared=None,
     signal_latch=None,
 ):
     staged = Path(staged)
@@ -1747,7 +1747,7 @@ def publish_install_directory(
             before_rename=before_rename,
             after_rename=after_rename,
             after_approval=after_approval,
-            after_quarantine_rename=after_quarantine_rename,
+            after_rollback_prepared=after_rollback_prepared,
             signal_latch=signal_latch,
         )
 
@@ -1765,7 +1765,7 @@ def _publish_install_directory_locked(
     before_rename=None,
     after_rename=None,
     after_approval=None,
-    after_quarantine_rename=None,
+    after_rollback_prepared=None,
     signal_latch=None,
 ):
     staged = Path(staged)
@@ -1818,6 +1818,7 @@ def _publish_install_directory_locked(
         if before_rename is not None:
             before_rename(staged)
         _raise_if_interrupted(signal_latch)
+        installed_fd = os.dup(measurement.root_fd)
         _rename_no_replace(
             measurement.parent_fd, staged.name, measurement.parent_fd, destination.name
         )
@@ -1830,11 +1831,6 @@ def _publish_install_directory_locked(
             measurement.root_inode,
         )
         os.fsync(measurement.parent_fd)
-        installed_fd = os.open(
-            destination.name,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=measurement.parent_fd,
-        )
         installed_value = os.fstat(installed_fd)
         if (installed_value.st_dev, installed_value.st_ino) != (
             measurement.root_device,
@@ -1862,16 +1858,6 @@ def _publish_install_directory_locked(
     except BaseException as error:
         if committed:
             try:
-                current = os.stat(
-                    destination.name,
-                    dir_fd=measurement.parent_fd,
-                    follow_symlinks=False,
-                )
-                if (current.st_dev, current.st_ino) != (
-                    measurement.root_device,
-                    measurement.root_inode,
-                ):
-                    raise PublicationError("AMBIGUOUS_INSTALL_IDENTITY")
                 _transition_marker_state(
                     installed_fd,
                     "ROLLBACK_PREPARED",
@@ -1884,60 +1870,12 @@ def _publish_install_directory_locked(
                     measurement.root_device,
                     measurement.root_inode,
                 )
+                if after_rollback_prepared is not None:
+                    after_rollback_prepared(destination)
                 _verify_retained_directory_name(
                     measurement.parent_fd,
                     destination.name,
                     installed_fd,
-                    measurement.root_device,
-                    measurement.root_inode,
-                )
-                _rename_no_replace(
-                    measurement.parent_fd,
-                    destination.name,
-                    measurement.parent_fd,
-                    quarantine.name,
-                )
-                transition = PublicationTransition(
-                    "QUARANTINE_PREPARED",
-                    str(destination),
-                    str(quarantine),
-                    measurement.root_device,
-                    measurement.root_inode,
-                )
-                _verify_retained_directory_name(
-                    measurement.parent_fd,
-                    quarantine.name,
-                    installed_fd,
-                    measurement.root_device,
-                    measurement.root_inode,
-                )
-                os.fsync(measurement.parent_fd)
-                if after_quarantine_rename is not None:
-                    after_quarantine_rename(quarantine)
-                _verify_retained_directory_name(
-                    measurement.parent_fd,
-                    quarantine.name,
-                    installed_fd,
-                    measurement.root_device,
-                    measurement.root_inode,
-                )
-                _transition_marker_state(
-                    installed_fd,
-                    "QUARANTINED",
-                    rollback_state="ROLLED_BACK",
-                )
-                _verify_retained_directory_name(
-                    measurement.parent_fd,
-                    quarantine.name,
-                    installed_fd,
-                    measurement.root_device,
-                    measurement.root_inode,
-                )
-                os.fsync(measurement.parent_fd)
-                transition = PublicationTransition(
-                    "QUARANTINED",
-                    str(destination),
-                    str(quarantine),
                     measurement.root_device,
                     measurement.root_inode,
                 )
@@ -1993,7 +1931,7 @@ def _verify_retained_directory_name(parent_fd, name, retained_fd, device, inode)
 
 
 def _transition_marker_state(directory_fd, state, **fields):
-    if state not in {"ROLLBACK_PREPARED", "QUARANTINED"}:
+    if state != "ROLLBACK_PREPARED":
         raise PublicationError("invalid rollback marker transition")
     marker_fd = os.open(
         APPROVAL_MARKER,
@@ -2003,12 +1941,12 @@ def _transition_marker_state(directory_fd, state, **fields):
     try:
         value = os.fstat(marker_fd)
         if not stat.S_ISREG(value.st_mode):
-            raise PublicationError("quarantine marker identity changed")
+            raise PublicationError("rollback marker identity changed")
         payload = os.read(marker_fd, 8193)
         if len(payload) > 8192:
             raise PublicationError("oversized rollback marker")
         marker = _closed_json(payload)
-        if marker.get("state") not in {"APPROVED", "ROLLBACK_PREPARED"}:
+        if marker.get("state") != "APPROVED":
             raise PublicationError("invalid rollback marker source state")
         marker["state"] = state
         marker.update(fields)
@@ -2660,6 +2598,13 @@ def cleanup_publication_stage(registry, entry, transition):
             "published install has an unresolved cleanup transition",
             transition=transition,
         )
+    current = registry._lstat(entry.name)
+    if (
+        current is None
+        or not stat.S_ISDIR(current.st_mode)
+        or not registry._matches(current, entry)
+    ):
+        raise PathIdentityError("owned publication identity changed")
     registry.remove_tree(entry)
 
 
@@ -2839,12 +2784,6 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
             except (PublicationError, ProvisioningInterrupted) as error:
                 publication_transition = error.transition
                 if (
-                    publication_transition is not None
-                    and publication_transition.state
-                    in {"QUARANTINE_PREPARED", "QUARANTINED"}
-                ):
-                    output_stage.name = Path(publication_transition.quarantine).name
-                elif (
                     publication_transition is not None
                     and publication_transition.state
                     in {"PUBLISHED", "ROLLBACK_PREPARED"}
