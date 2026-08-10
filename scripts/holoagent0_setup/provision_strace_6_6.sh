@@ -1734,7 +1734,51 @@ def publish_install_directory(
     if staged != measurement.path or destination.parent != measurement.parent:
         raise PublicationError("staging measurement path changed")
     _verify_staging_name(measurement)
-    _verify_retained_measurement(measurement, pins, runner, deadline)
+    with _exclusive_elf_lock(measurement.elf_fd):
+        return _publish_install_directory_locked(
+            staged,
+            destination,
+            quarantine,
+            measurement,
+            pins,
+            runner,
+            deadline=deadline,
+            before_marker=before_marker,
+            before_rename=before_rename,
+            after_rename=after_rename,
+            after_approval=after_approval,
+            after_quarantine_rename=after_quarantine_rename,
+            signal_latch=signal_latch,
+        )
+
+
+def _publish_install_directory_locked(
+    staged,
+    destination,
+    quarantine,
+    measurement,
+    pins,
+    runner,
+    *,
+    deadline,
+    before_marker=None,
+    before_rename=None,
+    after_rename=None,
+    after_approval=None,
+    after_quarantine_rename=None,
+    signal_latch=None,
+):
+    staged = Path(staged)
+    destination = _canonical_destination(destination)
+    quarantine = _canonical_destination(quarantine)
+    if staged.parent != destination.parent or destination.parent != quarantine.parent:
+        raise PublicationError("publication paths must use the same parent")
+    if staged != measurement.path or destination.parent != measurement.parent:
+        raise PublicationError("staging measurement path changed")
+    _verify_staging_name(measurement)
+    _verify_retained_measurement(
+        measurement, pins, runner, deadline, elf_lock_held=True
+    )
     _raise_if_interrupted(signal_latch)
     committed = False
     installed_fd = -1
@@ -1768,6 +1812,8 @@ def publish_install_directory(
             pins,
             runner,
             deadline=deadline,
+            retained_elf_fd=measurement.elf_fd,
+            elf_lock_held=True,
         )
         if before_rename is not None:
             before_rename(staged)
@@ -1807,6 +1853,8 @@ def publish_install_directory(
             pins,
             runner,
             deadline=deadline,
+            retained_elf_fd=measurement.elf_fd,
+            elf_lock_held=True,
         )
         _raise_if_interrupted(signal_latch)
         os.fsync(measurement.parent_fd)
@@ -1833,6 +1881,13 @@ def publish_install_directory(
                     "ROLLBACK_PREPARED",
                     str(destination),
                     str(quarantine),
+                    measurement.root_device,
+                    measurement.root_inode,
+                )
+                _verify_retained_directory_name(
+                    measurement.parent_fd,
+                    destination.name,
+                    installed_fd,
                     measurement.root_device,
                     measurement.root_inode,
                 )
@@ -1981,7 +2036,16 @@ def verify_approved_install(destination, pins, runner, *, deadline):
         os.close(parent_fd)
 
 
-def _verify_approved_install_at(parent_fd, destination_name, pins, runner, *, deadline):
+def _verify_approved_install_at(
+    parent_fd,
+    destination_name,
+    pins,
+    runner,
+    *,
+    deadline,
+    retained_elf_fd=None,
+    elf_lock_held=False,
+):
     installed_fd = os.open(
         destination_name,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -2015,7 +2079,20 @@ def _verify_approved_install_at(parent_fd, destination_name, pins, runner, *, de
             marker["elf_inode"],
         ):
             raise PublicationError("approved ELF identity changed")
-        _verify_elf_fd(elf_fd, pins, runner, deadline)
+        if elf_lock_held:
+            if retained_elf_fd is None:
+                raise PublicationError("locked ELF verification lacks retained fd")
+            retained_value = os.fstat(retained_elf_fd)
+            if (retained_value.st_dev, retained_value.st_ino) != (
+                elf_value.st_dev,
+                elf_value.st_ino,
+            ):
+                raise PublicationError("retained approved ELF identity changed")
+            _verify_elf_fd_locked(retained_elf_fd, pins, runner, deadline)
+        else:
+            if retained_elf_fd is not None:
+                raise PublicationError("retained ELF requires an existing lock")
+            _verify_elf_fd(elf_fd, pins, runner, deadline)
     finally:
         for fd in (elf_fd, marker_fd, bin_fd, installed_fd):
             if fd >= 0:
@@ -2106,44 +2183,48 @@ def hash_retained_fd(fd, runner, *, deadline, hasher="/usr/bin/sha256sum"):
 
 def _verify_elf_fd(fd, pins, runner, deadline):
     with _exclusive_elf_lock(fd):
-        before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or before.st_size != pins.size:
-            raise PublicationError("ELF size changed")
-        retained = f"/proc/self/fd/{fd}"
-        validation = run_blocking_phase(
-            "elf_validation",
-            isolated_python_argv(_ELF_VALIDATOR, retained),
-            runner,
-            deadline=deadline,
-            pass_fds=(fd,),
-        )
-        if validation.returncode != 0:
-            raise PublicationError("ELF ABI changed")
-        initial_digest = _parse_elf_validator_digest(validation.stdout)
-        if initial_digest != pins.sha256:
-            raise PublicationError("ELF digest changed")
-        version = run_blocking_phase(
-            "elf_version",
-            [retained, "--version"],
-            runner,
-            deadline=deadline,
-            pass_fds=(fd,),
-        )
-        if (
-            version.returncode != 0
-            or hashlib.sha256(version.stdout).hexdigest() != pins.version_sha256
-        ):
-            raise PublicationError("ELF version output changed")
-        final_digest = hash_retained_fd(fd, runner, deadline=deadline)
-        after = os.fstat(fd)
-        if (before.st_dev, before.st_ino, before.st_size) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-        ):
-            raise PublicationError("ELF identity changed during verification")
-        if final_digest != initial_digest:
-            raise PublicationError("ELF bytes changed during verification")
+        _verify_elf_fd_locked(fd, pins, runner, deadline)
+
+
+def _verify_elf_fd_locked(fd, pins, runner, deadline):
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_size != pins.size:
+        raise PublicationError("ELF size changed")
+    retained = f"/proc/self/fd/{fd}"
+    validation = run_blocking_phase(
+        "elf_validation",
+        isolated_python_argv(_ELF_VALIDATOR, retained),
+        runner,
+        deadline=deadline,
+        pass_fds=(fd,),
+    )
+    if validation.returncode != 0:
+        raise PublicationError("ELF ABI changed")
+    initial_digest = _parse_elf_validator_digest(validation.stdout)
+    if initial_digest != pins.sha256:
+        raise PublicationError("ELF digest changed")
+    version = run_blocking_phase(
+        "elf_version",
+        [retained, "--version"],
+        runner,
+        deadline=deadline,
+        pass_fds=(fd,),
+    )
+    if (
+        version.returncode != 0
+        or hashlib.sha256(version.stdout).hexdigest() != pins.version_sha256
+    ):
+        raise PublicationError("ELF version output changed")
+    final_digest = hash_retained_fd(fd, runner, deadline=deadline)
+    after = os.fstat(fd)
+    if (before.st_dev, before.st_ino, before.st_size) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+    ):
+        raise PublicationError("ELF identity changed during verification")
+    if final_digest != initial_digest:
+        raise PublicationError("ELF bytes changed during verification")
 
 
 def _parse_elf_validator_digest(payload):
@@ -2158,14 +2239,19 @@ def _parse_elf_validator_digest(payload):
     return value
 
 
-def _verify_retained_measurement(measurement, pins, runner, deadline):
+def _verify_retained_measurement(
+    measurement, pins, runner, deadline, *, elf_lock_held=False
+):
     root = os.fstat(measurement.root_fd)
     elf = os.fstat(measurement.elf_fd)
     if (root.st_dev, root.st_ino) != (measurement.root_device, measurement.root_inode):
         raise PublicationError("retained staging directory changed")
     if (elf.st_dev, elf.st_ino) != (measurement.elf_device, measurement.elf_inode):
         raise PublicationError("retained staging ELF changed")
-    _verify_elf_fd(measurement.elf_fd, pins, runner, deadline)
+    if elf_lock_held:
+        _verify_elf_fd_locked(measurement.elf_fd, pins, runner, deadline)
+    else:
+        _verify_elf_fd(measurement.elf_fd, pins, runner, deadline)
 
 
 def _verify_staging_name(measurement):
