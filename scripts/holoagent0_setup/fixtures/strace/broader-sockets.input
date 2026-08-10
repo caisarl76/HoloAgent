@@ -2,3 +2,8 @@
 83    1700000052.000002 bind(4<NETLINK:[404]>, {sa_family=AF_NETLINK, nl_pid=4321, nl_groups=00000000}, 12) = 0 <0.000001>
 83    1700000052.000003 getsockname(4<NETLINK:[ROUTE:4321]>, {sa_family=AF_NETLINK, nl_pid=4321, nl_groups=00000001}, [12]) = 0 <0.000001>
 83    1700000052.000004 socket(AF_INET, SOCK_DGRAM, IPPROTO_UDPLITE) = 5<UDPLITE:[505]> <0.000001>
+83    1700000052.000005 connect(-1, {sa_family=AF_PACKET, sll_protocol=htons(ETH_P_ALL), sll_ifindex=4207869677, sll_hatype=ARPHRD_ETHER, sll_pkttype=PACKET_HOST, sll_halen=0}, 20) = -1 EBADF (Bad file descriptor) <0.000001>
+83    1700000052.000006 connect(-1, {sa_family=AF_PACKET, sll_protocol=htons(ETH_P_ALL), sll_ifindex=if_nametoindex("lo"), sll_hatype=ARPHRD_ETHER, sll_pkttype=PACKET_HOST, sll_halen=0}, 20) = -1 EBADF (Bad file descriptor) <0.000001>
+83    1700000052.000007 getsockopt(6<TCP:[127.0.0.1:7400]>, SOL_TCP, TCP_MAXSEG, [536], [4]) = 0 <0.000001>
+83    1700000052.000008 getsockopt(7<UNIX-STREAM:[707]>, SOL_SOCKET, SO_ACCEPTCONN, [1], [4]) = 0 <0.000001>
+83    1700000052.000009 setsockopt(7<UNIX-STREAM:[707]>, SOL_SOCKET, SO_PASSCRED, [1], 4) = 0 <0.000001>
