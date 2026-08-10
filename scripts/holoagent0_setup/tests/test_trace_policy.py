@@ -476,6 +476,48 @@ def test_non_ip_observer_sockets_are_neutral(domain, protocol):
     assert decision.status == "PASS"
 
 
+def test_netlink_observer_bind_and_message_operations_are_neutral():
+    policy = make_policy()
+    records = Records()
+    assert (
+        policy.feed(
+            records.socket(
+                COORDINATOR_PID,
+                7,
+                domain="AF_NETLINK",
+                protocol="NETLINK_ROUTE",
+            )
+        ).status
+        == "PASS"
+    )
+    address = {"family": "AF_NETLINK", "pid": COORDINATOR_PID, "groups": 0}
+    for operation in ("bind", "getsockname"):
+        decision = policy.feed(
+            records.make(
+                COORDINATOR_PID,
+                operation,
+                transition={
+                    "operation": operation,
+                    "fd": {"fd": 7},
+                    "address": address,
+                },
+            )
+        )
+        assert decision.status == "PASS"
+    for syscall in ("sendmsg", "recvmsg"):
+        decision = policy.feed(
+            records.make(
+                COORDINATOR_PID,
+                syscall,
+                result=1,
+                fds=[{"fd": 7}],
+                lengths={"iov_count": 1},
+                flags=[],
+            )
+        )
+        assert decision.status == "PASS"
+
+
 def test_missing_or_nonmonotonic_marker_indices_fail_closed():
     policy = make_policy()
     records = Records()
