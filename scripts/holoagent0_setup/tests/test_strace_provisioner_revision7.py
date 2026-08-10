@@ -455,6 +455,7 @@ def test_cleanup_uses_retained_parent_fd_and_rejects_root_symlink_swap(tmp_path)
     with pytest.raises(ns["PathIdentityError"]):
         registry.remove_tree(tree)
     assert (outside / "keep").read_text() == "keep"
-    assert not (tmp_path / tree.name).exists()
+    assert (tmp_path / tree.name).is_symlink()
+    assert os.readlink(tmp_path / tree.name) == str(outside)
     assert moved.is_dir()
     registry.close()

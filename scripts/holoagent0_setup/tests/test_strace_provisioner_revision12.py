@@ -204,7 +204,7 @@ def test_rollback_swap_after_prepared_never_moves_foreign_destination(tmp_path):
         measurement.close()
 
 
-def test_finalizer_removes_only_the_retained_rollback_destination(tmp_path):
+def test_finalizer_refuses_to_remove_retained_rollback_destination(tmp_path):
     ns = _namespace()
     registry = ns["OwnedPathRegistry"](tmp_path)
     retained = registry.create_directory(".stage", mode=0o700)
@@ -224,8 +224,10 @@ def test_finalizer_removes_only_the_retained_rollback_destination(tmp_path):
     )
 
     try:
-        ns["cleanup_publication_stage"](registry, retained, transition)
-        assert not (tmp_path / "install").exists()
+        with pytest.raises(ns["PublicationError"], match="unresolved cleanup"):
+            ns["cleanup_publication_stage"](registry, retained, transition)
+        assert retained.fd == -1
+        assert (tmp_path / "install").is_dir()
     finally:
         registry.close()
 
@@ -256,8 +258,9 @@ def test_finalizer_rejects_and_preserves_a_replacement_destination(tmp_path):
     )
 
     try:
-        with pytest.raises(ns["PathIdentityError"]):
+        with pytest.raises(ns["PublicationError"], match="unresolved cleanup"):
             ns["cleanup_publication_stage"](registry, retained, transition)
+        assert retained.fd == -1
         assert replacement.is_dir()
         assert (replacement / "foreign-content").read_bytes() == foreign_payload
         moved = moved_original.stat()
