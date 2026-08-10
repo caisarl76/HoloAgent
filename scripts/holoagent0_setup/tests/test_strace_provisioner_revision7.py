@@ -266,7 +266,7 @@ else:
     )
 
 
-def test_docker_cleanup_observes_delayed_daemon_materialization_and_removes_it(
+def test_docker_cleanup_observes_but_never_adopts_delayed_materialization(
     tmp_path,
 ):
     ns = _namespace()
@@ -300,10 +300,10 @@ def test_docker_cleanup_observes_delayed_daemon_materialization_and_removes_it(
         command_timeout=0.15,
     )
     try:
-        with pytest.raises(ns["OwnedProcessTimeout"]):
+        with pytest.raises(ns["DockerCleanupError"]):
             owner.run_container(["fake-image", "true"], timeout=0.08, env=environment)
-        assert (state / "rm-called").exists()
-        assert not (state / "present").exists()
+        assert not (state / "rm-called").exists()
+        assert (state / "present").exists()
     finally:
         daemon_process.wait(timeout=2)
 
@@ -341,6 +341,11 @@ def test_docker_collision_and_cleanup_error_are_fail_closed_and_bounded(tmp_path
     (state / "nonce").write_text(nonce)
     (state / "label").write_text(f"holoagent0.strace.owner={nonce}")
     environment["FAKE_DOCKER_BEHAVIOR"] = "remove-error"
+    identity = ns["DockerIdentity"]("a" * 64, name, nonce)
+    owner.attempted = True
+    owner.created_identity = identity
+    owner._active_identity = identity
+    owner._create_outcome_uncertain = False
     started = time.monotonic()
     with pytest.raises(ns["DockerCleanupError"]):
         owner.cleanup(env=environment)
