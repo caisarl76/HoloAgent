@@ -26,6 +26,7 @@ SOURCE_SHA256 = "421b4186c06b705163e64dc85f271ebdcf67660af8667283147d5e859fc8a96
 TOP_DIRECTORY = "strace-6.6"
 PYTHON = "/usr/bin/python3.10"
 DOCKER = "/usr/bin/docker"
+DEFAULT_DOCKER_HOST = "unix:///var/run/docker.sock"
 BUILD_ENV = {"LC_ALL": "C", "LANG": "C", "TZ": "UTC", "SOURCE_DATE_EPOCH": "0"}
 BLOCKING_PHASES = frozenset(
     {
@@ -140,6 +141,7 @@ def closed_command_env(extra=None):
     }
     if extra:
         allowed = {
+            "DOCKER_CONFIG",
             "DOCKER_HOST",
             "FAKE_DOCKER_STATE",
             "FAKE_DOCKER_BEHAVIOR",
@@ -158,6 +160,18 @@ def closed_command_env(extra=None):
                 or not socket_path.is_absolute()
             ):
                 raise ProvisioningError("DOCKER_HOST must be an absolute Unix socket")
+        docker_config = extra.get("DOCKER_CONFIG")
+        if docker_config is not None:
+            prefix = f"/proc/{os.getpid()}/fd/"
+            suffix = docker_config.removeprefix(prefix)
+            if (
+                not docker_config.startswith(prefix)
+                or not suffix.isdigit()
+                or not stat.S_ISDIR(os.fstat(int(suffix)).st_mode)
+            ):
+                raise ProvisioningError(
+                    "DOCKER_CONFIG must identify a retained local directory"
+                )
         environment.update(extra)
     return environment
 
@@ -204,6 +218,22 @@ class SealedArchive:
         if self.fd >= 0:
             os.close(self.fd)
             self.fd = -1
+
+
+@dataclass
+class DockerClientContext:
+    directory_fd: int
+    device: int
+    inode: int
+    environment: dict
+
+    def close(self):
+        if self.directory_fd >= 0:
+            value = os.fstat(self.directory_fd)
+            if (value.st_dev, value.st_ino) != (self.device, self.inode):
+                raise PathIdentityError("Docker client config identity changed")
+            os.close(self.directory_fd)
+            self.directory_fd = -1
 
 
 def isolated_python_argv(program, *arguments):
@@ -645,6 +675,7 @@ def install_escape_filter():
     audit_arch_x86_64 = 0xC000003E
     seccomp_allow = 0x7FFF0000
     seccomp_errno = 0x00050000 | errno.EPERM
+    seccomp_enosys = 0x00050000 | errno.ENOSYS
     seccomp_kill_process = 0x80000000
     namespace_flags = (
         0x00020000
@@ -661,13 +692,19 @@ def install_escape_filter():
         (return_constant, 0, 0, seccomp_kill_process),
         (load_word_absolute, 0, 0, 0),
     ]
-    for syscall_number in (112, 272, 308, 435):
+    for syscall_number in (112, 272, 308):
         instructions.extend(
             [
                 (jump_equal, 0, 1, syscall_number),
                 (return_constant, 0, 0, seccomp_errno),
             ]
         )
+    instructions.extend(
+        [
+            (jump_equal, 0, 1, 435),
+            (return_constant, 0, 0, seccomp_enosys),
+        ]
+    )
     instructions.extend(
         [
             (jump_equal, 0, 3, 56),
@@ -1001,6 +1038,75 @@ def retained_fd_path(fd, suffix=None):
     ):
         raise PathIdentityError("retained FD suffix must be a safe relative path")
     return Path(value).joinpath(*relative.parts)
+
+
+def _validated_local_docker_host(ambient):
+    host = ambient.get("DOCKER_HOST", DEFAULT_DOCKER_HOST)
+    if not isinstance(host, str) or not host.startswith("unix:///"):
+        raise ProvisioningError("Docker host must be an absolute local Unix socket")
+    socket_path = Path(host.removeprefix("unix://"))
+    if (
+        not socket_path.is_absolute()
+        or ".." in socket_path.parts
+        or os.path.normpath(str(socket_path)) != str(socket_path)
+    ):
+        raise ProvisioningError("Docker socket path must be absolute and canonical")
+    try:
+        value = os.stat(socket_path, follow_symlinks=False)
+    except OSError as error:
+        raise ProvisioningError("Docker host socket is unavailable") from error
+    if not stat.S_ISSOCK(value.st_mode):
+        raise ProvisioningError("Docker host must identify a local Unix socket")
+    return host
+
+
+def create_docker_client_context(root_fd, ambient):
+    root = os.fstat(root_fd)
+    if not stat.S_ISDIR(root.st_mode):
+        raise PathIdentityError("Docker client root must be a retained directory")
+    host = _validated_local_docker_host(ambient)
+    name = "docker-client"
+    os.mkdir(name, mode=0o700, dir_fd=root_fd)
+    directory_fd = -1
+    config_fd = -1
+    try:
+        directory_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=root_fd,
+        )
+        os.fchmod(directory_fd, 0o700)
+        directory = os.fstat(directory_fd)
+        config_fd = os.open(
+            "config.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(config_fd, 0o600)
+        _write_fd(config_fd, b"{}\n")
+        os.fsync(config_fd)
+        os.close(config_fd)
+        config_fd = -1
+        os.fsync(directory_fd)
+        environment = closed_command_env(
+            {
+                "DOCKER_HOST": host,
+                "DOCKER_CONFIG": str(retained_fd_path(directory_fd)),
+            }
+        )
+        return DockerClientContext(
+            directory_fd,
+            directory.st_dev,
+            directory.st_ino,
+            environment,
+        )
+    except BaseException:
+        if config_fd >= 0:
+            os.close(config_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        raise
 
 
 def create_owned_file_at(directory_fd, name, *, mode):
@@ -1357,40 +1463,62 @@ def measure_elf_pins(path, runner, *, deadline, require_exact=False):
         os.close(fd)
 
 
+@contextmanager
+def _exclusive_elf_lock(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EAGAIN}:
+            raise PublicationError("runtime ELF is already being modified") from error
+        raise PublicationError("runtime ELF lock failed") from error
+    try:
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 def _measure_elf_fd(fd, runner, deadline, *, require_exact=False):
-    before = os.fstat(fd)
-    if not stat.S_ISREG(before.st_mode):
-        raise PublicationError("runtime must be a regular non-symlink ELF")
-    retained = f"/proc/self/fd/{fd}"
-    validation = run_blocking_phase(
-        "elf_validation",
-        isolated_python_argv(_ELF_VALIDATOR, retained),
-        runner,
-        deadline=deadline,
-        pass_fds=(fd,),
-    )
-    if validation.returncode != 0:
-        raise PublicationError("runtime is not linux-x86_64 ELF")
-    version = run_blocking_phase(
-        "elf_version",
-        [retained, "--version"],
-        runner,
-        deadline=deadline,
-        pass_fds=(fd,),
-    )
-    if version.returncode != 0:
-        raise PublicationError("runtime version command failed")
-    if require_exact:
-        require_strace_6_6(version.stdout)
-    digest = hash_retained_fd(fd, runner, deadline=deadline)
-    after = os.fstat(fd)
-    if (before.st_dev, before.st_ino, before.st_size) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-    ):
-        raise PublicationError("runtime identity changed during measurement")
-    return ElfPins(before.st_size, digest, hashlib.sha256(version.stdout).hexdigest())
+    with _exclusive_elf_lock(fd):
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise PublicationError("runtime must be a regular non-symlink ELF")
+        retained = f"/proc/self/fd/{fd}"
+        validation = run_blocking_phase(
+            "elf_validation",
+            isolated_python_argv(_ELF_VALIDATOR, retained),
+            runner,
+            deadline=deadline,
+            pass_fds=(fd,),
+        )
+        if validation.returncode != 0:
+            raise PublicationError("runtime is not linux-x86_64 ELF")
+        digest = _parse_elf_validator_digest(validation.stdout)
+        version = run_blocking_phase(
+            "elf_version",
+            [retained, "--version"],
+            runner,
+            deadline=deadline,
+            pass_fds=(fd,),
+        )
+        if version.returncode != 0:
+            raise PublicationError("runtime version command failed")
+        if require_exact:
+            require_strace_6_6(version.stdout)
+        final_digest = hash_retained_fd(fd, runner, deadline=deadline)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+        ):
+            raise PublicationError("runtime identity changed during measurement")
+        if final_digest != digest:
+            raise PublicationError("runtime bytes changed during measurement")
+        return ElfPins(
+            before.st_size,
+            digest,
+            hashlib.sha256(version.stdout).hexdigest(),
+        )
 
 
 def require_strace_6_6(output):
@@ -1721,22 +1849,35 @@ def publish_install_directory(
                     measurement.root_device,
                     measurement.root_inode,
                 )
+                _verify_retained_directory_name(
+                    measurement.parent_fd,
+                    quarantine.name,
+                    installed_fd,
+                    measurement.root_device,
+                    measurement.root_inode,
+                )
                 os.fsync(measurement.parent_fd)
                 if after_quarantine_rename is not None:
                     after_quarantine_rename(quarantine)
-                quarantine_fd = os.open(
+                _verify_retained_directory_name(
+                    measurement.parent_fd,
                     quarantine.name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=measurement.parent_fd,
+                    installed_fd,
+                    measurement.root_device,
+                    measurement.root_inode,
                 )
-                try:
-                    _transition_marker_state(
-                        quarantine_fd,
-                        "QUARANTINED",
-                        rollback_state="ROLLED_BACK",
-                    )
-                finally:
-                    os.close(quarantine_fd)
+                _transition_marker_state(
+                    installed_fd,
+                    "QUARANTINED",
+                    rollback_state="ROLLED_BACK",
+                )
+                _verify_retained_directory_name(
+                    measurement.parent_fd,
+                    quarantine.name,
+                    installed_fd,
+                    measurement.root_device,
+                    measurement.root_inode,
+                )
                 os.fsync(measurement.parent_fd)
                 transition = PublicationTransition(
                     "QUARANTINED",
@@ -1778,6 +1919,22 @@ def publish_install_directory(
     finally:
         if installed_fd >= 0:
             os.close(installed_fd)
+
+
+def _verify_retained_directory_name(parent_fd, name, retained_fd, device, inode):
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        retained = os.fstat(retained_fd)
+    except OSError as error:
+        raise PublicationError("retained directory name changed") from error
+    expected = (device, inode)
+    if (
+        not stat.S_ISDIR(named.st_mode)
+        or not stat.S_ISDIR(retained.st_mode)
+        or (named.st_dev, named.st_ino) != expected
+        or (retained.st_dev, retained.st_ino) != expected
+    ):
+        raise PublicationError("retained directory name changed")
 
 
 def _transition_marker_state(directory_fd, state, **fields):
@@ -1948,23 +2105,57 @@ def hash_retained_fd(fd, runner, *, deadline, hasher="/usr/bin/sha256sum"):
 
 
 def _verify_elf_fd(fd, pins, runner, deadline):
-    value = os.fstat(fd)
-    if not stat.S_ISREG(value.st_mode) or value.st_size != pins.size:
-        raise PublicationError("ELF size changed")
-    if hash_retained_fd(fd, runner, deadline=deadline) != pins.sha256:
-        raise PublicationError("ELF digest changed")
-    version = run_blocking_phase(
-        "elf_version",
-        [f"/proc/self/fd/{fd}", "--version"],
-        runner,
-        deadline=deadline,
-        pass_fds=(fd,),
-    )
-    if (
-        version.returncode != 0
-        or hashlib.sha256(version.stdout).hexdigest() != pins.version_sha256
+    with _exclusive_elf_lock(fd):
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size != pins.size:
+            raise PublicationError("ELF size changed")
+        retained = f"/proc/self/fd/{fd}"
+        validation = run_blocking_phase(
+            "elf_validation",
+            isolated_python_argv(_ELF_VALIDATOR, retained),
+            runner,
+            deadline=deadline,
+            pass_fds=(fd,),
+        )
+        if validation.returncode != 0:
+            raise PublicationError("ELF ABI changed")
+        initial_digest = _parse_elf_validator_digest(validation.stdout)
+        if initial_digest != pins.sha256:
+            raise PublicationError("ELF digest changed")
+        version = run_blocking_phase(
+            "elf_version",
+            [retained, "--version"],
+            runner,
+            deadline=deadline,
+            pass_fds=(fd,),
+        )
+        if (
+            version.returncode != 0
+            or hashlib.sha256(version.stdout).hexdigest() != pins.version_sha256
+        ):
+            raise PublicationError("ELF version output changed")
+        final_digest = hash_retained_fd(fd, runner, deadline=deadline)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+        ):
+            raise PublicationError("ELF identity changed during verification")
+        if final_digest != initial_digest:
+            raise PublicationError("ELF bytes changed during verification")
+
+
+def _parse_elf_validator_digest(payload):
+    try:
+        value = bytes(payload).decode("ascii", "strict").strip()
+    except UnicodeDecodeError as error:
+        raise PublicationError("ELF validator returned an invalid digest") from error
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
     ):
-        raise PublicationError("ELF version output changed")
+        raise PublicationError("ELF validator returned an invalid digest")
+    return value
 
 
 def _verify_retained_measurement(measurement, pins, runner, deadline):
@@ -2082,14 +2273,23 @@ def _closed_json(payload):
 
 
 _ELF_VALIDATOR = r"""
-from pathlib import Path
+import hashlib
 import struct
 import sys
-header = Path(sys.argv[1]).read_bytes()[:20]
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb", buffering=0) as stream:
+    header = stream.read(20)
+    digest.update(header)
+    while True:
+        block = stream.read(65536)
+        if not block:
+            break
+        digest.update(block)
 if len(header) != 20 or header[:4] != b"\x7fELF":
     raise SystemExit(1)
 if header[4] != 2 or header[5] != 1 or struct.unpack("<H", header[18:20])[0] != 62:
     raise SystemExit(1)
+print(digest.hexdigest())
 """
 
 
@@ -2404,10 +2604,9 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
     output_stage = None
     measurement = None
     docker_owner = None
+    docker_client = None
     publication_transition = None
-    docker_environment = closed_command_env(
-        {key: os.environ[key] for key in ("DOCKER_HOST",) if key in os.environ}
-    )
+    docker_environment = None
     cleanup_succeeded = True
     ordinary_status = 0
     primary_error = None
@@ -2417,6 +2616,8 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
         root = registry.create_directory(
             f".holoagent0-strace-{secrets.token_hex(16)}", mode=0o700
         )
+        docker_client = create_docker_client_context(root.fd, os.environ)
+        docker_environment = docker_client.environment
         snapshot = create_sealable_archive("holoagent0-strace-6.6")
         transfer_archive(
             source_archive,
@@ -2582,6 +2783,8 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
                         lambda: docker_owner.cleanup(env=docker_environment),
                     )
                 )
+            if docker_client is not None:
+                actions.append(("docker_client", docker_client.close))
             if measurement is not None:
                 actions.append(("measurement", measurement.close))
             if snapshot is not None:
