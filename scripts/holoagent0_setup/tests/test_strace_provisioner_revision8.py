@@ -107,14 +107,14 @@ elif args and args[0] == 'rm':
     if identity != (state/'id').read_text().strip(): raise SystemExit(66)
     (state/'present').unlink(missing_ok=True)
 elif args and args[0] == 'start':
-    time.sleep(30)
+    (state/'start-called').touch(); time.sleep(30)
 else:
     raise SystemExit(64)
 """,
     )
 
 
-def test_signal_during_docker_run_uses_cleanup_runner_and_removes_late_id(tmp_path):
+def test_signal_during_response_less_create_never_adopts_late_inventory_id(tmp_path):
     ns = _namespace()
     state = tmp_path / "state"
     state.mkdir()
@@ -153,12 +153,12 @@ def test_signal_during_docker_run_uses_cleanup_runner_and_removes_late_id(tmp_pa
 
     worker = threading.Thread(target=materialize_and_signal)
     worker.start()
-    with pytest.raises(ns["ProvisioningInterrupted"]) as captured:
+    with pytest.raises(ns["DockerCleanupError"]):
         owner.run_container(["fake-image", "true"], timeout=1.0, env=environment)
     worker.join(timeout=2)
-    assert captured.value.status == 143
-    assert (state / "rm-arg").read_text() == container_id
-    assert not (state / "present").exists()
+    assert not (state / "rm-arg").exists()
+    assert (state / "present").exists()
+    assert not (state / "start-called").exists()
 
 
 def test_signal_cleanup_failure_has_harness_status_three(tmp_path):
@@ -377,10 +377,10 @@ def test_exact_strace_version_first_line_is_required():
             ns["require_strace_6_6"](value)
 
 
-def test_shell_and_command_environment_are_hermetic():
+def test_direct_launcher_and_command_environment_are_hermetic():
     ns = _namespace()
     source = SCRIPT.read_text(encoding="utf-8")
-    assert "exec /usr/bin/python3.10 -I -S -" in source
+    assert source.startswith("#!/usr/bin/env -S /usr/bin/python3.10 -I -S\n")
     environment = ns["closed_command_env"]({"DOCKER_HOST": "unix:///run/docker.sock"})
     assert environment == {
         "PATH": "/usr/bin:/bin",

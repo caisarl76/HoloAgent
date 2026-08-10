@@ -52,11 +52,11 @@ def _wait_for(path: Path, timeout: float = 2.0) -> None:
     raise AssertionError(f"timed out waiting for {path}")
 
 
-def test_thin_shell_execs_one_digest_bound_stdlib_python_provisioner():
+def test_direct_entrypoint_is_one_digest_bound_stdlib_python_provisioner():
     source = SCRIPT.read_text(encoding="utf-8")
     namespace = _namespace()
     prefix = source.split("# BEGIN_PROVISIONER_PYTHON", 1)[0]
-    assert prefix.count("exec /usr/bin/python3.10") == 1
+    assert prefix == "#!/usr/bin/env -S /usr/bin/python3.10 -I -S\n"
     assert "BEGIN_OWNED_PROCESS_HELPERS" not in source
     assert "subprocess" in namespace
     assert not (ROOT / "holoagent0_setup/strace_publication.py").exists()

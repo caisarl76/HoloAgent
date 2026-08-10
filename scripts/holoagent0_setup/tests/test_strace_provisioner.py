@@ -37,7 +37,7 @@ def _namespace():
 def _run(*args: str, env=None):
     _namespace()
     return subprocess.run(
-        ["bash", str(SCRIPT), *args],
+        [str(SCRIPT), *args],
         text=True,
         capture_output=True,
         cwd=REPOSITORY_ROOT,
@@ -290,7 +290,7 @@ def test_no_archive_mode_validates_build_pins_before_transfer(tmp_path):
     assert result.returncode == 3
     assert "PENDING_REPRODUCIBLE_BUILD" in result.stderr
     assert "curl" not in result.stderr.lower()
-    assert "exec /usr/bin/python3.10" in source
+    assert source.startswith("#!/usr/bin/env -S /usr/bin/python3.10 -I -S\n")
 
 
 def test_candidate_measurement_never_amends_policy_or_claims_reviewed_install():

@@ -15,3 +15,4 @@ scripts/holoagent0_setup/tests/test_strace_provisioner_revision6.py
 scripts/holoagent0_setup/tests/test_strace_provisioner_revision7.py
 scripts/holoagent0_setup/tests/test_strace_provisioner_revision8.py
 scripts/holoagent0_setup/tests/test_strace_provisioner_revision9.py
+scripts/holoagent0_setup/tests/test_strace_provisioner_revision10.py
