@@ -8,7 +8,7 @@ import ipaddress
 import json
 import os
 import re
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 RAW_PAYLOAD_SYSCALL_ORDER = (
@@ -28,7 +28,7 @@ RAW_PAYLOAD_SYSCALL_ORDER = (
     "tee",
     "copy_file_range",
 )
-STRACE_ARGUMENTS = (
+STRACE_ARGUMENT_TEMPLATE = (
     "--kill-on-exit",
     "-f",
     "-yy",
@@ -39,14 +39,17 @@ STRACE_ARGUMENTS = (
     "--quiet=none",
     "--trace=all",
     f"--raw={','.join(RAW_PAYLOAD_SYSCALL_ORDER)}",
+    "--output=/proc/self/fd/{output_fd}",
 )
+# Compatibility name for consumers that inspect the reviewed template.
+STRACE_ARGUMENTS = STRACE_ARGUMENT_TEMPLATE
 STRACE_ENVIRONMENT = {"LC_ALL": "C", "TZ": "UTC"}
 RAW_PAYLOAD_SYSCALLS = frozenset(RAW_PAYLOAD_SYSCALL_ORDER)
 DECODED_ADDRESS_SYSCALLS = frozenset(
     {"sendto", "recvfrom", "sendmsg", "recvmsg", "sendmmsg", "recvmmsg"}
 )
 
-_PREFIX = re.compile(r"^([1-9][0-9]*) ([0-9]+(?:\.[0-9]+)?) (.+)$")
+_PREFIX = re.compile(r"^([1-9][0-9]*)( +)([0-9]+(?:\.[0-9]+)?) (.+)$")
 _CALL = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\((.*)\) = (.+) <([0-9]+(?:\.[0-9]+)?)>$")
 _UNFINISHED = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\((.*)<unfinished \.\.\.>$")
 _RESUMED = re.compile(r"^<\.\.\. ([A-Za-z_][A-Za-z0-9_]*) resumed>(.*)$")
@@ -54,7 +57,7 @@ _SIGNAL = re.compile(r"^--- (SIG[A-Z0-9]+) \{.*\} ---$")
 _EXITED = re.compile(r"^\+\+\+ exited with ([0-9]+) \+\+\+$")
 _KILLED = re.compile(r"^\+\+\+ killed by (SIG[A-Z0-9]+)(?: \(core dumped\))? \+\+\+$")
 _NUMBER_TEXT = r"(?:0|[1-9][0-9]*|0x[0-9a-f]+)"
-_FD = re.compile(r"^([0-9]+)(?:<([^>]*)>)?$")
+_FD = re.compile(r"^(-?(?:0|[1-9][0-9]*))(?:<(.+)>)?$")
 _INTEGER = re.compile(rf"^-?{_NUMBER_TEXT}$")
 _RAW_INTEGER = re.compile(r"^(?:0|0x[0-9a-f]+)$")
 _ERRNO = re.compile(r"^(-1) ([A-Z][A-Z0-9_]*) \(([^\r\n()]*)\)$")
@@ -62,12 +65,29 @@ _FLAGGED_RESULT = re.compile(
     rf"^({_NUMBER_TEXT}) \(flags ([A-Z][A-Z0-9_]*(?:\|[A-Z][A-Z0-9_]*)*)\)$"
 )
 
-_SOCKET_DOMAINS = frozenset({"AF_INET", "AF_INET6", "AF_UNIX"})
+_SOCKET_DOMAINS = frozenset({"AF_INET", "AF_INET6", "AF_NETLINK", "AF_UNIX"})
 _SOCKET_BASE_TYPES = frozenset(
     {"SOCK_DGRAM", "SOCK_RAW", "SOCK_SEQPACKET", "SOCK_STREAM"}
 )
 _SOCKET_TYPE_FLAGS = frozenset({"SOCK_CLOEXEC", "SOCK_NONBLOCK"})
-_SOCKET_PROTOCOLS = frozenset({"IPPROTO_TCP", "IPPROTO_UDP"})
+_INET_SOCKET_PROTOCOLS = frozenset(
+    {
+        "IPPROTO_ICMP",
+        "IPPROTO_ICMPV6",
+        "IPPROTO_IP",
+        "IPPROTO_RAW",
+        "IPPROTO_SCTP",
+        "IPPROTO_TCP",
+        "IPPROTO_UDP",
+    }
+)
+_NETLINK_SOCKET_PROTOCOLS = frozenset({"NETLINK_ROUTE", "NETLINK_SOCK_DIAG"})
+_RESTART_TEXT = {
+    "ERESTARTSYS": "To be restarted if SA_RESTART is set",
+    "ERESTARTNOINTR": "To be restarted",
+    "ERESTARTNOHAND": "To be restarted if no handler",
+    "ERESTART_RESTARTBLOCK": "Interrupted by signal",
+}
 _FCNTL_STATUS_FLAGS = frozenset(
     {
         "O_APPEND",
@@ -97,6 +117,19 @@ class _Pending:
     arguments_prefix: str
     timestamp: str
     entry_index: int
+
+
+def strace_arguments_for_output_fd(output_fd: int) -> tuple[str, ...]:
+    """Materialize the sole reviewed strace output path from a numeric FD."""
+
+    if not isinstance(output_fd, int) or isinstance(output_fd, bool):
+        raise TypeError("strace output FD must be an integer")
+    if output_fd < 3 or output_fd > 2_147_483_647:
+        raise ValueError("strace output FD is outside the reviewed numeric range")
+    return (
+        *STRACE_ARGUMENT_TEMPLATE[:-1],
+        STRACE_ARGUMENT_TEMPLATE[-1].format(output_fd=output_fd),
+    )
 
 
 def _fail(code: str) -> TraceDecodeError:
@@ -162,6 +195,56 @@ def _provenance(value: str) -> dict[str, object]:
     anon = re.fullmatch(r"anon_inode:\[([A-Za-z0-9_-]+)\]", value)
     if anon is not None:
         return {"kind": "anon_inode", "type": anon.group(1)}
+    annotated_socket = re.fullmatch(
+        r"(TCP|TCPv6|UDP|UDPv6|UNIX|NETLINK):\[(.*)\]", value
+    )
+    if annotated_socket is not None:
+        protocol, annotation = annotated_socket.groups()
+        if protocol in {"TCP", "UDP"}:
+            endpoint = r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+"
+            if not (
+                re.fullmatch(r"[0-9]+", annotation)
+                or re.fullmatch(rf"{endpoint}(?:->{endpoint})?", annotation)
+            ):
+                raise _fail("unsupported-fd-provenance")
+            for address, port in re.findall(
+                r"((?:[0-9]{1,3}\.){3}[0-9]{1,3}):([0-9]+)", annotation
+            ):
+                try:
+                    ipaddress.IPv4Address(address)
+                except ipaddress.AddressValueError as error:
+                    raise _fail("unsupported-fd-provenance") from error
+                if int(port) > 65535:
+                    raise _fail("unsupported-fd-provenance")
+        elif protocol in {"TCPv6", "UDPv6"}:
+            endpoint = r"\[([0-9A-Fa-f:.]+)\]:([0-9]+)"
+            if re.fullmatch(r"[0-9]+", annotation):
+                pass
+            else:
+                endpoints = re.fullmatch(rf"{endpoint}(?:->{endpoint})?", annotation)
+                if endpoints is None:
+                    raise _fail("unsupported-fd-provenance")
+                values = endpoints.groups()
+                for index in range(0, len(values), 2):
+                    if values[index] is None:
+                        continue
+                    try:
+                        ipaddress.IPv6Address(values[index])
+                    except ipaddress.AddressValueError as error:
+                        raise _fail("unsupported-fd-provenance") from error
+                    if int(values[index + 1]) > 65535:
+                        raise _fail("unsupported-fd-provenance")
+        elif protocol == "UNIX":
+            unix_name = r'@?"(?:[^"\\]|\\.)*"'
+            if (
+                re.fullmatch(r"[0-9]+", annotation) is None
+                and re.fullmatch(rf"[0-9]+(?:->[0-9]+)?(?:,{unix_name})?", annotation)
+                is None
+            ):
+                raise _fail("unsupported-fd-provenance")
+        elif re.fullmatch(r"(?:[0-9]+|[A-Z][A-Z0-9_]*:[0-9]+)", annotation) is None:
+            raise _fail("unsupported-fd-provenance")
+        return {"kind": "socket", "protocol": protocol}
     if value.startswith("/"):
         return {"kind": "path"}
     raise _fail("unsupported-fd-provenance")
@@ -174,6 +257,8 @@ def _fd(value: str, code: str) -> dict[str, object]:
     record: dict[str, object] = {"fd": int(match.group(1), 0)}
     provenance = match.group(2)
     if provenance is not None:
+        if record["fd"] < 0:
+            raise _fail(code)
         if len(provenance) > 4096 or any(ord(char) < 32 for char in provenance):
             raise _fail("invalid-fd-provenance")
         record["provenance"] = _provenance(provenance)
@@ -181,6 +266,12 @@ def _fd(value: str, code: str) -> dict[str, object]:
 
 
 def _result(value: str) -> dict[str, object]:
+    restart = re.fullmatch(r"\? (ERESTART[A-Z_]*) \(([^\r\n()]*)\)", value)
+    if restart is not None:
+        name, text = restart.groups()
+        if _RESTART_TEXT.get(name) != text:
+            raise _fail("unsupported-restart-result")
+        return {"interrupted": True, "restart": name}
     errno = _ERRNO.fullmatch(value)
     if errno is not None:
         errno_number = next(
@@ -211,8 +302,7 @@ def _result(value: str) -> dict[str, object]:
 
 
 def _raw_result(value: str) -> dict[str, object]:
-    errno = _ERRNO.fullmatch(value)
-    if errno is not None:
+    if _ERRNO.fullmatch(value) is not None or value.startswith("? ERESTART"):
         return _result(value)
     return {"value": _raw_integer(value, "invalid-raw-return")}
 
@@ -256,19 +346,27 @@ def _socket_type(value: str) -> list[str]:
     return values
 
 
-def _socket_protocol(value: str) -> int | str:
+def _socket_protocol(value: str, domain: str) -> int | str:
     if value == "0":
         return 0
-    if value not in _SOCKET_PROTOCOLS:
+    allowed = (
+        _NETLINK_SOCKET_PROTOCOLS if domain == "AF_NETLINK" else _INET_SOCKET_PROTOCOLS
+    )
+    if value not in allowed:
         raise _fail("unsupported-socket-protocol")
     return value
 
 
 def _socket_parameters(arguments: list[str]) -> dict[str, object]:
     domain = _socket_domain(arguments[0])
-    protocol = _socket_protocol(arguments[2])
+    protocol = _socket_protocol(arguments[2], domain)
     if domain == "AF_UNIX" and protocol != 0:
         raise _fail("unsupported-unix-socket-protocol")
+    if domain == "AF_NETLINK" and protocol not in _NETLINK_SOCKET_PROTOCOLS:
+        raise _fail("unsupported-netlink-socket-protocol")
+    if domain in {"AF_INET", "AF_INET6"} and isinstance(protocol, str):
+        if protocol not in _INET_SOCKET_PROTOCOLS:
+            raise _fail("unsupported-inet-socket-protocol")
     return {
         "domain": domain,
         "socket_type": _socket_type(arguments[1]),
@@ -323,6 +421,20 @@ def _vector(value: str, code: str) -> list[str]:
     return [] if not inner else _split_arguments(inner)
 
 
+def _output_pointer(value: str, code: str) -> None:
+    if value != "NULL" and re.fullmatch(r"0x[0-9a-f]+", value) is None:
+        raise _fail(code)
+
+
+def _output_length(value: str, code: str) -> int | None:
+    if value == "NULL" or re.fullmatch(r"0x[0-9a-f]+", value) is not None:
+        return None
+    length = re.fullmatch(r"\[([0-9]+)(?: => ([0-9]+))?\]", value)
+    if length is None:
+        raise _fail(code)
+    return int(length.group(2) or length.group(1))
+
+
 def _address(value: str) -> dict[str, object] | None:
     if value == "NULL":
         return None
@@ -368,6 +480,8 @@ def _address(value: str) -> dict[str, object] | None:
         except ipaddress.AddressValueError as error:
             raise _fail("sockaddr-inet-address") from error
     else:
+        if set(fields) == {"sa_family"}:
+            return result
         if set(fields) != {"sa_family", "sun_path"}:
             raise _fail("sockaddr-unix-fields")
         if re.fullmatch(r'"(?:[^"\\]|\\.)*"', fields["sun_path"]) is None:
@@ -477,15 +591,25 @@ def _raw_metadata(name: str, arguments: list[str]) -> dict[str, object]:
     return metadata
 
 
-def _message_vector(value: str) -> list[dict[str, object]]:
+def _message_vector(
+    value: str, *, allow_incomplete: bool = False
+) -> tuple[list[dict[str, object]], int]:
     messages: list[dict[str, object]] = []
+    completed = 0
+    incomplete_seen = False
     for item in _vector(value, "message-vector"):
         fields = _fields(item, "message-vector-entry")
-        if set(fields) != {"msg_hdr", "msg_len"}:
+        if set(fields) == {"msg_hdr", "msg_len"}:
+            if incomplete_seen:
+                raise _fail("message-vector-completion-order")
+            _integer(fields["msg_len"], "invalid-message-length")
+            completed += 1
+        elif allow_incomplete and set(fields) == {"msg_hdr"}:
+            incomplete_seen = True
+        else:
             raise _fail("message-vector-entry-fields")
-        _integer(fields["msg_len"], "invalid-message-length")
         messages.append(_message(fields["msg_hdr"]))
-    return messages
+    return messages, completed
 
 
 def _address_metadata(
@@ -502,9 +626,9 @@ def _address_metadata(
     if len(arguments) != arity:
         raise _fail("address-syscall-arity")
     metadata: dict[str, object] = {"fds": [_fd(arguments[0], "invalid-socket-fd")]}
-    if name in {"sendto", "recvfrom"}:
+    if name == "sendto":
         metadata["lengths"] = {"count": _integer(arguments[2], "invalid-count")}
-        sockaddr_length = re.fullmatch(r"\[?([0-9]+)\]?", arguments[-1])
+        sockaddr_length = re.fullmatch(r"([0-9]+)", arguments[-1])
         if sockaddr_length is None:
             raise _fail("invalid-sockaddr-length")
         metadata["lengths"]["sockaddr"] = int(sockaddr_length.group(1))
@@ -512,17 +636,63 @@ def _address_metadata(
         address = _address(arguments[4])
         if address is not None:
             metadata["address"] = address
-    elif name in {"sendmsg", "recvmsg"}:
+    elif name == "recvfrom":
+        metadata["lengths"] = {"count": _integer(arguments[2], "invalid-count")}
+        metadata["flags"] = _flags(arguments[3])
+        if arguments[4].startswith("{"):
+            address = _address(arguments[4])
+            length = _output_length(arguments[5], "invalid-sockaddr-length")
+            if length is None:
+                raise _fail("invalid-sockaddr-length")
+            metadata["lengths"]["sockaddr"] = length
+            if address is not None:
+                metadata["address"] = address
+        else:
+            _output_pointer(arguments[4], "invalid-recvfrom-address-pointer")
+            sockaddr_length = _output_length(
+                arguments[5], "invalid-recvfrom-length-pointer"
+            )
+            if sockaddr_length is not None:
+                metadata["lengths"]["sockaddr"] = sockaddr_length
+    elif name == "sendmsg":
         message = _message(arguments[1])
         metadata.update(message)
         metadata["flags"] = _flags(arguments[2])
+    elif name == "recvmsg":
+        metadata["flags"] = _flags(arguments[2])
+        if arguments[1].startswith("{"):
+            fields = _fields(arguments[1], "message-header")
+            if set(fields) == {"msg_namelen"}:
+                metadata["lengths"] = {
+                    "name_length": _integer(
+                        fields["msg_namelen"], "invalid-message-name-length"
+                    )
+                }
+            else:
+                metadata.update(_message(arguments[1]))
+        else:
+            _output_pointer(arguments[1], "invalid-recvmsg-output-pointer")
     elif name == "sendmmsg":
-        messages = _message_vector(arguments[1])
+        messages, completed_count = _message_vector(arguments[1], allow_incomplete=True)
         requested_count = _integer(arguments[2], "invalid-message-count")
         if len(messages) != requested_count:
             raise _fail("message-vector-count-mismatch")
+        if _successful(result):
+            result_count = result.get("value")
+            if not isinstance(result_count, int) or result_count > requested_count:
+                raise _fail("sendmmsg-result-count")
+        else:
+            result_count = 0
+        if completed_count != result_count:
+            raise _fail("sendmmsg-completed-count")
         metadata["messages"] = messages
-        metadata["lengths"] = {"message_count": requested_count}
+        if completed_count == requested_count:
+            metadata["lengths"] = {"message_count": requested_count}
+        else:
+            metadata["lengths"] = {
+                "message_count": completed_count,
+                "requested_message_count": requested_count,
+            }
         metadata["flags"] = _flags(arguments[3])
     else:
         requested_count = _integer(arguments[2], "invalid-message-count")
@@ -534,11 +704,13 @@ def _address_metadata(
                 or successful_count > requested_count
             ):
                 raise _fail("recvmmsg-result-count")
-            messages = _message_vector(arguments[1])
+            messages, completed_count = _message_vector(arguments[1])
+            if completed_count != successful_count:
+                raise _fail("recvmmsg-completed-count")
             if len(messages) != successful_count:
                 raise _fail("message-vector-count-mismatch")
         else:
-            _raw_integer(arguments[1], "invalid-recvmmsg-output-pointer")
+            _output_pointer(arguments[1], "invalid-recvmmsg-output-pointer")
             successful_count = 0
             messages = []
         metadata["messages"] = messages
@@ -626,22 +798,46 @@ def _transition_metadata(
             _raw_integer(arguments[3], "socketpair-output-pointer")
     elif name in {"accept", "accept4"}:
         _arity(arguments, 3 if name == "accept" else 4, f"{name}-arity")
-        transition.update(
-            source_fd=_fd(arguments[0], f"{name}-source-fd"),
-            address=_address(arguments[1]),
-        )
+        transition["source_fd"] = _fd(arguments[0], f"{name}-source-fd")
+        if arguments[1].startswith("{") or arguments[1] == "NULL":
+            address = _address(arguments[1])
+            if address is not None:
+                transition["address"] = address
+            if arguments[1] == "NULL":
+                if arguments[2] != "NULL":
+                    raise _fail(f"{name}-sockaddr-length")
+            elif _output_length(arguments[2], f"{name}-sockaddr-length") is None:
+                raise _fail(f"{name}-sockaddr-length")
+        else:
+            _output_pointer(arguments[1], f"{name}-address-pointer")
+            _output_length(arguments[2], f"{name}-length-pointer")
         if name == "accept4":
             transition["flags"] = _closed_flags(
                 arguments[3], _SOCKET_TYPE_FLAGS, "unsupported-accept4-flags"
             )
         if _successful(result):
             transition["created_fd"] = _returned_fd(result, f"{name}-return-fd")
-    elif name in {"bind", "connect", "getsockname"}:
+    elif name in {"bind", "connect"}:
         _arity(arguments, 3, f"{name}-arity")
         transition.update(
             fd=_fd(arguments[0], f"{name}-fd"),
             address=_address(arguments[1]),
         )
+    elif name == "getsockname":
+        _arity(arguments, 3, "getsockname-arity")
+        transition["fd"] = _fd(arguments[0], "getsockname-fd")
+        if arguments[1].startswith("{") or arguments[1] == "NULL":
+            address = _address(arguments[1])
+            if address is not None:
+                transition["address"] = address
+            if arguments[1] == "NULL":
+                if arguments[2] != "NULL":
+                    raise _fail("getsockname-sockaddr-length")
+            elif _output_length(arguments[2], "getsockname-sockaddr-length") is None:
+                raise _fail("getsockname-sockaddr-length")
+        else:
+            _output_pointer(arguments[1], "getsockname-address-pointer")
+            _output_length(arguments[2], "getsockname-length-pointer")
     elif name == "dup":
         _arity(arguments, 1, "dup-arity")
         transition["source_fd"] = _fd(arguments[0], "dup-source-fd")
@@ -714,7 +910,7 @@ def _transition_metadata(
         if _successful(result):
             transition.update(
                 child_pid=result["value"],
-                fd_table="copied" if name == "fork" else "shared-until-exec",
+                fd_table="copied",
             )
     elif name == "clone":
         fields = _named_arguments(arguments, "clone-arguments")
@@ -790,6 +986,7 @@ class TraceNormalizer:
         max_records: int = 1_000_000,
         max_pending_processes: int = 4096,
         max_input_bytes: int = 67_108_864,
+        record_sink: Callable[[dict[str, object]], object] | None = None,
     ) -> None:
         bounds = (max_line_bytes, max_records, max_pending_processes, max_input_bytes)
         if any(
@@ -797,6 +994,8 @@ class TraceNormalizer:
             for value in bounds
         ):
             raise ValueError("trace bounds must be positive integers")
+        if record_sink is not None and not callable(record_sink):
+            raise TypeError("record_sink must be callable")
         self.max_line_bytes = max_line_bytes
         self.max_records = max_records
         self.max_pending_processes = max_pending_processes
@@ -808,39 +1007,58 @@ class TraceNormalizer:
         self._entries = 0
         self._exits = 0
         self._finished = False
+        self._record_sink = record_sink
+        self._terminal_error: TraceDecodeError | None = None
+
+    def _latch(self, error: TraceDecodeError) -> TraceDecodeError:
+        if self._terminal_error is None:
+            self._terminal_error = error
+        return self._terminal_error
+
+    def _raise_if_terminal(self) -> None:
+        if self._terminal_error is not None:
+            raise self._terminal_error
 
     def feed(self, chunk: bytes) -> list[dict[str, object]]:
+        self._raise_if_terminal()
         if self._finished:
             raise TraceDecodeError("strace decode rejected: feed-after-finish")
         if not isinstance(chunk, bytes):
             raise TypeError("trace chunks must be bytes")
-        self._input_bytes += len(chunk)
-        if self._input_bytes > self.max_input_bytes:
-            raise _fail("input-bound")
-        self._buffer.extend(chunk)
-        records: list[dict[str, object]] = []
-        while True:
-            newline = self._buffer.find(b"\n")
-            if newline < 0:
-                if len(self._buffer) > self.max_line_bytes:
+        try:
+            self._input_bytes += len(chunk)
+            if self._input_bytes > self.max_input_bytes:
+                raise _fail("input-bound")
+            self._buffer.extend(chunk)
+            records: list[dict[str, object]] = []
+            while True:
+                newline = self._buffer.find(b"\n")
+                if newline < 0:
+                    if len(self._buffer) > self.max_line_bytes:
+                        raise _fail("line-bound")
+                    break
+                if newline > self.max_line_bytes:
                     raise _fail("line-bound")
-                break
-            if newline > self.max_line_bytes:
-                raise _fail("line-bound")
-            line = bytes(self._buffer[:newline])
-            del self._buffer[: newline + 1]
-            records.extend(self._decode_line(line))
-        return records
+                line = bytes(self._buffer[:newline])
+                del self._buffer[: newline + 1]
+                records.extend(self._decode_line(line))
+            return records
+        except TraceDecodeError as error:
+            raise self._latch(error)
 
     def finish(self) -> list[dict[str, object]]:
+        self._raise_if_terminal()
         if self._finished:
             raise TraceDecodeError("strace decode rejected: duplicate-finish")
         self._finished = True
-        if self._buffer:
-            raise _fail("truncated-line")
-        if self._pending:
-            raise _fail("pending-syscall")
-        return []
+        try:
+            if self._buffer:
+                raise _fail("truncated-line")
+            if self._pending:
+                raise _fail("pending-syscall")
+            return []
+        except TraceDecodeError as error:
+            raise self._latch(error)
 
     def _decode_line(self, encoded: bytes) -> list[dict[str, object]]:
         if not encoded or b"\r" in encoded or b"\x00" in encoded:
@@ -854,9 +1072,10 @@ class TraceNormalizer:
         prefix = _PREFIX.fullmatch(line)
         if prefix is None:
             raise _fail("line-grammar")
-        pid = int(prefix.group(1))
-        timestamp = prefix.group(2)
-        body = prefix.group(3)
+        pid_text, padding, timestamp, body = prefix.groups()
+        if padding != " " * max(1, 6 - len(pid_text)):
+            raise _fail("pid-prefix-framing")
+        pid = int(pid_text)
         if "runs in " in body and " bit mode" in body:
             raise _fail("unsupported-personality")
 
@@ -949,6 +1168,21 @@ class TraceNormalizer:
             raise _fail("syscall-grammar")
         name, arguments_text, result_text, duration = call.groups()
         arguments = _split_arguments(arguments_text)
+        timeout_left: dict[str, int] | None = None
+        left = re.fullmatch(
+            r"(.+) \(left \{tv_sec=([0-9]+), tv_nsec=([0-9]+)\}\)", result_text
+        )
+        if left is not None:
+            if name != "recvmmsg":
+                raise _fail("unexpected-left-timeout")
+            result_text = left.group(1)
+            nanoseconds = int(left.group(3))
+            if nanoseconds > 999_999_999:
+                raise _fail("invalid-left-timeout")
+            timeout_left = {
+                "seconds": int(left.group(2)),
+                "nanoseconds": nanoseconds,
+            }
         record: dict[str, object] = {
             "kind": "syscall",
             "pid": pid,
@@ -964,6 +1198,8 @@ class TraceNormalizer:
             result = _fcntl_result(arguments[1], result_text)
         else:
             result = _result(result_text)
+        if timeout_left is not None:
+            result["timeout_left"] = timeout_left
         if name in RAW_PAYLOAD_SYSCALLS:
             record.update(_raw_metadata(name, arguments))
         elif name in DECODED_ADDRESS_SYSCALLS:
@@ -980,6 +1216,11 @@ class TraceNormalizer:
             raise _fail("record-bound")
         record["record_index"] = self._records
         self._records += 1
+        if self._record_sink is not None:
+            try:
+                self._record_sink(record)
+            except Exception:
+                raise _fail("record-sink") from None
         return record
 
 

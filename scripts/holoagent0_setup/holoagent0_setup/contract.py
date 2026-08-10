@@ -56,6 +56,7 @@ _TRACE_OPTIONS = (
     "--quiet=none",
     "--trace=all",
     "--raw=read,readv,pread64,preadv,preadv2,write,writev,pwrite64,pwritev,pwritev2,sendfile,splice,vmsplice,tee,copy_file_range",
+    "--output=/proc/self/fd/{output_fd}",
 )
 _TRACE_RAW_SYSCALLS = (
     "read",

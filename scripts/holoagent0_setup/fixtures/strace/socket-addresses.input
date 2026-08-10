@@ -1,2 +1,2 @@
-103 1700000002.000001 sendto(7<socket:[70]>, "SOCKET_SECRET", 13, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.1")}, 16) = 13 <0.000004>
-103 1700000002.000002 recvfrom(7<socket:[70]>, "SOCKET_SECRET", 13, 0, {sa_family=AF_INET6, sin6_port=htons(12345), sin6_flowinfo=htonl(1234567890), inet_pton(AF_INET6, "12:34:56:78:90:ab:cd:ef", &sin6_addr), sin6_scope_id=4207869677}, [28]) = 13 <0.000005>
+103   1700000002.000001 sendto(7<socket:[70]>, "SOCKET_SECRET", 13, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("192.0.2.1")}, 16) = 13 <0.000004>
+103   1700000002.000002 recvfrom(7<socket:[70]>, "SOCKET_SECRET", 13, 0, {sa_family=AF_INET6, sin6_port=htons(12345), sin6_flowinfo=htonl(1234567890), inet_pton(AF_INET6, "12:34:56:78:90:ab:cd:ef", &sin6_addr), sin6_scope_id=4207869677}, [28]) = 13 <0.000005>

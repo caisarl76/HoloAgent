@@ -201,7 +201,7 @@ umask 0022
     --volume "$temp_dir/source/$TOP_DIRECTORY:/src:ro" \
     --volume "$temp_dir/build:/build" \
     --volume "$temp_dir/install:/out" \
-    "docker.io/library/debian@${pins[2]}" \
+    "docker.io/library/gcc@${pins[2]}" \
     /bin/sh -eu -c 'cd /build && /src/configure --prefix=/out --disable-gcc-Werror && make -j1 && make install'
 
 elf="$temp_dir/install/bin/strace"

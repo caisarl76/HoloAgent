@@ -91,7 +91,7 @@ def test_real_strace_yy_socket_annotations_are_redacted_but_keep_protocol(
     annotation, protocol
 ):
     record = normalize_bytes(_line(71, f"close(9<{annotation}>) = 0 <0.000001>"))[0]
-    provenance = record["transition"]["fd"]["provenance"]
+    provenance = record["transition"]["closed_fd"]["provenance"]
     assert provenance == {"kind": "socket", "protocol": protocol}
     rendered = canonical_ndjson([record])
     for secret in ("127.0.0.1", "41000", "::1", "/tmp", "FD_PATH_SECRET", "4321"):
@@ -103,15 +103,27 @@ def test_real_strace_yy_socket_annotations_are_redacted_but_keep_protocol(
     [
         (
             "AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_IP",
-            {"domain": "AF_INET", "type": "SOCK_STREAM", "protocol": "IPPROTO_IP"},
+            {
+                "domain": "AF_INET",
+                "socket_type": ["SOCK_STREAM", "SOCK_CLOEXEC"],
+                "protocol": "IPPROTO_IP",
+            },
         ),
         (
             "AF_INET6, SOCK_RAW, IPPROTO_RAW",
-            {"domain": "AF_INET6", "type": "SOCK_RAW", "protocol": "IPPROTO_RAW"},
+            {
+                "domain": "AF_INET6",
+                "socket_type": ["SOCK_RAW"],
+                "protocol": "IPPROTO_RAW",
+            },
         ),
         (
             "AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE",
-            {"domain": "AF_NETLINK", "type": "SOCK_RAW", "protocol": "NETLINK_ROUTE"},
+            {
+                "domain": "AF_NETLINK",
+                "socket_type": ["SOCK_RAW", "SOCK_CLOEXEC"],
+                "protocol": "NETLINK_ROUTE",
+            },
         ),
     ],
 )
@@ -224,7 +236,11 @@ def test_failed_socket_output_pointer_forms_preserve_attempt_without_effect(
     body, operation
 ):
     record = normalize_bytes(_line(74, body))[0]
-    assert record["transition"] == {"operation": operation, "fd": {"fd": -1}}
+    fd_key = "source_fd" if operation in {"accept", "accept4"} else "fd"
+    expected = {"operation": operation, fd_key: {"fd": -1}}
+    if operation == "accept4":
+        expected["flags"] = ["SOCK_CLOEXEC"]
+    assert record["transition"] == expected
     assert record["result"]["errno"] == "EBADF"
 
 
