@@ -1809,11 +1809,7 @@ def _publish_install_directory_locked(
         marker = _approval_payload(measurement, pins)
         marker_fd = os.open(
             APPROVAL_MARKER,
-            os.O_RDWR
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_NOFOLLOW
-            | os.O_CLOEXEC,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
             0o600,
             dir_fd=measurement.root_fd,
         )
