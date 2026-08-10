@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+import holoagent0_setup.broker as broker_module
 import holoagent0_setup.signal_handoff as signal_handoff_module
 from holoagent0_setup.broker import write_frame
 from holoagent0_setup.process_identity import ProcessIdentity
@@ -213,6 +214,69 @@ def test_supervisor_authorizes_only_after_actual_complete_frame_write(identity):
     assert snapshot.terminal_state == "FAILED"
     assert snapshot.acceptance_count == snapshot.forward_count == 0
     assert forwarded == []
+
+
+def test_supervisor_accepts_completed_response_when_duplicate_close_raises(
+    identity, monkeypatch
+):
+    coordinator = _coordinator(identity)
+    supervisor = _supervisor(identity)
+    _request, request_read = _send_request(coordinator)
+    response_read, response_write = os.pipe()
+    duplicated = []
+    active_duplicates = set()
+    duplicate_close_count = 0
+    real_dup = os.dup
+    real_close = os.close
+
+    def track_dup(fd):
+        duplicated_fd = real_dup(fd)
+        duplicated.append(duplicated_fd)
+        active_duplicates.add(duplicated_fd)
+        return duplicated_fd
+
+    def close_then_raise(fd):
+        nonlocal duplicate_close_count
+        is_duplicate = fd in active_duplicates
+        real_close(fd)
+        if is_duplicate:
+            active_duplicates.remove(fd)
+            duplicate_close_count += 1
+            if duplicate_close_count == 2:
+                raise OSError("injected response duplicate close failure")
+
+    monkeypatch.setattr(broker_module.os, "dup", track_dup)
+    monkeypatch.setattr(broker_module.os, "close", close_then_raise)
+    try:
+        supervisor.receive_and_accept(
+            request_read,
+            response_write,
+            deadline=time.monotonic() + 0.2,
+        )
+        os.fstat(response_write)
+    finally:
+        os.close(request_read)
+        os.close(response_write)
+    try:
+        coordinator.receive_acceptance(
+            response_read,
+            deadline=time.monotonic() + 0.2,
+        )
+        os.fstat(response_read)
+    finally:
+        os.close(response_read)
+
+    snapshot = supervisor.snapshot()
+    assert snapshot.state == "READY"
+    assert snapshot.terminal_state is None
+    assert snapshot.acceptance_count == 1
+    assert snapshot.next_sequence == 2
+    assert coordinator.snapshot().state == "LIVE_READY"
+    assert len(duplicated) == 3
+    assert active_duplicates == set()
+    for duplicated_fd in duplicated:
+        with pytest.raises(OSError):
+            os.fstat(duplicated_fd)
 
 
 def test_coordinator_rejection_does_not_rewrite_supervisor_authorization(identity):

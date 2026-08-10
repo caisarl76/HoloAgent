@@ -63,6 +63,30 @@ def _raw_frame(payload: bytes) -> bytes:
     return len(payload).to_bytes(4, "big") + payload
 
 
+def _raise_after_stable_duplicate_close(monkeypatch):
+    duplicated = []
+    active_duplicates = set()
+    real_dup = os.dup
+    real_close = os.close
+
+    def track_dup(fd):
+        duplicated_fd = real_dup(fd)
+        duplicated.append(duplicated_fd)
+        active_duplicates.add(duplicated_fd)
+        return duplicated_fd
+
+    def close_then_raise(fd):
+        is_duplicate = fd in active_duplicates
+        real_close(fd)
+        if is_duplicate:
+            active_duplicates.remove(fd)
+            raise OSError("injected stable duplicate close failure")
+
+    monkeypatch.setattr(broker_module.os, "dup", track_dup)
+    monkeypatch.setattr(broker_module.os, "close", close_then_raise)
+    return duplicated, active_duplicates
+
+
 def _read_raw(raw: bytes, *, keep_writer: bool = False) -> dict[str, object]:
     read_fd, write_fd = os.pipe()
     try:
@@ -345,6 +369,61 @@ def test_stable_broker_duplicates_close_after_success(monkeypatch):
         os.fstat(read_fd)
     finally:
         os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
+def test_successful_read_returns_frame_when_stable_duplicate_close_raises(monkeypatch):
+    payload = canonical_json_bytes(ready_message())
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, _raw_frame(payload))
+    os.close(write_fd)
+    duplicated, active_duplicates = _raise_after_stable_duplicate_close(monkeypatch)
+    try:
+        assert (
+            read_frame(read_fd, deadline=time.monotonic() + 0.2, exact_one=True)
+            == ready_message()
+        )
+        assert len(duplicated) == 1
+        assert active_duplicates == set()
+        with pytest.raises(OSError):
+            os.fstat(duplicated[0])
+        os.fstat(read_fd)
+    finally:
+        os.close(read_fd)
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_primary_broker_error_is_not_masked_by_duplicate_close_error(
+    monkeypatch, operation
+):
+    read_fd, write_fd = os.pipe()
+    if operation == "read":
+        os.close(write_fd)
+        write_fd = -1
+    else:
+        os.close(read_fd)
+        read_fd = -1
+    duplicated, active_duplicates = _raise_after_stable_duplicate_close(monkeypatch)
+    caller_fd = read_fd if operation == "read" else write_fd
+    try:
+        with pytest.raises(BrokerProtocolError, match="EOF|frame write"):
+            if operation == "read":
+                read_frame(read_fd, deadline=time.monotonic() + 0.2)
+            else:
+                write_frame(
+                    write_fd,
+                    ready_message(),
+                    deadline=time.monotonic() + 0.2,
+                )
+        assert len(duplicated) == 1
+        assert active_duplicates == set()
+        with pytest.raises(OSError):
+            os.fstat(duplicated[0])
+        os.fstat(caller_fd)
+    finally:
+        if read_fd >= 0:
+            os.close(read_fd)
         if write_fd >= 0:
             os.close(write_fd)
 

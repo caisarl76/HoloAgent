@@ -117,7 +117,7 @@ def write_frame(
             absolute_deadline,
         )
     finally:
-        os.close(stable_fd)
+        _close_no_throw(stable_fd)
 
 
 def read_frame(
@@ -151,7 +151,7 @@ def read_frame(
             _require_channel_eof(stable_fd, absolute_deadline)
         return message
     finally:
-        os.close(stable_fd)
+        _close_no_throw(stable_fd)
 
 
 def validate_message(
@@ -340,6 +340,13 @@ def _duplicate_broker_fd(fd: int) -> int:
         return os.dup(fd)
     except OSError as error:
         raise BrokerProtocolError("broker descriptor is invalid") from error
+
+
+def _close_no_throw(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 
 
 def _require_anonymous_pipe(fd: int, *, readable: bool) -> None:
