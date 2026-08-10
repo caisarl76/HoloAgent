@@ -1,0 +1,2 @@
+{"duration":"0.000001","entry_index":0,"exit_index":0,"kind":"syscall","pid":81,"record_index":0,"result":{"value":81},"syscall":"getpid","timestamp":"1700000050.000001"}
+{"duration":"0.000001","entry_index":1,"exit_index":1,"kind":"syscall","pid":81,"record_index":1,"result":{"errno":"EBADF","errno_text":"Bad file descriptor","value":-1},"syscall":"close","timestamp":"1700000050.000002","transition":{"fd":{"fd":1234567},"operation":"close"}}
