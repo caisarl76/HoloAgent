@@ -63,6 +63,40 @@ def _validate_members(archive: Path):
     )
 
 
+def _run_cleanup_trap_harness(tmp_path: Path, command: str):
+    source = SCRIPT.read_text(encoding="utf-8")
+    start = source.index("cleanup() {")
+    end = source.index('snapshot="$temp_dir/strace-6.6.tar.xz"')
+    private_temp = tmp_path / "private-temp"
+    private_temp.mkdir()
+    (private_temp / "owned").write_text("owned", encoding="utf-8")
+    candidate = tmp_path / "candidate.json"
+    harness = "\n".join(
+        (
+            "set -euo pipefail",
+            'temp_dir="$1"',
+            'candidate="$2"',
+            source[start:end],
+            command,
+            ': > "$candidate"',
+        )
+    )
+    completed = subprocess.run(
+        [
+            "bash",
+            "-c",
+            harness,
+            "cleanup-trap-harness",
+            str(private_temp),
+            str(candidate),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return completed, private_temp, candidate
+
+
 def test_script_has_exact_usage_and_fails_closed_for_bad_cli(tmp_path):
     completed = _run()
     assert completed.returncode == 2
@@ -141,6 +175,32 @@ def test_private_temp_cleanup_and_no_policy_mutation(tmp_path):
     )
     assert result.returncode == 3
     assert list(temp_parent.iterdir()) == []
+    assert POLICY.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("signal_name", "expected_status"),
+    [("HUP", 129), ("INT", 130), ("TERM", 143)],
+)
+def test_signal_traps_use_deterministic_status_cleanup_and_publish_nothing(
+    tmp_path, signal_name, expected_status
+):
+    before = POLICY.read_bytes()
+    completed, private_temp, candidate = _run_cleanup_trap_harness(
+        tmp_path, f'kill -s {signal_name} "$$"'
+    )
+    assert completed.returncode == expected_status
+    assert not private_temp.exists()
+    assert not candidate.exists()
+    assert POLICY.read_bytes() == before
+
+
+def test_ordinary_exit_cleanup_preserves_failing_command_status(tmp_path):
+    before = POLICY.read_bytes()
+    completed, private_temp, candidate = _run_cleanup_trap_harness(tmp_path, "exit 7")
+    assert completed.returncode == 7
+    assert not private_temp.exists()
+    assert not candidate.exists()
     assert POLICY.read_bytes() == before
 
 
