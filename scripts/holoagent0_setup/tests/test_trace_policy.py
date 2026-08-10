@@ -91,8 +91,15 @@ def _trace_line(call, *, pid=100):
     return f"{prefix}{call}{padding}= 0 <0.000001>\n".encode()
 
 
-def make_policy(*, loopback_only=True, participant_digests=None):
+def make_policy(
+    *, loopback_only=True, participant_digests=None, initial_fd_manifest=None
+):
     participant_digests = participant_digests or CONFIG_DIGESTS
+    manifest_argument = (
+        {}
+        if initial_fd_manifest is None
+        else {"initial_fd_manifest": initial_fd_manifest}
+    )
     return TracePolicy(
         coordinator_pid=COORDINATOR_PID,
         marker_token=TOKEN,
@@ -101,6 +108,7 @@ def make_policy(*, loopback_only=True, participant_digests=None):
             for index, pid in PARTICIPANT_PIDS.items()
         },
         namespace_loopback_only=loopback_only,
+        **manifest_argument,
     )
 
 
@@ -603,7 +611,8 @@ def test_exec_unshares_clone_files_table_before_closing_cloexec_entries():
         ("239.255.0.1", "192.0.2.10", "FAIL"),
     ],
 )
-def test_multicast_membership_option_is_value_bound(group, interface, expected):
+@pytest.mark.parametrize("option", ["IP_ADD_MEMBERSHIP", "IP_DROP_MEMBERSHIP"])
+def test_multicast_membership_option_is_value_bound(option, group, interface, expected):
     policy = make_policy()
     records = Records()
     open_window(policy, records)
@@ -617,7 +626,7 @@ def test_multicast_membership_option_is_value_bound(group, interface, expected):
                 "operation": "setsockopt",
                 "fd": {"fd": 7},
                 "level": "SOL_IP",
-                "option": "IP_ADD_MEMBERSHIP",
+                "option": option,
                 "length": 8,
                 "membership": {"group": group, "interface": interface},
             },
@@ -626,9 +635,10 @@ def test_multicast_membership_option_is_value_bound(group, interface, expected):
     assert decision.status == expected
 
 
-def test_normalizer_retains_only_structural_multicast_membership_values():
+@pytest.mark.parametrize("option", ["IP_ADD_MEMBERSHIP", "IP_DROP_MEMBERSHIP"])
+def test_normalizer_retains_only_structural_multicast_membership_values(option):
     source = _trace_line(
-        "setsockopt(7<UDP:[127.0.0.1:26650]>, SOL_IP, IP_ADD_MEMBERSHIP, "
+        f"setsockopt(7<UDP:[127.0.0.1:26650]>, SOL_IP, {option}, "
         '{imr_multiaddr=inet_addr("239.255.0.1"), '
         'imr_interface=inet_addr("127.0.0.1")}, 8)'
     )
@@ -640,13 +650,83 @@ def test_normalizer_retains_only_structural_multicast_membership_values():
             "provenance": {"kind": "socket", "protocol": "UDP"},
         },
         "level": "SOL_IP",
-        "option": "IP_ADD_MEMBERSHIP",
+        "option": option,
         "length": 8,
         "membership": {
             "group": "239.255.0.1",
             "interface": "127.0.0.1",
         },
     }
+
+
+def test_reviewed_launcher_manifest_seeds_descriptor_tables_before_trace():
+    policy = make_policy(
+        initial_fd_manifest={
+            COORDINATOR_PID: [
+                {
+                    "fd": 0,
+                    "kind": "character_device",
+                    "inode": 101,
+                    "cloexec": False,
+                },
+                {"fd": 4, "kind": "pipe", "inode": 102, "cloexec": True},
+            ]
+        }
+    )
+    records = Records()
+
+    assert policy.provenance.describe(COORDINATOR_PID, 0) == {
+        "kind": "character_device",
+        "domain": None,
+        "socket_type": [],
+        "protocol": None,
+        "inode": 101,
+        "local": None,
+        "peer": None,
+        "cloexec": False,
+        "local_conflict": False,
+        "peer_conflict": False,
+        "message_peers": (),
+    }
+    policy.feed(
+        records.make(
+            COORDINATOR_PID,
+            "fork",
+            result=PARTICIPANT_PIDS[0],
+            transition={
+                "operation": "fork",
+                "child_pid": PARTICIPANT_PIDS[0],
+                "fd_table": "copied",
+            },
+        )
+    )
+    policy.feed(
+        records.make(
+            PARTICIPANT_PIDS[0],
+            "execve",
+            transition={"operation": "exec", "cloexec_fds": "closed"},
+        )
+    )
+    assert policy.provenance.describe(PARTICIPANT_PIDS[0], 4) is None
+    assert policy.provenance.describe(COORDINATOR_PID, 4)["kind"] == "pipe"
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {COORDINATOR_PID: [{"fd": 1, "kind": "socket", "cloexec": False}]},
+        {
+            COORDINATOR_PID: [
+                {"fd": 1, "kind": "pipe", "cloexec": False},
+                {"fd": 1, "kind": "pipe", "cloexec": False},
+            ]
+        },
+        {COORDINATOR_PID: [{"fd": 1, "kind": "pipe", "cloexec": False, "x": 1}]},
+    ],
+)
+def test_reviewed_launcher_manifest_rejects_unsafe_or_ambiguous_entries(manifest):
+    with pytest.raises(ValueError, match="initial FD manifest"):
+        make_policy(initial_fd_manifest=manifest)
 
 
 def test_meta_and_data_port_sets_are_closed_and_disjoint():
