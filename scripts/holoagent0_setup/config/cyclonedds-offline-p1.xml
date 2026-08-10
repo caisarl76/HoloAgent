@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS>
+  <Domain Id="77">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="lo" autodetermine="false" presence_required="true" multicast="true" allow_multicast="spdp"/>
+      </Interfaces>
+      <Transport>udp</Transport>
+      <AllowMulticast>spdp</AllowMulticast>
+      <EnableMulticastLoopback>true</EnableMulticastLoopback>
+      <MulticastTimeToLive>1</MulticastTimeToLive>
+      <RedundantNetworking>false</RedundantNetworking>
+    </General>
+    <Discovery>
+      <ParticipantIndex>1</ParticipantIndex>
+      <SPDPMulticastAddress>239.255.0.1</SPDPMulticastAddress>
+      <DefaultMulticastAddress>239.255.0.1</DefaultMulticastAddress>
+      <Peers AddLocalhost="false"/>
+      <Ports>
+        <Base>7400</Base>
+        <DomainGain>250</DomainGain>
+        <ParticipantGain>2</ParticipantGain>
+        <MulticastMetaOffset>0</MulticastMetaOffset>
+        <MulticastDataOffset>1</MulticastDataOffset>
+        <UnicastMetaOffset>10</UnicastMetaOffset>
+        <UnicastDataOffset>11</UnicastDataOffset>
+      </Ports>
+    </Discovery>
+    <Compatibility>
+      <ManySocketsMode>false</ManySocketsMode>
+    </Compatibility>
+    <Internal>
+      <MonitorPort>-1</MonitorPort>
+    </Internal>
+  </Domain>
+</CycloneDDS>
