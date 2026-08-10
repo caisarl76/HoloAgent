@@ -153,3 +153,52 @@ def test_rollback_revalidates_destination_after_marker_transition(tmp_path):
         assert marker["install_inode"] == retained.st_ino
     finally:
         measurement.close()
+
+
+def test_rollback_swap_after_prepared_never_moves_foreign_destination(tmp_path):
+    ns = _namespace()
+    staged, runner, pins, measurement = _elf_fixture(tmp_path, ns)
+    destination = tmp_path / "install"
+    quarantine = tmp_path / ".quarantine"
+    moved_original = tmp_path / ".retained-original"
+    foreign_payload = b"foreign destination must remain exactly untouched\n"
+
+    def fail_after_rename(_destination):
+        raise OSError("force rollback")
+
+    def swap_after_rollback_prepared(_destination):
+        os.rename(destination, moved_original)
+        destination.mkdir(mode=0o700)
+        (destination / "foreign-content").write_bytes(foreign_payload)
+
+    try:
+        with pytest.raises(ns["PublicationError"], match="AMBIGUOUS") as captured:
+            ns["publish_install_directory"](
+                staged,
+                destination,
+                quarantine,
+                measurement,
+                pins,
+                runner,
+                deadline=1.0,
+                after_rename=fail_after_rename,
+                after_rollback_prepared=swap_after_rollback_prepared,
+            )
+
+        assert captured.value.transition.state == "ROLLBACK_PREPARED"
+        assert destination.is_dir()
+        assert (destination / "foreign-content").read_bytes() == foreign_payload
+        assert not quarantine.exists()
+
+        moved = moved_original.stat()
+        retained = os.fstat(measurement.root_fd)
+        assert (moved.st_dev, moved.st_ino) == (
+            retained.st_dev,
+            retained.st_ino,
+        )
+        marker = json.loads(
+            (moved_original / ns["APPROVAL_MARKER"]).read_text(encoding="utf-8")
+        )
+        assert marker["state"] == "ROLLBACK_PREPARED"
+    finally:
+        measurement.close()
