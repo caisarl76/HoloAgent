@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -93,9 +94,10 @@ class PublicationError(ProvisioningError):
 
 
 class ProvisioningInterrupted(ProvisioningError):
-    def __init__(self, status: int):
+    def __init__(self, status: int, *, transition=None):
         super().__init__(f"interrupted with status {status}")
         self.status = status
+        self.transition = transition
 
 
 @dataclass(frozen=True)
@@ -194,6 +196,63 @@ class SourceArchive:
             self.fd = -1
 
 
+@dataclass
+class SealedArchive:
+    fd: int
+    device: int
+    inode: int
+    sealed: bool = False
+
+    def close(self):
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
+def isolated_python_argv(program, *arguments):
+    return [PYTHON, "-I", "-S", "-c", program, *map(str, arguments)]
+
+
+def create_sealable_archive(name):
+    if not isinstance(name, str) or not name or "/" in name or "\0" in name:
+        raise ArchiveValidationError("invalid retained archive name")
+    flags = os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+    fd = os.memfd_create(name, flags)
+    value = os.fstat(fd)
+    return SealedArchive(fd, value.st_dev, value.st_ino)
+
+
+def seal_retained_archive(archive):
+    if archive.sealed:
+        verify_sealed_archive(archive)
+        return
+    value = os.fstat(archive.fd)
+    if (value.st_dev, value.st_ino) != (archive.device, archive.inode):
+        raise ArchiveValidationError("retained archive identity changed before sealing")
+    seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    try:
+        fcntl.fcntl(archive.fd, fcntl.F_ADD_SEALS, seals)
+    except OSError as error:
+        raise ArchiveValidationError("retained archive sealing failed") from error
+    archive.sealed = True
+    verify_sealed_archive(archive)
+
+
+def verify_sealed_archive(archive):
+    value = os.fstat(archive.fd)
+    if (value.st_dev, value.st_ino) != (archive.device, archive.inode):
+        raise ArchiveValidationError("sealed archive identity changed")
+    required = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+    try:
+        actual = fcntl.fcntl(archive.fd, fcntl.F_GET_SEALS)
+    except OSError as error:
+        raise ArchiveValidationError("sealed archive verification failed") from error
+    if actual & required != required:
+        raise ArchiveValidationError("retained archive is not immutable")
+    if not archive.sealed:
+        raise ArchiveValidationError("retained archive seal state was not recorded")
+
+
 def read_process_identity(pid: int) -> ProcessIdentity:
     text = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii")
     closing = text.rfind(")")
@@ -270,13 +329,7 @@ class OwnedSessionRunner:
         baseline = _direct_child_identities(os.getpid())
         release_read, release_write = os.pipe2(os.O_CLOEXEC)
         inherited = tuple(sorted({release_read, *(int(fd) for fd in pass_fds)}))
-        command = [
-            PYTHON,
-            "-c",
-            _RELEASE_TRAMPOLINE,
-            str(release_read),
-            *map(str, argv),
-        ]
+        command = isolated_python_argv(_RELEASE_TRAMPOLINE, str(release_read), *map(str, argv))
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -291,6 +344,8 @@ class OwnedSessionRunner:
         pidfd = -1
         released = False
         identity = None
+        tracked = {}
+        drainers = ()
         try:
             pidfd = os.pidfd_open(process.pid, 0)
             first = self.identity_reader(process.pid)
@@ -332,7 +387,6 @@ class OwnedSessionRunner:
                     process.stderr, stderr_buffer, output_overflow, capture_budget
                 ),
             )
-            tracked = {}
             deadline = time.monotonic() + timeout
             timed_out = False
             interrupted = 0
@@ -367,12 +421,36 @@ class OwnedSessionRunner:
             if timed_out:
                 raise OwnedProcessTimeout(argv)
             return subprocess.CompletedProcess(tuple(argv), returncode, stdout, stderr)
-        except BaseException:
-            if not released:
-                self._abort_unreleased(process, pidfd)
-            elif identity is not None and process.poll() is None:
-                self._cleanup_session(identity, process)
-            raise
+        except BaseException as primary:
+            try:
+                primary.command_released = released
+            except (AttributeError, TypeError):
+                pass
+            cleanup_error = None
+            try:
+                if not released:
+                    self._abort_unreleased(process, pidfd)
+                elif identity is not None:
+                    try:
+                        if process.poll() is None:
+                            self._cleanup_session(identity, process)
+                        else:
+                            self._cleanup_descendants(identity)
+                    finally:
+                        self._cleanup_tracked(identity, baseline, tracked)
+                for drainer in drainers:
+                    drainer.join(self.kill_grace)
+                    if drainer.is_alive():
+                        raise OwnedCleanupError(
+                            "owned output drainer did not terminate"
+                        )
+            except BaseException as error:
+                cleanup_error = error
+            if cleanup_error is not None:
+                raise OwnedCleanupError(
+                    "owned process cleanup failed after command error"
+                ) from cleanup_error
+            raise primary
         finally:
             if release_write >= 0:
                 os.close(release_write)
@@ -476,23 +554,45 @@ class OwnedSessionRunner:
                 changed = True
 
     def _cleanup_tracked(self, leader, baseline, tracked):
-        self._discover_descendants(leader, baseline, tracked)
+        discovery_error = None
+        try:
+            self._discover_descendants(leader, baseline, tracked)
+        except BaseException as error:
+            discovery_error = error
         if not tracked:
+            if discovery_error is not None:
+                raise OwnedCleanupError(
+                    "descendant discovery failed during cleanup"
+                ) from discovery_error
             return
         self._signal_tracked(tracked, signal.SIGTERM)
         deadline = time.monotonic() + self.term_grace
         while time.monotonic() < deadline:
-            self._discover_descendants(leader, baseline, tracked)
+            try:
+                self._discover_descendants(leader, baseline, tracked)
+            except BaseException as error:
+                discovery_error = discovery_error or error
             if not _live_tracked(tracked):
                 _close_tracked(tracked)
+                if discovery_error is not None:
+                    raise OwnedCleanupError(
+                        "descendant discovery failed during cleanup"
+                    ) from discovery_error
                 return
             time.sleep(0.005)
         self._signal_tracked(tracked, signal.SIGKILL)
         deadline = time.monotonic() + self.kill_grace
         while time.monotonic() < deadline:
-            self._discover_descendants(leader, baseline, tracked)
+            try:
+                self._discover_descendants(leader, baseline, tracked)
+            except BaseException as error:
+                discovery_error = discovery_error or error
             if not _live_tracked(tracked):
                 _close_tracked(tracked)
+                if discovery_error is not None:
+                    raise OwnedCleanupError(
+                        "descendant discovery failed during cleanup"
+                    ) from discovery_error
                 return
             time.sleep(0.005)
         _close_tracked(tracked)
@@ -865,27 +965,40 @@ class DockerOwner:
         self.stabilization = float(stabilization)
         self.command_timeout = float(command_timeout)
         self.attempted = False
+        self.created_identity = None
+        self._active_identity = None
+        self._create_outcome_uncertain = False
 
     def run_container(self, args, *, timeout, env=None):
         if self._inventory(env):
             raise DockerOwnershipError("container name was already present")
-        self.attempted = True
         primary = None
         result = None
         try:
-            created = self.runner.run(
-                [
-                    self.docker,
-                    "create",
-                    "--name",
-                    self.name,
-                    "--label",
-                    f"holoagent0.strace.owner={self.nonce}",
-                    *map(str, args),
-                ],
-                timeout=timeout,
-                env=env,
-            )
+            try:
+                created = self.runner.run(
+                    [
+                        self.docker,
+                        "create",
+                        "--name",
+                        self.name,
+                        "--label",
+                        f"holoagent0.strace.owner={self.nonce}",
+                        *map(str, args),
+                    ],
+                    timeout=timeout,
+                    env=env,
+                )
+            except BaseException as error:
+                released = getattr(
+                    error, "command_released", isinstance(error, OwnedProcessTimeout)
+                )
+                if released:
+                    self.attempted = True
+                    self._create_outcome_uncertain = True
+                raise
+            self.attempted = True
+            self._create_outcome_uncertain = True
             if created.returncode != 0:
                 raise DockerOwnershipError("docker create failed")
             try:
@@ -896,6 +1009,11 @@ class DockerOwner:
                 ) from error
             if not _fullmatch_container_id(container_id):
                 raise DockerOwnershipError("docker create returned an invalid ID")
+            identity = DockerIdentity(container_id, self.name, self.nonce)
+            self.created_identity = identity
+            self._active_identity = identity
+            self._create_outcome_uncertain = False
+            self._verify_bound_identity(identity, env)
             result = self.runner.run(
                 [self.docker, "start", "--attach", container_id],
                 timeout=timeout,
@@ -915,42 +1033,79 @@ class DockerOwner:
 
     def cleanup(self, *, env=None):
         deadline = time.monotonic() + self.stabilization
+        removed = False
         while True:
             rows = self._inventory(env)
-            for identity in rows:
-                if identity.name != self.name:
-                    continue
-                if identity.nonce != self.nonce:
-                    raise DockerOwnershipError("container name has a foreign owner")
-                inspected = self._command(
+            if self._active_identity is None:
+                if rows:
+                    if len(rows) != 1 or rows[0].nonce != self.nonce:
+                        raise DockerOwnershipError(
+                            "container name has a foreign or ambiguous owner"
+                        )
+                    if not self.attempted:
+                        self._verify_bound_identity(rows[0], env)
+                        raise DockerCleanupError(
+                            "container was not created by this owner"
+                        )
+                    self._active_identity = rows[0]
+                    self.created_identity = rows[0]
+                    self._verify_bound_identity(rows[0], env)
+            elif rows:
+                if rows != [self._active_identity]:
+                    raise DockerOwnershipError(
+                        "container identity changed after create"
+                    )
+                self._verify_bound_identity(self._active_identity, env)
+            elif not removed:
+                raise DockerOwnershipError(
+                    "create-returned container identity disappeared"
+                )
+
+            if self._active_identity is not None and not removed:
+                result = self._command(
                     [
                         self.docker,
-                        "inspect",
-                        "--format",
-                        '{{.Id}}|{{.Name}}|{{ index .Config.Labels "holoagent0.strace.owner" }}',
-                        identity.container_id,
+                        "rm",
+                        "--force",
+                        self._active_identity.container_id,
                     ],
-                    env,
-                )
-                verified = _parse_inspected_identity(inspected.stdout)
-                if verified != identity:
-                    raise DockerOwnershipError("container label identity changed")
-                current = self._inventory(env)
-                if current != [identity]:
-                    raise DockerOwnershipError("container identity changed before removal")
-                removed = self._command(
-                    [self.docker, "rm", "--force", identity.container_id],
                     env,
                     cleanup=True,
                 )
-                if removed.returncode != 0:
+                if result.returncode != 0:
                     raise DockerCleanupError("docker rm failed")
+                removed = True
             if time.monotonic() >= deadline:
                 break
             time.sleep(0.02)
-        if any(identity.name == self.name for identity in self._inventory(env)):
+        remaining = self._inventory(env)
+        if remaining:
             raise DockerCleanupError("owned container remained after stabilization")
+        if self.attempted and self._active_identity is None:
+            raise DockerCleanupError("docker create outcome remained unresolved")
+        if self._create_outcome_uncertain and not removed:
+            raise DockerCleanupError("docker create outcome remained unresolved")
         self.attempted = False
+        self._active_identity = None
+        self._create_outcome_uncertain = False
+
+    def _verify_bound_identity(self, identity, env):
+        inspected = self._command(
+            [
+                self.docker,
+                "inspect",
+                "--format",
+                '{{.Id}}|{{.Name}}|{{ index .Config.Labels "holoagent0.strace.owner" }}',
+                identity.container_id,
+            ],
+            env,
+        )
+        verified = _parse_inspected_identity(inspected.stdout)
+        if verified != identity:
+            raise DockerOwnershipError("container label identity changed")
+        current = self._inventory(env)
+        if current != [identity]:
+            raise DockerOwnershipError("container identity changed during verification")
 
     def _command(self, argv, env, *, cleanup=False):
         try:
@@ -1120,7 +1275,7 @@ def measure_elf_pins(path, runner, *, deadline):
         raise PublicationError("runtime must be a regular non-symlink ELF")
     validation = run_blocking_phase(
         "elf_validation",
-        [PYTHON, "-c", _ELF_VALIDATOR, str(path)],
+        isolated_python_argv(_ELF_VALIDATOR, str(path)),
         runner,
         deadline=deadline,
     )
@@ -1314,6 +1469,8 @@ def publish_candidate_evidence(
             raise PublicationError("AMBIGUOUS_CANDIDATE_COMMIT") from cleanup_error
         if isinstance(error, FileExistsError):
             raise
+        if isinstance(error, ProvisioningInterrupted):
+            raise error
         raise PublicationError("candidate publication failed") from error
     finally:
         registry.close()
@@ -1332,6 +1489,7 @@ def publish_install_directory(
     before_rename=None,
     after_rename=None,
     after_approval=None,
+    after_quarantine_rename=None,
     signal_latch=None,
 ):
     staged = Path(staged)
@@ -1432,20 +1590,45 @@ def publish_install_directory(
                     measurement.root_inode,
                 ):
                     raise PublicationError("AMBIGUOUS_INSTALL_IDENTITY")
+                _transition_marker_state(
+                    installed_fd,
+                    "ROLLBACK_PREPARED",
+                    rollback_state="PREPARED",
+                )
+                transition = PublicationTransition(
+                    "ROLLBACK_PREPARED",
+                    str(destination),
+                    str(quarantine),
+                    measurement.root_device,
+                    measurement.root_inode,
+                )
                 _rename_no_replace(
                     measurement.parent_fd,
                     destination.name,
                     measurement.parent_fd,
                     quarantine.name,
                 )
+                transition = PublicationTransition(
+                    "QUARANTINE_PREPARED",
+                    str(destination),
+                    str(quarantine),
+                    measurement.root_device,
+                    measurement.root_inode,
+                )
                 os.fsync(measurement.parent_fd)
+                if after_quarantine_rename is not None:
+                    after_quarantine_rename(quarantine)
                 quarantine_fd = os.open(
                     quarantine.name,
                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                     dir_fd=measurement.parent_fd,
                 )
                 try:
-                    _mark_quarantined(quarantine_fd)
+                    _transition_marker_state(
+                        quarantine_fd,
+                        "QUARANTINED",
+                        rollback_state="ROLLED_BACK",
+                    )
                 finally:
                     os.close(quarantine_fd)
                 os.fsync(measurement.parent_fd)
@@ -1460,6 +1643,14 @@ def publish_install_directory(
                 raise PublicationError(
                     "AMBIGUOUS_INSTALL_COMMIT", transition=transition
                 ) from rollback_error
+            if signal_latch is not None and signal_latch.status:
+                interruption = (
+                    error
+                    if isinstance(error, ProvisioningInterrupted)
+                    else ProvisioningInterrupted(signal_latch.status)
+                )
+                interruption.transition = transition
+                raise interruption
             raise PublicationError(
                 "ROLLED_BACK_INSTALL_COMMIT", transition=transition
             ) from error
@@ -1477,7 +1668,9 @@ def publish_install_directory(
             os.close(installed_fd)
 
 
-def _mark_quarantined(directory_fd):
+def _transition_marker_state(directory_fd, state, **fields):
+    if state not in {"ROLLBACK_PREPARED", "QUARANTINED"}:
+        raise PublicationError("invalid rollback marker transition")
     marker_fd = os.open(
         APPROVAL_MARKER,
         os.O_RDWR | os.O_NOFOLLOW,
@@ -1489,10 +1682,12 @@ def _mark_quarantined(directory_fd):
             raise PublicationError("quarantine marker identity changed")
         payload = os.read(marker_fd, 8193)
         if len(payload) > 8192:
-            raise PublicationError("oversized quarantine marker")
+            raise PublicationError("oversized rollback marker")
         marker = _closed_json(payload)
-        marker["state"] = "QUARANTINED"
-        marker["rollback_state"] = "ROLLED_BACK"
+        if marker.get("state") not in {"APPROVED", "ROLLBACK_PREPARED"}:
+            raise PublicationError("invalid rollback marker source state")
+        marker["state"] = state
+        marker.update(fields)
         encoded = (
             json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode()
@@ -2019,13 +2214,7 @@ def _validate_snapshot_fd(fd, runner, deadline):
         raise ArchiveValidationError("source archive sha256 mismatch")
     result = run_blocking_phase(
         "archive_validation",
-        [
-            PYTHON,
-            "-c",
-            _ARCHIVE_VALIDATOR_PROGRAM,
-            f"/proc/self/fd/{fd}",
-            TOP_DIRECTORY,
-        ],
+        isolated_python_argv(_ARCHIVE_VALIDATOR_PROGRAM, f"/proc/self/fd/{fd}", TOP_DIRECTORY),
         runner,
         deadline=deadline,
         pass_fds=(fd,),
@@ -2111,13 +2300,14 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
     )
     cleanup_succeeded = True
     ordinary_status = 0
+    primary_error = None
     try:
         _raise_if_interrupted(latch)
         registry = OwnedPathRegistry(parent.resolve(strict=True))
         root = registry.create_directory(
             f".holoagent0-strace-{secrets.token_hex(16)}", mode=0o700
         )
-        snapshot = create_owned_file_at(root.fd, "strace-6.6.tar.xz", mode=0o600)
+        snapshot = create_sealable_archive("holoagent0-strace-6.6")
         transfer_archive(
             source_archive,
             retained_fd_path(snapshot.fd),
@@ -2133,7 +2323,9 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
             ):
                 raise ArchiveValidationError("source archive identity changed")
             source_archive.close()
+        seal_retained_archive(snapshot)
         _validate_snapshot_fd(snapshot.fd, runner, 120.0)
+        verify_sealed_archive(snapshot)
         if archive is not None:
             validate_build_pins(row, script_path, runner)
         if output is not None:
@@ -2151,6 +2343,7 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
         os.mkdir("build", 0o700, dir_fd=root.fd)
         source_path = retained_fd_path(root.fd, "source")
         build_path = retained_fd_path(root.fd, "build")
+        verify_sealed_archive(snapshot)
         extraction = run_blocking_phase(
             "archive_extraction",
             [
@@ -2242,18 +2435,27 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
                     deadline=10.0,
                     signal_latch=latch,
                 )
-            except PublicationError as error:
+            except (PublicationError, ProvisioningInterrupted) as error:
                 publication_transition = error.transition
                 if (
                     publication_transition is not None
-                    and publication_transition.state == "QUARANTINED"
+                    and publication_transition.state
+                    in {"QUARANTINE_PREPARED", "QUARANTINED"}
                 ):
                     output_stage.name = Path(publication_transition.quarantine).name
+                elif (
+                    publication_transition is not None
+                    and publication_transition.state
+                    in {"PUBLISHED", "ROLLBACK_PREPARED"}
+                ):
+                    output_stage.name = output.name
                 raise
             output_registry.forget(output_stage)
             output_stage = None
-    except ProvisioningInterrupted as error:
-        ordinary_status = error.status
+    except BaseException as error:
+        primary_error = error
+        if isinstance(error, ProvisioningInterrupted):
+            ordinary_status = error.status
     finally:
         with latch.block_for_cleanup():
             actions = []
@@ -2289,6 +2491,12 @@ def provision(script_path: Path, argv: Sequence[str]) -> int:
                 actions.append(("registry", registry.close))
             report = aggregate_cleanup(actions)
             cleanup_succeeded = report.succeeded
+    if not cleanup_succeeded:
+        return 3
+    if primary_error is not None and not isinstance(
+        primary_error, ProvisioningInterrupted
+    ):
+        raise primary_error
     return latch.final_status(
         cleanup_succeeded=cleanup_succeeded, ordinary_status=ordinary_status
     )
