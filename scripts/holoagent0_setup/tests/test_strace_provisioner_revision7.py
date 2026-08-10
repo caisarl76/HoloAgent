@@ -242,18 +242,22 @@ if behavior == 'hang':
     time.sleep(30)
 if args[:2] == ['container', 'ls']:
     if (state / 'present').exists():
-        print((state / 'name').read_text().strip() + '|' + (state / 'label').read_text().strip())
+        print('|'.join(((state / 'name').read_text().strip(), (state / 'label').read_text().strip(), (state / 'id').read_text().strip())))
 elif args and args[0] == 'inspect':
-    if not (state / 'present').exists():
+    if not (state / 'present').exists() or args[-1] != (state / 'id').read_text().strip():
         raise SystemExit(1)
-    print((state / 'nonce').read_text().strip())
-elif args and args[0] == 'run':
+    print('|'.join(((state / 'id').read_text().strip(), (state / 'name').read_text().strip(), (state / 'nonce').read_text().strip())))
+elif args and args[0] == 'create':
     (state / 'run-called').touch()
     (state / 'launch-request').touch()
+    time.sleep(30)
+elif args and args[0] == 'start':
     time.sleep(30)
 elif args and args[0] == 'rm':
     if behavior == 'remove-error':
         raise SystemExit(55)
+    if args[-1] != (state / 'id').read_text().strip():
+        raise SystemExit(66)
     (state / 'rm-called').touch()
     (state / 'present').unlink(missing_ok=True)
 else:
@@ -275,6 +279,7 @@ def test_docker_cleanup_observes_delayed_daemon_materialization_and_removes_it(
     (state / "name").write_text(name)
     (state / "nonce").write_text(nonce)
     (state / "label").write_text(f"holoagent0.strace.owner={nonce}")
+    (state / "id").write_text("a" * 64)
     daemon = _python_script(
         tmp_path / "daemon.py",
         "import sys,time\nfrom pathlib import Path\n"
@@ -314,6 +319,7 @@ def test_docker_collision_and_cleanup_error_are_fail_closed_and_bounded(tmp_path
     (state / "name").write_text(name)
     (state / "nonce").write_text("foreign")
     (state / "label").write_text("holoagent0.strace.owner=foreign")
+    (state / "id").write_text("a" * 64)
     (state / "present").touch()
     unrelated = tmp_path / "unrelated-container"
     unrelated.write_text("untouched")
