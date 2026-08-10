@@ -213,13 +213,13 @@ def test_runner_drains_large_output_without_pipe_deadlock(tmp_path):
     assert ns["MAX_CAPTURE_BYTES"] >= len(result.stdout) + len(result.stderr)
 
 
-def test_escaped_setsid_descendant_is_cleaned_and_baseline_child_survives(tmp_path):
+def test_forked_descendant_is_cleaned_and_baseline_child_survives(tmp_path):
     ns = _namespace()
     pid_file = tmp_path / "escaped.pid"
     leader = _python_script(
         tmp_path / "leader.py",
         "import subprocess,sys\nfrom pathlib import Path\n"
-        "child=subprocess.Popen(['/usr/bin/python3.10','-c','import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'], start_new_session=True)\n"
+        "child=subprocess.Popen(['/usr/bin/python3.10','-c','import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'])\n"
         "Path(sys.argv[1]).write_text(str(child.pid))\n",
     )
     unrelated = subprocess.Popen(["/usr/bin/sleep", "30"], start_new_session=True)

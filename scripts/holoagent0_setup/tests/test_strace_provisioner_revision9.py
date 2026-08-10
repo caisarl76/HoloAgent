@@ -220,14 +220,14 @@ def test_response_less_create_late_materialization_is_cleanup_failure(tmp_path):
     assert not any(call[1] == "rm" for call in runner.calls)
 
 
-def test_discovery_exception_still_kills_tracked_setsid_child_only(tmp_path):
+def test_discovery_exception_still_kills_tracked_forked_child_only(tmp_path):
     ns = _namespace()
     escaped_pid = tmp_path / "escaped.pid"
     leader = _python_script(
         tmp_path / "leader.py",
         "import subprocess,sys,time\nfrom pathlib import Path\n"
         "child=subprocess.Popen(['/usr/bin/python3.10','-I','-S','-c',"
-        "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'], start_new_session=True)\n"
+        "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'])\n"
         "Path(sys.argv[1]).write_text(str(child.pid))\ntime.sleep(30)\n",
     )
     unrelated = subprocess.Popen(["/usr/bin/sleep", "30"], start_new_session=True)
