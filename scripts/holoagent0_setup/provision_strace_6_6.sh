@@ -116,11 +116,20 @@ fi
 temp_dir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/holoagent0-strace.XXXXXXXX")"
 cleanup() {
     local status=$?
-    trap - EXIT HUP INT TERM
-    /usr/bin/rm -rf -- "$temp_dir"
+    trap - EXIT
+    /usr/bin/rm -rf -- "$temp_dir" || :
     exit "$status"
 }
-trap cleanup EXIT HUP INT TERM
+terminate() {
+    local status="$1"
+    trap - EXIT HUP INT TERM
+    /usr/bin/rm -rf -- "$temp_dir" || :
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'terminate 129' HUP
+trap 'terminate 130' INT
+trap 'terminate 143' TERM
 snapshot="$temp_dir/strace-6.6.tar.xz"
 
 if [[ -n "$archive" ]]; then
