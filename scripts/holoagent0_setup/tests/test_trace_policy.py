@@ -5,6 +5,7 @@ import itertools
 import pytest
 
 from holoagent0_setup.cyclone_policy import EXPECTED_CONFIG_SHA256
+from holoagent0_setup.trace_normalizer import normalize_bytes
 from holoagent0_setup.trace_policy import TracePolicy
 
 
@@ -82,6 +83,12 @@ class Records:
         if control is not None:
             fields["control"] = control
         return self.make(pid, syscall, result=8, **fields)
+
+
+def _trace_line(call, *, pid=100):
+    prefix = f"{pid:<5} 1700000060.000001 "
+    padding = " " * max(1, 40 - len(prefix) - len(call))
+    return f"{prefix}{call}{padding}= 0 <0.000001>\n".encode()
 
 
 def make_policy(*, loopback_only=True, participant_digests=None):
@@ -617,6 +624,29 @@ def test_multicast_membership_option_is_value_bound(group, interface, expected):
         )
     )
     assert decision.status == expected
+
+
+def test_normalizer_retains_only_structural_multicast_membership_values():
+    source = _trace_line(
+        "setsockopt(7<UDP:[127.0.0.1:26650]>, SOL_IP, IP_ADD_MEMBERSHIP, "
+        '{imr_multiaddr=inet_addr("239.255.0.1"), '
+        'imr_interface=inet_addr("127.0.0.1")}, 8)'
+    )
+    (record,) = normalize_bytes(source)
+    assert record["transition"] == {
+        "operation": "setsockopt",
+        "fd": {
+            "fd": 7,
+            "provenance": {"kind": "socket", "protocol": "UDP"},
+        },
+        "level": "SOL_IP",
+        "option": "IP_ADD_MEMBERSHIP",
+        "length": 8,
+        "membership": {
+            "group": "239.255.0.1",
+            "interface": "127.0.0.1",
+        },
+    }
 
 
 def test_meta_and_data_port_sets_are_closed_and_disjoint():
