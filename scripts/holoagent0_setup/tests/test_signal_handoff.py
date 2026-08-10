@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import os
 import signal
+from threading import Event, Thread
 import time
 
 import pytest
@@ -55,13 +57,11 @@ def _coordinator(
     identity,
     *,
     operations=None,
-    verifier=lambda _evidence: True,
     first_sequence=1,
 ):
     return CoordinatorSignalHandoff(
         "run-0123456789abcdef",
         identity,
-        trace_verifier=verifier,
         signal_operations=operations or FakeSignalOperations(),
         first_sequence=first_sequence,
     )
@@ -184,23 +184,19 @@ def test_supervisor_build_acceptance_is_pure_and_cannot_authorize(identity):
     assert acceptance.request_sha256 == request.canonical_sha256
     assert supervisor.snapshot() == before
     assert supervisor.snapshot().acceptance_count == 0
-    assert not hasattr(supervisor, "finalize_ready")
+    assert not hasattr(coordinator, "finalize_ready")
+    assert hasattr(supervisor, "finalize_ready")
 
 
-def test_supervisor_authorizes_and_forwards_only_after_complete_frame_write(
-    identity, monkeypatch
-):
+def test_supervisor_authorizes_only_after_actual_complete_frame_write(identity):
     coordinator = _coordinator(identity)
     forwarded = []
     supervisor = _supervisor(identity, forwarded=forwarded)
     supervisor.collect_signal("TERM")
     _request, request_read = _send_request(coordinator)
     response_read, response_write = os.pipe()
-
-    def fail_write(*_args, **_kwargs):
-        raise OSError("partial pipe write")
-
-    monkeypatch.setattr("holoagent0_setup.signal_handoff.write_frame", fail_write)
+    os.close(response_read)
+    response_read = -1
     try:
         with pytest.raises(SignalHandoffError, match="write"):
             supervisor.receive_and_accept(
@@ -210,7 +206,8 @@ def test_supervisor_authorizes_and_forwards_only_after_complete_frame_write(
             )
     finally:
         os.close(request_read)
-        os.close(response_read)
+        if response_read >= 0:
+            os.close(response_read)
         os.close(response_write)
     snapshot = supervisor.snapshot()
     assert snapshot.terminal_state == "FAILED"
@@ -312,9 +309,7 @@ def test_default_coordinator_path_really_unblocks_and_preserves_handlers(identit
     try:
         for number in reviewed:
             signal.signal(number, handler)
-        coordinator = CoordinatorSignalHandoff(
-            "nonce", identity, trace_verifier=lambda _evidence: True
-        )
+        coordinator = CoordinatorSignalHandoff("nonce", identity)
         supervisor = SupervisorSignalHandoff(
             "nonce",
             identity_validator=lambda _value: True,
@@ -416,53 +411,10 @@ def test_unblock_operation_exception_is_normalized_and_terminal(identity):
     assert coordinator.snapshot().unblock_count == 0
 
 
-def test_trace_verifier_is_mandatory(identity):
-    with pytest.raises(SignalHandoffError, match="trace verifier"):
-        CoordinatorSignalHandoff("nonce", identity)
-
-
-@pytest.mark.parametrize(
-    "fault",
-    ["binding", "order", "missing_functional_index", "count", "verifier"],
-)
-def test_terminal_trace_evidence_rejects_untrusted_or_inconsistent_rows(
-    identity, fault
-):
-    verifier = (lambda _evidence: False) if fault == "verifier" else (lambda _: True)
-    coordinator = _coordinator(identity, verifier=verifier)
-    supervisor = _supervisor(identity)
-    request, _acceptance = _round_trip(coordinator, supervisor)
-    coordinator.record_functional_progress()
-    kwargs = {
-        "unblock_index": 7,
-        "first_functional_index": 8,
-        "functional_count": 1,
-    }
-    if fault == "binding":
-        kwargs["nonce"] = "wrong"
-    elif fault == "order":
-        kwargs["first_functional_index"] = 6
-    elif fault == "missing_functional_index":
-        kwargs["first_functional_index"] = None
-    elif fault == "count":
-        kwargs["functional_count"] = 0
-        kwargs["first_functional_index"] = None
-    evidence = _evidence(request, **kwargs)
-
-    with pytest.raises(SignalHandoffError, match="trace"):
-        coordinator.finalize_ready(evidence)
-
-    snapshot = coordinator.snapshot()
-    assert snapshot.terminal_state == "FAILED"
-    assert snapshot.functional_count == 1
-
-
-def test_valid_trace_evidence_finalizes_zero_and_nonzero_functional_runs(identity):
+def test_supervisor_finalizes_zero_and_nonzero_functional_runs(identity):
     seen = []
     for functional_count in (0, 1):
-        coordinator = _coordinator(
-            identity, verifier=lambda evidence: seen.append(evidence) is None
-        )
+        coordinator = _coordinator(identity)
         supervisor = _supervisor(identity)
         request, _acceptance = _round_trip(coordinator, supervisor)
         if functional_count:
@@ -473,12 +425,59 @@ def test_valid_trace_evidence_finalizes_zero_and_nonzero_functional_runs(identit
             first_functional_index=11 if functional_count else None,
             functional_count=functional_count,
         )
-        coordinator.finalize_ready(evidence)
-        assert coordinator.snapshot().terminal_state == "READY"
+        coordinator_before = coordinator.snapshot()
+        supervisor.finalize_ready(
+            coordinator_before,
+            evidence,
+            lambda value: seen.append(value) is None,
+        )
+        assert coordinator.snapshot() == coordinator_before
+        assert coordinator.snapshot().state == "LIVE_READY"
+        assert coordinator.snapshot().terminal_state is None
+        assert supervisor.snapshot().terminal_state == "READY"
     assert seen[0].first_functional_trace_record_index is None
     assert (
         seen[1].unblock_trace_record_index < seen[1].first_functional_trace_record_index
     )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["coordinator", "binding", "order", "count", "verifier", "missing_verifier"],
+)
+def test_supervisor_rejects_inconsistent_or_untrusted_terminal_evidence(
+    identity, fault
+):
+    coordinator = _coordinator(identity)
+    supervisor = _supervisor(identity)
+    request, _acceptance = _round_trip(coordinator, supervisor)
+    coordinator.record_functional_progress()
+    coordinator_evidence = coordinator.snapshot()
+    kwargs = {
+        "unblock_index": 7,
+        "first_functional_index": 8,
+        "functional_count": 1,
+    }
+    if fault == "coordinator":
+        coordinator_evidence = replace(coordinator_evidence, unblock_count=0)
+    elif fault == "binding":
+        kwargs["nonce"] = "wrong"
+    elif fault == "order":
+        kwargs["first_functional_index"] = 6
+    elif fault == "count":
+        kwargs["functional_count"] = 0
+        kwargs["first_functional_index"] = None
+    evidence = _evidence(request, **kwargs)
+    verifier = (
+        None if fault == "missing_verifier" else lambda _value: fault != "verifier"
+    )
+
+    with pytest.raises(SignalHandoffError):
+        supervisor.finalize_ready(coordinator_evidence, evidence, verifier)
+
+    assert coordinator.snapshot().state == "LIVE_READY"
+    assert coordinator.snapshot().terminal_state is None
+    assert supervisor.snapshot().terminal_state == "FAILED"
 
 
 def test_supervisor_rejects_later_readiness_without_mutating_authorization(
@@ -582,28 +581,28 @@ def test_concurrent_duplicate_requests_authorize_exactly_one_without_loser_mutat
     assert forwarded == [(identity.pgid, "INT")]
 
 
-def test_trace_verifier_reentrant_failure_cannot_be_overwritten_by_ready(identity):
-    holder = {}
-
-    def verifier(_evidence):
-        holder["coordinator"].fail("trace verifier reentry")
-        return True
-
-    coordinator = _coordinator(identity, verifier=verifier)
-    holder["coordinator"] = coordinator
+def test_supervisor_trace_verifier_reentry_cannot_be_overwritten_by_ready(identity):
+    coordinator = _coordinator(identity)
     supervisor = _supervisor(identity)
     request, _acceptance = _round_trip(coordinator, supervisor)
 
-    with pytest.raises(SignalHandoffError):
-        coordinator.finalize_ready(_evidence(request))
+    def verifier(_evidence):
+        supervisor.fail("trace verifier reentry")
+        return True
 
-    snapshot = coordinator.snapshot()
+    with pytest.raises(SignalHandoffError):
+        supervisor.finalize_ready(
+            coordinator.snapshot(),
+            _evidence(request),
+            verifier,
+        )
+
+    snapshot = supervisor.snapshot()
     assert snapshot.state == snapshot.terminal_state == "FAILED"
-    assert snapshot.acceptance_validated
-    assert snapshot.unblock_count == 1
-    assert snapshot.functional_count == 0
     assert snapshot.events[-1].name == "failed:trace verifier reentry"
     assert all(event.name != "terminal_ready" for event in snapshot.events)
+    assert coordinator.snapshot().state == "LIVE_READY"
+    assert coordinator.snapshot().terminal_state is None
 
 
 @pytest.mark.parametrize("reentry_call", [1, 2])
@@ -721,23 +720,21 @@ def test_coordinator_writer_reentrant_failure_cannot_commit_request(
     assert all(event.name != "ready_request_write" for event in snapshot.events)
 
 
-@pytest.mark.parametrize("reentry", ["fail", "second_transition"])
-def test_supervisor_writer_reentry_cannot_commit_acceptance(
-    identity, monkeypatch, reentry
+def test_completed_response_linearizes_acceptance_before_reentrant_failure(
+    identity, monkeypatch
 ):
+    coordinator = _coordinator(identity)
     supervisor = _supervisor(identity)
-    _request, request_read = _send_request(_coordinator(identity))
+    _request, request_read = _send_request(coordinator)
     response_read, response_write = os.pipe()
     real_write_frame = signal_handoff_module.write_frame
 
-    def reentrant_write(*args, **kwargs):
-        if reentry == "fail":
-            supervisor.fail("supervisor writer reentry")
-        else:
-            supervisor.collect_signal("INT")
-        return real_write_frame(*args, **kwargs)
+    def complete_then_fail(*args, **kwargs):
+        result = real_write_frame(*args, **kwargs)
+        supervisor.fail("failure after response publication")
+        return result
 
-    monkeypatch.setattr(signal_handoff_module, "write_frame", reentrant_write)
+    monkeypatch.setattr(signal_handoff_module, "write_frame", complete_then_fail)
     try:
         with pytest.raises(SignalHandoffError):
             supervisor.receive_and_accept(
@@ -747,15 +744,133 @@ def test_supervisor_writer_reentry_cannot_commit_acceptance(
             )
     finally:
         os.close(request_read)
-        os.close(response_read)
         os.close(response_write)
+    try:
+        coordinator.receive_acceptance(
+            response_read,
+            deadline=time.monotonic() + 0.2,
+        )
+    finally:
+        os.close(response_read)
 
     snapshot = supervisor.snapshot()
     assert snapshot.state == snapshot.terminal_state == "FAILED"
-    assert snapshot.acceptance_count == snapshot.forward_count == 0
-    assert snapshot.next_sequence == 1
-    assert snapshot.events[-1].name.startswith("failed:")
-    assert all(event.name != "acceptance_write" for event in snapshot.events)
+    assert snapshot.acceptance_count == 1
+    assert snapshot.forward_count == 0
+    assert snapshot.next_sequence == 2
+    assert [event.name for event in snapshot.events][-2:] == [
+        "acceptance_write",
+        "failed:failure after response publication",
+    ]
+    assert coordinator.snapshot().state == "LIVE_READY"
+    assert coordinator.snapshot().unblock_count == 1
+
+
+def test_signal_during_response_publication_is_preserved_and_forwarded_once(
+    identity, monkeypatch
+):
+    coordinator = _coordinator(identity)
+    forwarded = []
+    supervisor = _supervisor(identity, forwarded=forwarded)
+    _request, request_read = _send_request(coordinator)
+    response_read, response_write = os.pipe()
+    real_write_frame = signal_handoff_module.write_frame
+
+    def complete_then_collect_signal(*args, **kwargs):
+        result = real_write_frame(*args, **kwargs)
+        supervisor.collect_signal("TERM")
+        return result
+
+    monkeypatch.setattr(
+        signal_handoff_module,
+        "write_frame",
+        complete_then_collect_signal,
+    )
+    try:
+        supervisor.receive_and_accept(
+            request_read,
+            response_write,
+            deadline=time.monotonic() + 0.2,
+        )
+    finally:
+        os.close(request_read)
+        os.close(response_write)
+    try:
+        coordinator.receive_acceptance(
+            response_read,
+            deadline=time.monotonic() + 0.2,
+        )
+    finally:
+        os.close(response_read)
+
+    snapshot = supervisor.snapshot()
+    assert snapshot.state == "READY"
+    assert snapshot.terminal_state is None
+    assert snapshot.acceptance_count == snapshot.forward_count == 1
+    assert snapshot.pending_signal == "TERM"
+    assert forwarded == [(identity.pgid, "TERM")]
+    assert [event.name for event in snapshot.events][-3:] == [
+        "acceptance_write",
+        "signal_latched",
+        "signal_forward",
+    ]
+
+
+def test_completed_response_linearizes_before_concurrent_failure(identity, monkeypatch):
+    coordinator = _coordinator(identity)
+    supervisor = _supervisor(identity)
+    _request, request_read = _send_request(coordinator)
+    response_read, response_write = os.pipe()
+    real_write_frame = signal_handoff_module.write_frame
+    response_complete = Event()
+    failure_complete = Event()
+
+    def complete_and_allow_failure_attempt(*args, **kwargs):
+        result = real_write_frame(*args, **kwargs)
+        response_complete.set()
+        failure_complete.wait(0.05)
+        return result
+
+    def fail_after_complete_response():
+        assert response_complete.wait(0.5)
+        supervisor.fail("concurrent failure after response publication")
+        failure_complete.set()
+
+    monkeypatch.setattr(
+        signal_handoff_module,
+        "write_frame",
+        complete_and_allow_failure_attempt,
+    )
+    failure_thread = Thread(target=fail_after_complete_response, daemon=True)
+    failure_thread.start()
+    try:
+        try:
+            supervisor.receive_and_accept(
+                request_read,
+                response_write,
+                deadline=time.monotonic() + 0.2,
+            )
+        except SignalHandoffError:
+            pass
+    finally:
+        os.close(request_read)
+        os.close(response_write)
+    failure_thread.join(0.5)
+    assert not failure_thread.is_alive()
+    try:
+        coordinator.receive_acceptance(
+            response_read,
+            deadline=time.monotonic() + 0.2,
+        )
+    finally:
+        os.close(response_read)
+
+    snapshot = supervisor.snapshot()
+    assert snapshot.state == snapshot.terminal_state == "FAILED"
+    assert snapshot.acceptance_count == 1
+    assert snapshot.next_sequence == 2
+    assert coordinator.snapshot().state == "LIVE_READY"
+    assert coordinator.snapshot().unblock_count == 1
 
 
 def test_terminal_role_states_are_immutable(identity):

@@ -259,15 +259,12 @@ class CoordinatorSignalHandoff:
         run_nonce: str,
         identity: ProcessIdentity,
         *,
-        trace_verifier: Callable[[TraceUnblockEvidence], bool] | None = None,
         signal_operations: object | None = None,
         first_sequence: int = 1,
     ) -> None:
         _require_nonce(run_nonce)
         if type(identity) is not ProcessIdentity or identity.pid != identity.pgid:
             raise SignalHandoffError("coordinator identity must lead its process group")
-        if trace_verifier is None or not callable(trace_verifier):
-            raise SignalHandoffError("a trusted trace verifier is mandatory")
         if type(first_sequence) is not int or first_sequence <= 0:
             raise SignalHandoffError("first sequence must be positive")
         operations = signal_operations or _OSSignalOperations()
@@ -278,7 +275,6 @@ class CoordinatorSignalHandoff:
         self._lock = RLock()
         self._run_nonce = run_nonce
         self._identity = identity
-        self._trace_verifier = trace_verifier
         self._signal_operations = operations
         self._next_sequence = first_sequence
         self._state = "AWAITING_READY"
@@ -410,7 +406,7 @@ class CoordinatorSignalHandoff:
             ):
                 return self._reject("handler dispositions changed during unblock")
             self._unblock_count = 1
-            self._state = "READY"
+            self._state = "LIVE_READY"
             self._event("signals_unblocked")
             self._finish_transition_locked(transition)
             return acceptance
@@ -418,58 +414,10 @@ class CoordinatorSignalHandoff:
     def record_functional_progress(self) -> None:
         with self._lock:
             self._require_transition_idle()
-            if self._state != "READY" or self._unblock_count != 1:
+            if self._state != "LIVE_READY" or self._unblock_count != 1:
                 return self._reject("functional progress preceded OS unblock")
             self._functional_count += 1
             self._event("functional")
-
-    def finalize_ready(self, evidence: TraceUnblockEvidence) -> None:
-        with self._lock:
-            self._require_transition_idle()
-            if (
-                self._state != "READY"
-                or not self._acceptance_validated
-                or self._unblock_count != 1
-                or self._sent_request is None
-            ):
-                return self._reject("coordinator is not live-ready")
-            if type(evidence) is not TraceUnblockEvidence:
-                return self._reject("trusted trace evidence is required")
-            request = self._sent_request
-            if (
-                evidence.run_nonce != request.run_nonce
-                or evidence.identity != request.identity
-                or evidence.request_sequence != request.sequence
-                or evidence.request_sha256 != request.canonical_sha256
-                or evidence.functional_count != self._functional_count
-            ):
-                return self._reject("trace evidence binding or count mismatch")
-            functional_index = evidence.first_functional_trace_record_index
-            if self._functional_count == 0:
-                if functional_index is not None:
-                    return self._reject(
-                        "trace evidence has an unexpected functional index"
-                    )
-            elif functional_index is None or not (
-                evidence.unblock_trace_record_index < functional_index
-            ):
-                return self._reject("trace evidence functional ordering is invalid")
-            transition = "trace verification"
-            version = self._start_transition_locked(transition)
-        try:
-            trusted = self._trace_verifier(evidence)
-        except Exception as error:
-            with self._lock:
-                if self._terminal_state is None:
-                    self._fail_locked("trusted trace verifier failed")
-            raise SignalHandoffError("trusted trace verifier failed") from error
-        with self._lock:
-            self._require_transition_unchanged_locked(transition, version)
-            if trusted is not True:
-                return self._reject("trusted trace verifier rejected evidence")
-            self._transition = None
-            self._terminal_state = "READY"
-            self._event("terminal_ready")
 
     def fail(self, reason: str) -> None:
         with self._lock:
@@ -582,6 +530,10 @@ class SupervisorSignalHandoff:
         self._pending_signal: str | None = None
         self._forward_target_pgid: int | None = None
         self._last_accepted_identity: ProcessIdentity | None = None
+        self._accepted_request: SignalReady | None = None
+        self._accepted_response: SignalReadyAccepted | None = None
+        self._deferred_failure_reason: str | None = None
+        self._deferred_signal: str | None = None
         self._events: list[HandoffEvent] = []
         self._state_version = 0
         self._transition: str | None = None
@@ -654,32 +606,47 @@ class SupervisorSignalHandoff:
                 return self._reject("request process identity mismatch")
             acceptance = _acceptance_for(request)
             self._event("ready_request_validated")
-            version = self._state_version
-        try:
-            write_frame(
-                response_write_fd,
-                acceptance.as_message(),
-                deadline=deadline,
-            )
-        except (BrokerProtocolError, OSError, SignalHandoffError) as error:
-            with self._lock:
+            self._transition = "acceptance publication"
+            self._state_version += 1
+            try:
+                write_frame(
+                    response_write_fd,
+                    acceptance.as_message(),
+                    deadline=deadline,
+                )
+            except (BrokerProtocolError, OSError, SignalHandoffError) as error:
+                self._deferred_failure_reason = None
+                self._deferred_signal = None
                 if self._terminal_state is None:
                     self._fail_locked("acceptance response write failed")
-            raise SignalHandoffError("acceptance response write failed") from error
-        with self._lock:
-            self._require_transition_unchanged_locked(transition, version)
+                raise SignalHandoffError("acceptance response write failed") from error
             self._acceptance_count = 1
             self._next_sequence += 1
             self._last_accepted_identity = request.identity
+            self._accepted_request = request
+            self._accepted_response = acceptance
             self._state = "READY"
             self._event("acceptance_write")
+            self._transition = "post-acceptance"
+            self._state_version += 1
+            if self._pending_signal is None and self._deferred_signal is not None:
+                self._pending_signal = self._deferred_signal
+                self._event("signal_latched")
+            self._deferred_signal = None
+            deferred_failure = self._deferred_failure_reason
+            self._deferred_failure_reason = None
+            if deferred_failure is not None:
+                self._fail_locked(deferred_failure)
+                raise SignalHandoffError(
+                    "supervisor failed after acceptance publication"
+                )
             if self._pending_signal is None:
-                self._finish_transition_locked(transition)
+                self._finish_transition_locked("post-acceptance")
                 return acceptance
             version = self._state_version
         valid_identity = self._validate_identity(request.identity)
         with self._lock:
-            self._require_transition_unchanged_locked(transition, version)
+            self._require_transition_unchanged_locked("post-acceptance", version)
             if not valid_identity:
                 return self._reject("process identity changed before forward")
             pending_signal = self._pending_signal
@@ -691,20 +658,25 @@ class SupervisorSignalHandoff:
                     self._fail_locked("modeled signal forward failed")
             raise SignalHandoffError("modeled signal forward failed") from error
         with self._lock:
-            self._require_transition_unchanged_locked(transition, version)
+            self._require_transition_unchanged_locked("post-acceptance", version)
             if result is not None:
                 return self._reject("modeled signal forward was not exact")
             self._forward_count = 1
             self._forward_target_pgid = request.identity.pgid
             self._event("signal_forward")
-            self._finish_transition_locked(transition)
+            self._finish_transition_locked("post-acceptance")
             return acceptance
 
     def collect_signal(self, signal_name: str) -> None:
         with self._lock:
-            self._require_transition_idle()
+            self._require_nonterminal()
             if type(signal_name) is not str or signal_name not in _SIGNAL_SET:
                 raise SignalHandoffError("signal must be exactly HUP, INT, or TERM")
+            if self._transition == "acceptance publication":
+                if self._pending_signal is None and self._deferred_signal is None:
+                    self._deferred_signal = signal_name
+                return
+            self._require_transition_idle()
             if self._pending_signal is not None:
                 return
             self._pending_signal = signal_name
@@ -738,10 +710,99 @@ class SupervisorSignalHandoff:
             self._event("signal_forward")
             self._finish_transition_locked(transition)
 
+    def finalize_ready(
+        self,
+        coordinator_evidence: CoordinatorSnapshot,
+        trace_evidence: TraceUnblockEvidence,
+        trusted_verifier: Callable[[TraceUnblockEvidence], bool] | None,
+    ) -> None:
+        """Own the terminal READY decision from bound cross-role evidence."""
+
+        with self._lock:
+            self._require_transition_idle()
+            if trusted_verifier is None or not callable(trusted_verifier):
+                return self._reject("a trusted trace verifier is mandatory")
+            request = self._accepted_request
+            acceptance = self._accepted_response
+            if (
+                self._state != "READY"
+                or self._acceptance_count != 1
+                or request is None
+                or acceptance is None
+                or acceptance != _acceptance_for(request)
+            ):
+                return self._reject("supervisor has no accepted readiness response")
+            if type(coordinator_evidence) is not CoordinatorSnapshot:
+                return self._reject("coordinator readiness evidence is invalid")
+            functional_events = tuple(
+                event
+                for event in coordinator_evidence.events
+                if event.name == "functional"
+            )
+            unblock_events = tuple(
+                event
+                for event in coordinator_evidence.events
+                if event.name == "signals_unblocked"
+            )
+            if (
+                coordinator_evidence.role != "COORDINATOR"
+                or coordinator_evidence.state != "LIVE_READY"
+                or coordinator_evidence.terminal_state is not None
+                or coordinator_evidence.request_sequence != acceptance.request_sequence
+                or coordinator_evidence.request_sha256 != acceptance.request_sha256
+                or coordinator_evidence.acceptance_validated is not True
+                or coordinator_evidence.unblock_count != 1
+                or len(unblock_events) != 1
+                or unblock_events[0].state != "LIVE_READY"
+                or len(functional_events) != coordinator_evidence.functional_count
+            ):
+                return self._reject("coordinator readiness evidence is inconsistent")
+            if type(trace_evidence) is not TraceUnblockEvidence:
+                return self._reject("trusted trace evidence is required")
+            if (
+                trace_evidence.run_nonce != request.run_nonce
+                or trace_evidence.identity != request.identity
+                or trace_evidence.request_sequence != acceptance.request_sequence
+                or trace_evidence.request_sha256 != acceptance.request_sha256
+                or trace_evidence.functional_count
+                != coordinator_evidence.functional_count
+            ):
+                return self._reject("trace evidence binding or count mismatch")
+            functional_index = trace_evidence.first_functional_trace_record_index
+            if coordinator_evidence.functional_count == 0:
+                if functional_index is not None:
+                    return self._reject(
+                        "trace evidence has an unexpected functional index"
+                    )
+            elif functional_index is None or not (
+                trace_evidence.unblock_trace_record_index < functional_index
+            ):
+                return self._reject("trace evidence functional ordering is invalid")
+            transition = "trace verification"
+            version = self._start_transition_locked(transition)
+        try:
+            trusted = trusted_verifier(trace_evidence)
+        except Exception as error:
+            with self._lock:
+                if self._terminal_state is None:
+                    self._fail_locked("trusted trace verifier failed")
+            raise SignalHandoffError("trusted trace verifier failed") from error
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
+            if trusted is not True:
+                return self._reject("trusted trace verifier rejected evidence")
+            self._transition = None
+            self._terminal_state = "READY"
+            self._event("terminal_ready")
+
     def fail(self, reason: str) -> None:
         with self._lock:
             self._require_nonterminal()
             _require_reason(reason)
+            if self._transition == "acceptance publication":
+                if self._deferred_failure_reason is None:
+                    self._deferred_failure_reason = reason
+                return
             self._fail_locked(reason)
 
     def snapshot(self) -> SupervisorSnapshot:
@@ -813,15 +874,15 @@ class SupervisorSignalHandoff:
 
     def _require_ready_acceptance_open(self) -> None:
         self._require_nonterminal()
-        if self._transition == "readiness acceptance":
-            raise SignalHandoffError("readiness already accepted")
-        if self._transition is not None:
-            self._reject("supervisor transition reentry")
         if self._acceptance_count != 0 or self._state not in {
             "AWAITING_READY",
             "PENDING_FORWARD",
         }:
             raise SignalHandoffError("readiness already accepted")
+        if self._transition == "readiness acceptance":
+            raise SignalHandoffError("readiness already accepted")
+        if self._transition is not None:
+            self._reject("supervisor transition reentry")
 
     def _event(self, name: str) -> None:
         self._events.append(HandoffEvent(len(self._events), name, self._state))
