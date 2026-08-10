@@ -17,17 +17,20 @@ from holoagent0_setup.cyclone_policy import (
 
 ROOT = Path(__file__).parents[1]
 CONFIG_DIR = ROOT / "config"
+REPOSITORY_ROOT = ROOT.parents[1]
 CONFIG_NAMES = tuple(f"cyclonedds-offline-p{index}.xml" for index in range(4))
 
 
-def _copy_configs(destination):
-    destination.mkdir()
+def _copy_configs(repository_root):
+    destination = repository_root / "scripts/holoagent0_setup/config"
+    destination.mkdir(parents=True)
     for name in CONFIG_NAMES:
         shutil.copyfile(CONFIG_DIR / name, destination / name)
+    return destination
 
 
 def test_four_configs_are_closed_byte_pinned_and_differ_only_by_index():
-    contract = load_pinned_cyclone_configs(CONFIG_DIR)
+    contract = load_pinned_cyclone_configs(CONFIG_DIR, repository_root=REPOSITORY_ROOT)
     assert tuple(config.participant_index for config in contract.configs) == tuple(
         range(4)
     )
@@ -53,7 +56,7 @@ def test_four_configs_are_closed_byte_pinned_and_differ_only_by_index():
 
 
 def test_exact_cyclone_semantics_and_ports_are_pinned():
-    contract = load_pinned_cyclone_configs(CONFIG_DIR)
+    contract = load_pinned_cyclone_configs(CONFIG_DIR, repository_root=REPOSITORY_ROOT)
     for config in contract.configs:
         assert config.path.read_bytes().count(b'allow_multicast="spdp"') == 1
     assert contract.domain_id == 77
@@ -112,42 +115,42 @@ def test_exact_cyclone_semantics_and_ports_are_pinned():
     ],
 )
 def test_any_semantic_or_digest_mutation_is_rejected(tmp_path, old, new):
-    copied = tmp_path / "config"
-    _copy_configs(copied)
+    repository = tmp_path / "repository"
+    copied = _copy_configs(repository)
     target = copied / CONFIG_NAMES[0]
     payload = target.read_bytes()
     assert old in payload
     target.write_bytes(payload.replace(old, new, 1))
     with pytest.raises(CycloneConfigError):
-        load_pinned_cyclone_configs(copied)
+        load_pinned_cyclone_configs(copied, repository_root=repository)
 
 
 def test_missing_extra_or_symlinked_config_is_rejected(tmp_path):
-    copied = tmp_path / "config"
-    _copy_configs(copied)
+    repository = tmp_path / "repository"
+    copied = _copy_configs(repository)
     (copied / CONFIG_NAMES[0]).unlink()
     with pytest.raises(CycloneConfigError):
-        load_pinned_cyclone_configs(copied)
+        load_pinned_cyclone_configs(copied, repository_root=repository)
 
     shutil.rmtree(copied)
-    _copy_configs(copied)
+    copied = _copy_configs(repository)
     (copied / "cyclonedds-extra.xml").write_text("<CycloneDDS/>", encoding="utf-8")
     with pytest.raises(CycloneConfigError):
-        load_pinned_cyclone_configs(copied)
+        load_pinned_cyclone_configs(copied, repository_root=repository)
 
     shutil.rmtree(copied)
-    _copy_configs(copied)
+    copied = _copy_configs(repository)
     target = copied / CONFIG_NAMES[0]
     real = copied / "real.xml"
     target.rename(real)
     target.symlink_to(real)
     with pytest.raises(CycloneConfigError):
-        load_pinned_cyclone_configs(copied)
+        load_pinned_cyclone_configs(copied, repository_root=repository)
 
 
 @pytest.mark.parametrize("participant_index", range(4))
 def test_only_absolute_pinned_file_uri_for_matching_role_passes(participant_index):
-    contract = load_pinned_cyclone_configs(CONFIG_DIR)
+    contract = load_pinned_cyclone_configs(CONFIG_DIR, repository_root=REPOSITORY_ROOT)
     path = (CONFIG_DIR / CONFIG_NAMES[participant_index]).resolve()
     descriptor = validate_cyclonedds_uri(
         path.as_uri(), contract, participant_index=participant_index
@@ -157,7 +160,7 @@ def test_only_absolute_pinned_file_uri_for_matching_role_passes(participant_inde
 
 
 def test_inline_relative_wrong_role_and_symlink_uri_are_rejected(tmp_path):
-    contract = load_pinned_cyclone_configs(CONFIG_DIR)
+    contract = load_pinned_cyclone_configs(CONFIG_DIR, repository_root=REPOSITORY_ROOT)
     path = (CONFIG_DIR / CONFIG_NAMES[0]).resolve()
     for uri, index in (
         ("<CycloneDDS><Domain Id='77'/></CycloneDDS>", 0),
@@ -174,11 +177,22 @@ def test_inline_relative_wrong_role_and_symlink_uri_are_rejected(tmp_path):
     with pytest.raises(CycloneConfigError):
         validate_cyclonedds_uri(link.as_uri(), contract, participant_index=0)
 
+    copied = tmp_path / "copied.xml"
+    shutil.copyfile(path, copied)
+    with pytest.raises(CycloneConfigError):
+        validate_cyclonedds_uri(copied.as_uri(), contract, participant_index=0)
+
+
+def test_config_loader_rejects_directory_outside_trusted_repository_root(tmp_path):
+    copied = _copy_configs(tmp_path / "alternate")
+    with pytest.raises(CycloneConfigError):
+        load_pinned_cyclone_configs(copied, repository_root=REPOSITORY_ROOT)
+
 
 def test_uri_is_remeasured_and_rejects_post_load_content_change(tmp_path):
-    copied = tmp_path / "config"
-    _copy_configs(copied)
-    contract = load_pinned_cyclone_configs(copied)
+    repository = tmp_path / "repository"
+    copied = _copy_configs(repository)
+    contract = load_pinned_cyclone_configs(copied, repository_root=repository)
     target = (copied / CONFIG_NAMES[0]).resolve()
     target.write_bytes(target.read_bytes().replace(b">spdp<", b">false<", 1))
     with pytest.raises(CycloneConfigError):

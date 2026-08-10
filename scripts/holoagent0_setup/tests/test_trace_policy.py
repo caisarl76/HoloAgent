@@ -4,13 +4,14 @@ import itertools
 
 import pytest
 
+from holoagent0_setup.cyclone_policy import EXPECTED_CONFIG_SHA256
 from holoagent0_setup.trace_policy import TracePolicy
 
 
 TOKEN = "0123456789ab"
 COORDINATOR_PID = 90
 PARTICIPANT_PIDS = {index: 100 + index for index in range(4)}
-CONFIG_DIGESTS = {index: f"{index + 1:064x}" for index in range(4)}
+CONFIG_DIGESTS = EXPECTED_CONFIG_SHA256
 META_PORTS = {0: 26660, 1: 26662, 2: 26664, 3: 26666}
 DATA_PORTS = {0: 26661, 1: 26663, 2: 26665, 3: 26667}
 
@@ -92,7 +93,6 @@ def make_policy(*, loopback_only=True, participant_digests=None):
             pid: {"index": index, "config_digest": participant_digests[index]}
             for index, pid in PARTICIPANT_PIDS.items()
         },
-        expected_config_digests=CONFIG_DIGESTS,
         namespace_loopback_only=loopback_only,
     )
 
@@ -372,11 +372,17 @@ def test_ordinary_dds_message_passes_but_scm_rights_is_journaled():
     assert policy.journal.first_violation.reason == "PROHIBITED_FD_TRANSFER"
 
 
-def test_pidfd_acquisition_and_bad_marker_identity_fail_closed():
+def test_bad_marker_is_trace_integrity_not_a_network_violation():
     policy = make_policy()
     records = Records()
     bad_marker = policy.feed(records.marker("BEGIN", pid=91))
-    assert (bad_marker.status, bad_marker.reason) == ("FAIL", "INVALID_MARKER")
+    assert (bad_marker.status, bad_marker.reason) == ("PASS", "OK")
+    assert policy.trace_integrity_error == "INVALID_MARKER"
+    assert policy.journal.violation_count == 0
+    assert policy.finalize(trace_integrity_ok=False).status == "SKIPPED"
+
+
+def test_pidfd_acquisition_is_a_network_policy_violation():
 
     policy = make_policy()
     records = Records()
@@ -420,24 +426,35 @@ def test_clean_finalize_passes_or_skips_when_trace_is_unavailable():
     )
 
 
-def test_participant_config_digest_and_marker_window_are_exact():
-    for mutate in ("pid", "digest", "token", "phase"):
+def test_participant_pid_and_pinned_config_digest_are_exact():
+    for mutate in ("pid", "digest"):
         policy = make_policy()
         records = Records()
-        if mutate == "token":
-            decision = policy.feed(records.marker("BEGIN", token="ffffffffffff"))
-        elif mutate == "phase":
-            decision = policy.feed(records.marker("END"))
-        else:
-            if mutate == "digest":
-                bad_digests = dict(CONFIG_DIGESTS)
-                bad_digests[0] = "f" * 64
-                policy = make_policy(participant_digests=bad_digests)
-                records = Records()
-            open_window(policy, records)
-            pid = 999 if mutate == "pid" else PARTICIPANT_PIDS[0]
-            decision = policy.feed(records.socket(pid, 7))
+        if mutate == "digest":
+            bad_digests = dict(CONFIG_DIGESTS)
+            bad_digests[0] = "f" * 64
+            policy = make_policy(participant_digests=bad_digests)
+            records = Records()
+        open_window(policy, records)
+        pid = 999 if mutate == "pid" else PARTICIPANT_PIDS[0]
+        decision = policy.feed(records.socket(pid, 7))
         assert decision.status == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"phase": "BEGIN", "token": "ffffffffffff"},
+        {"phase": "END", "token": TOKEN},
+    ],
+)
+def test_invalid_marker_sequence_only_poison_trace_integrity(marker):
+    policy = make_policy()
+    records = Records()
+    decision = policy.feed(records.make(COORDINATOR_PID, "prctl", marker=marker))
+    assert (decision.status, decision.reason) == ("PASS", "OK")
+    assert policy.trace_integrity_error == "INVALID_MARKER"
+    assert policy.journal.violation_count == 0
 
 
 @pytest.mark.parametrize(
@@ -532,7 +549,74 @@ def test_missing_or_nonmonotonic_marker_indices_fail_closed():
     open_window(policy, records)
     invalid_end = records.marker("END")
     invalid_end["entry_index"] = 0
-    assert policy.feed(invalid_end).reason == "INVALID_MARKER"
+    assert policy.feed(invalid_end).status == "PASS"
+    assert policy.trace_integrity_error == "INVALID_MARKER"
+    assert policy.journal.violation_count == 0
+
+
+def test_exec_unshares_clone_files_table_before_closing_cloexec_entries():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    parent = PARTICIPANT_PIDS[0]
+    assert policy.feed(records.socket(parent, 7)).status == "PASS"
+    assert (
+        policy.feed(
+            records.make(
+                parent,
+                "clone",
+                result=200,
+                transition={
+                    "operation": "clone",
+                    "child_pid": 200,
+                    "fd_table": "shared",
+                    "flags": ["CLONE_VM", "CLONE_FILES", "SIGCHLD"],
+                },
+            )
+        ).status
+        == "PASS"
+    )
+    policy.feed(
+        records.make(
+            200,
+            "execve",
+            transition={"operation": "exec", "cloexec_fds": "closed"},
+        )
+    )
+    assert policy.provenance.describe(200, 7) is None
+    assert policy.provenance.describe(parent, 7) is not None
+
+
+@pytest.mark.parametrize(
+    "group,interface,expected",
+    [
+        ("239.255.0.1", "127.0.0.1", "PASS"),
+        ("224.0.0.1", "127.0.0.1", "FAIL"),
+        ("239.255.0.1", "0.0.0.0", "FAIL"),
+        ("239.255.0.1", "192.0.2.10", "FAIL"),
+    ],
+)
+def test_multicast_membership_option_is_value_bound(group, interface, expected):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, decision = bound_udp(policy, records, 0, ("0.0.0.0", 26650))
+    assert decision.status == "PASS"
+    decision = policy.feed(
+        records.make(
+            pid,
+            "setsockopt",
+            transition={
+                "operation": "setsockopt",
+                "fd": {"fd": 7},
+                "level": "SOL_IP",
+                "option": "IP_ADD_MEMBERSHIP",
+                "length": 8,
+                "membership": {"group": group, "interface": interface},
+            },
+        )
+    )
+    assert decision.status == expected
 
 
 def test_meta_and_data_port_sets_are_closed_and_disjoint():
