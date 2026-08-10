@@ -229,7 +229,7 @@ def test_socket_option_setup_retains_identity_level_option_and_length_only():
     source = _line(
         'setsockopt(3<UDP:[127.0.0.1:7400]>, SOL_SOCKET, SO_REUSEADDR, "OPTION_PAYLOAD_SECRET", 4)'
     ) + _line(
-        "getsockopt(3<UDP:[127.0.0.1:7400]>, IPPROTO_IP, IP_MULTICAST_TTL, [1], [4])",
+        "getsockopt(3<UDP:[127.0.0.1:7400]>, SOL_IP, IP_MULTICAST_TTL, [1], [4])",
         timestamp="1700000050.000002",
     )
     records = normalize_bytes(source)
@@ -244,7 +244,7 @@ def test_socket_option_setup_retains_identity_level_option_and_length_only():
         "length": 4,
     }
     assert records[1]["transition"]["operation"] == "getsockopt"
-    assert records[1]["transition"]["level"] == "IPPROTO_IP"
+    assert records[1]["transition"]["level"] == "SOL_IP"
     assert records[1]["transition"]["option"] == "IP_MULTICAST_TTL"
     assert "OPTION_PAYLOAD_SECRET" not in canonical_ndjson(records)
 
@@ -282,3 +282,9 @@ def test_pinned_test_manifest_includes_all_trace_revision_suites():
     assert "scripts/holoagent0_setup/tests/test_trace_normalizer_revision3.py" in paths
     assert "scripts/holoagent0_setup/tests/test_trace_normalizer_revision4.py" in paths
     assert len(paths) == len(set(paths))
+    repository_root = ROOT.parents[1]
+    discovered = {
+        path.relative_to(repository_root).as_posix()
+        for path in (ROOT / "tests").glob("test_*.py")
+    }
+    assert set(paths) == discovered

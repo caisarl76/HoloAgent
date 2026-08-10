@@ -50,7 +50,10 @@ DECODED_ADDRESS_SYSCALLS = frozenset(
 )
 
 _PREFIX = re.compile(r"^([1-9][0-9]*)( +)([0-9]+(?:\.[0-9]+)?) (.+)$")
-_CALL = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\((.*)\) = (.+) <([0-9]+(?:\.[0-9]+)?)>$")
+_CALL = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_]*)\((.*)\)( +)= (.+) <([0-9]+(?:\.[0-9]+)?)>$"
+)
+_RESULT_TAIL = re.compile(r"^(.*\))( +)= (.+) <([0-9]+(?:\.[0-9]+)?)>$")
 _UNFINISHED = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\((.*)<unfinished \.\.\.>$")
 _RESUMED = re.compile(r"^<\.\.\. ([A-Za-z_][A-Za-z0-9_]*) resumed>(.*)$")
 _SIGNAL = re.compile(r"^--- (SIG[A-Z0-9]+) \{.*\} ---$")
@@ -65,28 +68,296 @@ _FLAGGED_RESULT = re.compile(
     rf"^({_NUMBER_TEXT}) \(flags ([A-Z][A-Z0-9_]*(?:\|[A-Z][A-Z0-9_]*)*)\)$"
 )
 
-_SOCKET_DOMAINS = frozenset({"AF_INET", "AF_INET6", "AF_NETLINK", "AF_UNIX"})
+_SOCKET_DOMAINS = frozenset(
+    {
+        "AF_ALG",
+        "AF_APPLETALK",
+        "AF_ASH",
+        "AF_ATMPVC",
+        "AF_ATMSVC",
+        "AF_AX25",
+        "AF_BLUETOOTH",
+        "AF_BRIDGE",
+        "AF_CAIF",
+        "AF_CAN",
+        "AF_DECnet",
+        "AF_ECONET",
+        "AF_IEEE802154",
+        "AF_INET",
+        "AF_INET6",
+        "AF_IPX",
+        "AF_IRDA",
+        "AF_ISDN",
+        "AF_IUCV",
+        "AF_KCM",
+        "AF_KEY",
+        "AF_LLC",
+        "AF_MCTP",
+        "AF_MPLS",
+        "AF_NETBEUI",
+        "AF_NETLINK",
+        "AF_NETROM",
+        "AF_NFC",
+        "AF_PACKET",
+        "AF_PHONET",
+        "AF_PPPOX",
+        "AF_QIPCRTR",
+        "AF_RDS",
+        "AF_ROSE",
+        "AF_RXRPC",
+        "AF_SECURITY",
+        "AF_SMC",
+        "AF_SNA",
+        "AF_TIPC",
+        "AF_UNIX",
+        "AF_UNSPEC",
+        "AF_VSOCK",
+        "AF_WANPIPE",
+        "AF_X25",
+        "AF_XDP",
+    }
+)
 _SOCKET_BASE_TYPES = frozenset(
-    {"SOCK_DGRAM", "SOCK_RAW", "SOCK_SEQPACKET", "SOCK_STREAM"}
+    {
+        "SOCK_DCCP",
+        "SOCK_DGRAM",
+        "SOCK_PACKET",
+        "SOCK_RAW",
+        "SOCK_RDM",
+        "SOCK_SEQPACKET",
+        "SOCK_STREAM",
+    }
 )
 _SOCKET_TYPE_FLAGS = frozenset({"SOCK_CLOEXEC", "SOCK_NONBLOCK"})
 _INET_SOCKET_PROTOCOLS = frozenset(
     {
+        "IPPROTO_AH",
+        "IPPROTO_BEETPH",
+        "IPPROTO_COMP",
+        "IPPROTO_DCCP",
+        "IPPROTO_DSTOPTS",
+        "IPPROTO_EGP",
+        "IPPROTO_ENCAP",
+        "IPPROTO_ESP",
+        "IPPROTO_ETHERNET",
+        "IPPROTO_FRAGMENT",
+        "IPPROTO_GRE",
         "IPPROTO_ICMP",
         "IPPROTO_ICMPV6",
+        "IPPROTO_IDP",
+        "IPPROTO_IGMP",
         "IPPROTO_IP",
+        "IPPROTO_IPIP",
+        "IPPROTO_IPV6",
+        "IPPROTO_L2TP",
+        "IPPROTO_MH",
+        "IPPROTO_MPLS",
+        "IPPROTO_MPTCP",
+        "IPPROTO_MTP",
+        "IPPROTO_NONE",
+        "IPPROTO_PIM",
+        "IPPROTO_PUP",
         "IPPROTO_RAW",
+        "IPPROTO_ROUTING",
+        "IPPROTO_RSVP",
         "IPPROTO_SCTP",
         "IPPROTO_TCP",
+        "IPPROTO_TP",
         "IPPROTO_UDP",
+        "IPPROTO_UDPLITE",
     }
 )
-_NETLINK_SOCKET_PROTOCOLS = frozenset({"NETLINK_ROUTE", "NETLINK_SOCK_DIAG"})
+_NETLINK_SOCKET_PROTOCOLS = frozenset(
+    {
+        "NETLINK_AUDIT",
+        "NETLINK_CONNECTOR",
+        "NETLINK_CRYPTO",
+        "NETLINK_DNRTMSG",
+        "NETLINK_ECRYPTFS",
+        "NETLINK_FIB_LOOKUP",
+        "NETLINK_FIREWALL",
+        "NETLINK_GENERIC",
+        "NETLINK_IP6_FW",
+        "NETLINK_ISCSI",
+        "NETLINK_KOBJECT_UEVENT",
+        "NETLINK_NETFILTER",
+        "NETLINK_NFLOG",
+        "NETLINK_RDMA",
+        "NETLINK_ROUTE",
+        "NETLINK_SCSITRANSPORT",
+        "NETLINK_SELINUX",
+        "NETLINK_SMC",
+        "NETLINK_SOCK_DIAG",
+        "NETLINK_UNUSED",
+        "NETLINK_USERSOCK",
+        "NETLINK_XFRM",
+    }
+)
+_FAMILY_SOCKET_PROTOCOLS = {
+    "AF_BLUETOOTH": frozenset(
+        {
+            "BTPROTO_AVDTP",
+            "BTPROTO_BNEP",
+            "BTPROTO_CMTP",
+            "BTPROTO_HCI",
+            "BTPROTO_HIDP",
+            "BTPROTO_L2CAP",
+            "BTPROTO_RFCOMM",
+            "BTPROTO_SCO",
+        }
+    ),
+    "AF_CAN": frozenset(
+        {
+            "CAN_BCM",
+            "CAN_ISOTP",
+            "CAN_J1939",
+            "CAN_MCNET",
+            "CAN_RAW",
+            "CAN_TP16",
+            "CAN_TP20",
+        }
+    ),
+    "AF_CAIF": frozenset(
+        {
+            "CAIFPROTO_AT",
+            "CAIFPROTO_DATAGRAM",
+            "CAIFPROTO_DATAGRAM_LOOP",
+            "CAIFPROTO_DEBUG",
+            "CAIFPROTO_RFM",
+            "CAIFPROTO_UTIL",
+        }
+    ),
+    "AF_IRDA": frozenset({"IRDAPROTO_ULTRA", "IRDAPROTO_UNITDATA"}),
+    "AF_ISDN": frozenset(
+        {
+            "ISDN_P_BASE",
+            "ISDN_P_B_HDLC",
+            "ISDN_P_B_L2DSP",
+            "ISDN_P_B_L2DSPHDLC",
+            "ISDN_P_B_L2DTMF",
+            "ISDN_P_B_RAW",
+            "ISDN_P_B_X75SLP",
+            "ISDN_P_LAPD_NT",
+            "ISDN_P_LAPD_TE",
+            "ISDN_P_NT_E1",
+            "ISDN_P_NT_S0",
+            "ISDN_P_TE_E1",
+            "ISDN_P_TE_S0",
+        }
+    ),
+    "AF_KCM": frozenset({"KCMPROTO_CONNECTED"}),
+    "AF_NFC": frozenset({"NFC_SOCKPROTO_LLCP", "NFC_SOCKPROTO_RAW"}),
+    "AF_PHONET": frozenset({"PN_PROTO_PHONET", "PN_PROTO_PIPE", "PN_PROTO_TRANSPORT"}),
+    "AF_SMC": frozenset({"SMCPROTO_SMC", "SMCPROTO_SMC6"}),
+}
+_PACKET_PROTOCOLS = frozenset(
+    {
+        "ETH_P_8021Q",
+        "ETH_P_ALL",
+        "ETH_P_ARP",
+        "ETH_P_IP",
+        "ETH_P_IPV6",
+        "ETH_P_LLDP",
+        "ETH_P_LOOPBACK",
+        "ETH_P_MPLS_MC",
+        "ETH_P_MPLS_UC",
+        "ETH_P_RARP",
+    }
+)
+_INET_PROVENANCE_V4 = frozenset(
+    {"DCCP", "L2TP/IP", "PING", "RAW", "SCTP", "TCP", "UDP", "UDPLITE"}
+)
+_INET_PROVENANCE_V6 = frozenset(
+    {
+        "DCCPv6",
+        "L2TP/IPv6",
+        "PINGv6",
+        "RAWv6",
+        "SCTPv6",
+        "TCPv6",
+        "UDPv6",
+        "UDPLITEv6",
+    }
+)
+_SOCKET_PROVENANCE_PROTOCOLS = (
+    _INET_PROVENANCE_V4
+    | _INET_PROVENANCE_V6
+    | frozenset({"NETLINK", "PACKET", "UNIX", "UNIX-STREAM"})
+)
 _RESTART_TEXT = {
     "ERESTARTSYS": "To be restarted if SA_RESTART is set",
     "ERESTARTNOINTR": "To be restarted",
     "ERESTARTNOHAND": "To be restarted if no handler",
     "ERESTART_RESTARTBLOCK": "Interrupted by signal",
+}
+_SOCKET_OPTIONS = {
+    "SOL_IP": frozenset(
+        {
+            "IP_ADD_MEMBERSHIP",
+            "IP_DROP_MEMBERSHIP",
+            "IP_FREEBIND",
+            "IP_MULTICAST_IF",
+            "IP_MULTICAST_LOOP",
+            "IP_MULTICAST_TTL",
+            "IP_PKTINFO",
+            "IP_RECVERR",
+            "IP_RECVTTL",
+            "IP_TOS",
+            "IP_TTL",
+        }
+    ),
+    "SOL_IPV6": frozenset(
+        {
+            "IPV6_ADD_MEMBERSHIP",
+            "IPV6_DROP_MEMBERSHIP",
+            "IPV6_MULTICAST_HOPS",
+            "IPV6_MULTICAST_IF",
+            "IPV6_MULTICAST_LOOP",
+            "IPV6_RECVERR",
+            "IPV6_RECVHOPLIMIT",
+            "IPV6_RECVPKTINFO",
+            "IPV6_UNICAST_HOPS",
+            "IPV6_V6ONLY",
+        }
+    ),
+    "SOL_TCP": frozenset(
+        {
+            "TCP_CORK",
+            "TCP_DEFER_ACCEPT",
+            "TCP_FASTOPEN",
+            "TCP_KEEPCNT",
+            "TCP_KEEPIDLE",
+            "TCP_KEEPINTVL",
+            "TCP_NODELAY",
+            "TCP_QUICKACK",
+            "TCP_SYNCNT",
+            "TCP_USER_TIMEOUT",
+        }
+    ),
+    "SOL_UDP": frozenset({"UDP_CORK", "UDP_SEGMENT"}),
+    "SOL_UDPLITE": frozenset({"UDPLITE_RECV_CSCOV", "UDPLITE_SEND_CSCOV"}),
+    "SOL_SOCKET": frozenset(
+        {
+            "SO_BROADCAST",
+            "SO_DONTROUTE",
+            "SO_ERROR",
+            "SO_KEEPALIVE",
+            "SO_LINGER",
+            "SO_MARK",
+            "SO_OOBINLINE",
+            "SO_RCVBUF",
+            "SO_RCVLOWAT",
+            "SO_RCVTIMEO",
+            "SO_REUSEADDR",
+            "SO_REUSEPORT",
+            "SO_SNDBUF",
+            "SO_SNDLOWAT",
+            "SO_SNDTIMEO",
+            "SO_TIMESTAMP",
+            "SO_TIMESTAMPNS",
+            "SO_TYPE",
+        }
+    ),
 }
 _FCNTL_STATUS_FLAGS = frozenset(
     {
@@ -195,12 +466,12 @@ def _provenance(value: str) -> dict[str, object]:
     anon = re.fullmatch(r"anon_inode:\[([A-Za-z0-9_-]+)\]", value)
     if anon is not None:
         return {"kind": "anon_inode", "type": anon.group(1)}
-    annotated_socket = re.fullmatch(
-        r"(TCP|TCPv6|UDP|UDPv6|UNIX|NETLINK):\[(.*)\]", value
-    )
+    annotated_socket = re.fullmatch(r"([A-Za-z0-9/-]+):\[(.*)\]", value)
     if annotated_socket is not None:
         protocol, annotation = annotated_socket.groups()
-        if protocol in {"TCP", "UDP"}:
+        if protocol not in _SOCKET_PROVENANCE_PROTOCOLS:
+            raise _fail("unsupported-fd-provenance")
+        if protocol in _INET_PROVENANCE_V4:
             endpoint = r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+"
             if not (
                 re.fullmatch(r"[0-9]+", annotation)
@@ -216,7 +487,7 @@ def _provenance(value: str) -> dict[str, object]:
                     raise _fail("unsupported-fd-provenance") from error
                 if int(port) > 65535:
                     raise _fail("unsupported-fd-provenance")
-        elif protocol in {"TCPv6", "UDPv6"}:
+        elif protocol in _INET_PROVENANCE_V6:
             endpoint = r"\[([0-9A-Fa-f:.]+)\]:([0-9]+)"
             if re.fullmatch(r"[0-9]+", annotation):
                 pass
@@ -234,7 +505,7 @@ def _provenance(value: str) -> dict[str, object]:
                         raise _fail("unsupported-fd-provenance") from error
                     if int(values[index + 1]) > 65535:
                         raise _fail("unsupported-fd-provenance")
-        elif protocol == "UNIX":
+        elif protocol in {"UNIX", "UNIX-STREAM"}:
             unix_name = r'@?"(?:[^"\\]|\\.)*"'
             if (
                 re.fullmatch(r"[0-9]+", annotation) is None
@@ -242,7 +513,12 @@ def _provenance(value: str) -> dict[str, object]:
                 is None
             ):
                 raise _fail("unsupported-fd-provenance")
-        elif re.fullmatch(r"(?:[0-9]+|[A-Z][A-Z0-9_]*:[0-9]+)", annotation) is None:
+        elif (
+            protocol == "NETLINK"
+            and re.fullmatch(r"(?:[0-9]+|[A-Z][A-Z0-9_]*:[0-9]+)", annotation) is None
+        ):
+            raise _fail("unsupported-fd-provenance")
+        elif protocol == "PACKET" and re.fullmatch(r"[0-9]+", annotation) is None:
             raise _fail("unsupported-fd-provenance")
         return {"kind": "socket", "protocol": protocol}
     if value.startswith("/"):
@@ -349,9 +625,17 @@ def _socket_type(value: str) -> list[str]:
 def _socket_protocol(value: str, domain: str) -> int | str:
     if value == "0":
         return 0
-    allowed = (
-        _NETLINK_SOCKET_PROTOCOLS if domain == "AF_NETLINK" else _INET_SOCKET_PROTOCOLS
-    )
+    if domain in {"AF_INET", "AF_INET6"}:
+        allowed = _INET_SOCKET_PROTOCOLS
+    elif domain == "AF_NETLINK":
+        allowed = _NETLINK_SOCKET_PROTOCOLS
+    elif domain == "AF_PACKET":
+        packet = re.fullmatch(r"htons\((ETH_P_[A-Z0-9_]+)\)", value)
+        if packet is None or packet.group(1) not in _PACKET_PROTOCOLS:
+            raise _fail("unsupported-packet-socket-protocol")
+        return packet.group(1)
+    else:
+        allowed = _FAMILY_SOCKET_PROTOCOLS.get(domain, frozenset())
     if value not in allowed:
         raise _fail("unsupported-socket-protocol")
     return value
@@ -465,7 +749,7 @@ def _address(value: str) -> dict[str, object] | None:
         }
     fields = _fields(value, "sockaddr-grammar")
     family = fields.get("sa_family")
-    if family not in {"AF_INET", "AF_UNIX"}:
+    if family not in {"AF_INET", "AF_NETLINK", "AF_PACKET", "AF_UNIX"}:
         raise _fail("unsupported-socket-family")
     result: dict[str, object] = {"family": family}
     if family == "AF_INET":
@@ -479,14 +763,73 @@ def _address(value: str) -> dict[str, object] | None:
             ip = str(ipaddress.IPv4Address(address.group(1)))
         except ipaddress.AddressValueError as error:
             raise _fail("sockaddr-inet-address") from error
+    elif family == "AF_NETLINK":
+        if set(fields) != {"sa_family", "nl_pid", "nl_groups"}:
+            raise _fail("sockaddr-netlink-fields")
+        pid = _integer(fields["nl_pid"], "sockaddr-netlink-pid")
+        if (
+            pid < 0
+            or pid > 0xFFFFFFFF
+            or re.fullmatch(r"[0-9a-f]{8}", fields["nl_groups"]) is None
+        ):
+            raise _fail("sockaddr-netlink-values")
+        return {
+            "family": family,
+            "pid": pid,
+            "groups": int(fields["nl_groups"], 16),
+        }
+    elif family == "AF_PACKET":
+        expected = {
+            "sa_family",
+            "sll_protocol",
+            "sll_ifindex",
+            "sll_hatype",
+            "sll_pkttype",
+            "sll_halen",
+            "sll_addr",
+        }
+        if set(fields) != expected:
+            raise _fail("sockaddr-packet-fields")
+        protocol = re.fullmatch(r"htons\((ETH_P_[A-Z0-9_]+)\)", fields["sll_protocol"])
+        if protocol is None or protocol.group(1) not in _PACKET_PROTOCOLS:
+            raise _fail("sockaddr-packet-protocol")
+        _integer(fields["sll_ifindex"], "sockaddr-packet-ifindex")
+        if fields["sll_hatype"] not in {"ARPHRD_ETHER", "ARPHRD_LOOPBACK"}:
+            raise _fail("sockaddr-packet-hatype")
+        if fields["sll_pkttype"] not in {
+            "PACKET_BROADCAST",
+            "PACKET_FASTROUTE",
+            "PACKET_HOST",
+            "PACKET_KERNEL",
+            "PACKET_LOOPBACK",
+            "PACKET_MULTICAST",
+            "PACKET_OTHERHOST",
+            "PACKET_OUTGOING",
+            "PACKET_USER",
+        }:
+            raise _fail("sockaddr-packet-type")
+        address_length = _integer(fields["sll_halen"], "sockaddr-packet-length")
+        address_bytes = _vector(fields["sll_addr"], "sockaddr-packet-address")
+        if (
+            address_length > 8
+            or len(address_bytes) != address_length
+            or any(
+                re.fullmatch(r"0x[0-9a-f]{2}", byte) is None for byte in address_bytes
+            )
+        ):
+            raise _fail("sockaddr-packet-address")
+        return {"family": family, "protocol": protocol.group(1)}
     else:
         if set(fields) == {"sa_family"}:
             return result
         if set(fields) != {"sa_family", "sun_path"}:
             raise _fail("sockaddr-unix-fields")
-        if re.fullmatch(r'"(?:[^"\\]|\\.)*"', fields["sun_path"]) is None:
+        path = fields["sun_path"]
+        if re.fullmatch(r'@?"(?:[^"\\]|\\.)*"', path) is None:
             raise _fail("sockaddr-unix-path")
         result["path"] = {"kind": "unix"}
+        if path.startswith("@"):
+            result["path"]["abstract"] = True
         return result
     port_value = int(port.group(1))
     if port_value > 65535:
@@ -729,7 +1072,12 @@ _TRANSITION_SYSCALLS = frozenset(
         "accept4",
         "bind",
         "connect",
+        "getpeername",
         "getsockname",
+        "getsockopt",
+        "listen",
+        "setsockopt",
+        "shutdown",
         "dup",
         "dup2",
         "dup3",
@@ -823,21 +1171,51 @@ def _transition_metadata(
             fd=_fd(arguments[0], f"{name}-fd"),
             address=_address(arguments[1]),
         )
-    elif name == "getsockname":
-        _arity(arguments, 3, "getsockname-arity")
-        transition["fd"] = _fd(arguments[0], "getsockname-fd")
+    elif name in {"getpeername", "getsockname"}:
+        _arity(arguments, 3, f"{name}-arity")
+        transition["fd"] = _fd(arguments[0], f"{name}-fd")
         if arguments[1].startswith("{") or arguments[1] == "NULL":
             address = _address(arguments[1])
             if address is not None:
                 transition["address"] = address
             if arguments[1] == "NULL":
                 if arguments[2] != "NULL":
-                    raise _fail("getsockname-sockaddr-length")
-            elif _output_length(arguments[2], "getsockname-sockaddr-length") is None:
-                raise _fail("getsockname-sockaddr-length")
+                    raise _fail(f"{name}-sockaddr-length")
+            elif _output_length(arguments[2], f"{name}-sockaddr-length") is None:
+                raise _fail(f"{name}-sockaddr-length")
         else:
-            _output_pointer(arguments[1], "getsockname-address-pointer")
-            _output_length(arguments[2], "getsockname-length-pointer")
+            _output_pointer(arguments[1], f"{name}-address-pointer")
+            _output_length(arguments[2], f"{name}-length-pointer")
+    elif name in {"getsockopt", "setsockopt"}:
+        _arity(arguments, 5, f"{name}-arity")
+        level = arguments[1]
+        option = arguments[2]
+        if level not in _SOCKET_OPTIONS or option not in _SOCKET_OPTIONS[level]:
+            raise _fail(f"unsupported-{name}-option")
+        transition.update(
+            fd=_fd(arguments[0], f"{name}-fd"),
+            level=level,
+            option=option,
+        )
+        if name == "setsockopt":
+            length = _integer(arguments[4], "setsockopt-length")
+        else:
+            length = _output_length(arguments[4], "getsockopt-length")
+        if length is not None and length < 0:
+            raise _fail(f"{name}-length")
+        if length is not None:
+            transition["length"] = length
+    elif name == "listen":
+        _arity(arguments, 2, "listen-arity")
+        transition.update(
+            fd=_fd(arguments[0], "listen-fd"),
+            backlog=_integer(arguments[1], "listen-backlog"),
+        )
+    elif name == "shutdown":
+        _arity(arguments, 2, "shutdown-arity")
+        if arguments[1] not in {"SHUT_RD", "SHUT_RDWR", "SHUT_WR"}:
+            raise _fail("shutdown-how")
+        transition.update(fd=_fd(arguments[0], "shutdown-fd"), how=arguments[1])
     elif name == "dup":
         _arity(arguments, 1, "dup-arity")
         transition["source_fd"] = _fd(arguments[0], "dup-source-fd")
@@ -976,6 +1354,18 @@ def _transition_metadata(
     return transition
 
 
+def _marker_metadata(arguments: list[str]) -> dict[str, str] | None:
+    if len(arguments) != 2 or arguments[0] != "PR_SET_NAME":
+        return None
+    marker = re.fullmatch(r'"H0([BE])([0-9a-f]{12})"', arguments[1])
+    if marker is None:
+        return None
+    return {
+        "phase": "BEGIN" if marker.group(1) == "B" else "END",
+        "token": marker.group(2),
+    }
+
+
 class TraceNormalizer:
     """Incrementally normalize one canonical linux-x86_64 strace 6.6 stream."""
 
@@ -1076,6 +1466,7 @@ class TraceNormalizer:
         if padding != " " * max(1, 6 - len(pid_text)):
             raise _fail("pid-prefix-framing")
         pid = int(pid_text)
+        prefix_columns = len(line) - len(body)
         if "runs in " in body and " bit mode" in body:
             raise _fail("unsupported-personality")
 
@@ -1104,10 +1495,19 @@ class TraceNormalizer:
                 raise _fail("resumed-syscall-mismatch")
             exit_index = self._exits
             self._exits += 1
+            result_tail = _RESULT_TAIL.fullmatch(body)
+            if result_tail is None:
+                raise _fail("resumed-result-grammar")
             combined = f"{pending.syscall}({pending.arguments_prefix}{resumed.group(2)}"
             return [
                 self._decode_complete(
-                    pid, pending.timestamp, combined, pending.entry_index, exit_index
+                    pid,
+                    pending.timestamp,
+                    combined,
+                    pending.entry_index,
+                    exit_index,
+                    prefix_columns=prefix_columns,
+                    alignment_close_column=prefix_columns + len(result_tail.group(1)),
                 )
             ]
 
@@ -1156,17 +1556,43 @@ class TraceNormalizer:
         exit_index = self._exits
         self._entries += 1
         self._exits += 1
-        return [self._decode_complete(pid, timestamp, body, entry_index, exit_index)]
+        return [
+            self._decode_complete(
+                pid,
+                timestamp,
+                body,
+                entry_index,
+                exit_index,
+                prefix_columns=prefix_columns,
+            )
+        ]
 
     def _decode_complete(
-        self, pid: int, timestamp: str, body: str, entry_index: int, exit_index: int
+        self,
+        pid: int,
+        timestamp: str,
+        body: str,
+        entry_index: int,
+        exit_index: int,
+        *,
+        prefix_columns: int,
+        alignment_close_column: int | None = None,
     ) -> dict[str, object]:
         if "..." in body:
             raise _fail("abbreviated-field")
         call = _CALL.fullmatch(body)
         if call is None:
             raise _fail("syscall-grammar")
-        name, arguments_text, result_text, duration = call.groups()
+        name, arguments_text, result_padding, result_text, duration = call.groups()
+        close_column = (
+            prefix_columns + call.start(3)
+            if alignment_close_column is None
+            else alignment_close_column
+        )
+        if result_padding != " " * max(1, 40 - close_column):
+            raise _fail("result-alignment")
+        if re.fullmatch(r"syscall_0x[0-9a-f]+", name) is not None:
+            raise _fail("unsupported-native-syscall")
         arguments = _split_arguments(arguments_text)
         timeout_left: dict[str, int] | None = None
         left = re.fullmatch(
@@ -1192,6 +1618,10 @@ class TraceNormalizer:
             "exit_index": exit_index,
             "syscall": name,
         }
+        if name == "prctl":
+            marker = _marker_metadata(arguments)
+            if marker is not None:
+                record["marker"] = marker
         if name in RAW_PAYLOAD_SYSCALLS:
             result = _raw_result(result_text)
         elif name == "fcntl" and len(arguments) >= 2:

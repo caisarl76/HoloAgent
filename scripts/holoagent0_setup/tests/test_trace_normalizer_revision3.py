@@ -1,6 +1,7 @@
 import inspect
 import json
 from pathlib import Path
+import re
 
 import pytest
 
@@ -20,7 +21,16 @@ POLICY = ROOT / "policies/holoagent0-trace-tool-v1.json"
 def _line(pid: int, body: str, timestamp: str = "1700000040.000001") -> bytes:
     # strace 6.6 src/strace.c printleader(): dedicated -o and -f use "%-5u"
     # and then tprint_space(), for a minimum-width PID field plus one separator.
-    return f"{pid:<5} {timestamp} {body}\n".encode()
+    prefix = f"{pid:<5} {timestamp} "
+    result = re.fullmatch(r"(.*\))( +)= (.*)", body)
+    if result is not None:
+        body = (
+            result.group(1)
+            + " " * max(1, 40 - len(prefix) - len(result.group(1)))
+            + "= "
+            + result.group(3)
+        )
+    return f"{prefix}{body}\n".encode()
 
 
 def _require_record_sink():

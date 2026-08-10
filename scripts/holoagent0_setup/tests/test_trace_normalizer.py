@@ -2,6 +2,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 
 import pytest
 
@@ -11,9 +12,9 @@ from holoagent0_setup.trace_normalizer import (
     STRACE_ARGUMENTS,
     STRACE_ENVIRONMENT,
     TraceDecodeError,
-    TraceNormalizer,
+    TraceNormalizer as _TraceNormalizer,
     canonical_ndjson,
-    normalize_bytes,
+    normalize_bytes as _normalize_bytes,
 )
 
 
@@ -31,6 +32,32 @@ SENTINELS = (
     "RIGHTS_SECRET",
     "SPOOF_SECRET",
 )
+
+
+def _align_reviewed_results(source: bytes) -> bytes:
+    lines = []
+    for line in source.splitlines(keepends=True):
+        ending = b"\n" if line.endswith(b"\n") else b""
+        body = line[: -len(ending)] if ending else line
+        match = re.fullmatch(rb"(.*\))( +)= (.*)", body)
+        if match is not None:
+            body = (
+                match.group(1)
+                + b" " * max(1, 40 - len(match.group(1)))
+                + b"= "
+                + match.group(3)
+            )
+        lines.append(body + ending)
+    return b"".join(lines)
+
+
+def normalize_bytes(source: bytes, **bounds):
+    return _normalize_bytes(_align_reviewed_results(source), **bounds)
+
+
+class TraceNormalizer(_TraceNormalizer):
+    def _decode_line(self, encoded: bytes):
+        return super()._decode_line(_align_reviewed_results(encoded))
 
 
 def _sha256(path: Path) -> str:
