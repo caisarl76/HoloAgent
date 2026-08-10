@@ -933,19 +933,29 @@ class OwnedPathRegistry:
             self._close_entry(entry)
             raise PathIdentityError("owned directory disappeared")
         if not self._matches(current, entry) or not stat.S_ISDIR(current.st_mode):
-            if stat.S_ISLNK(current.st_mode):
-                os.unlink(entry.name, dir_fd=self.parent_fd)
-                os.fsync(self.parent_fd)
             self._close_entry(entry)
             raise PathIdentityError("owned directory identity changed")
         retained = os.fstat(entry.fd)
         if not self._matches(retained, entry):
             self._close_entry(entry)
             raise PathIdentityError("retained directory identity changed")
-        self._clear_directory(entry.fd)
-        os.rmdir(entry.name, dir_fd=self.parent_fd)
-        os.fsync(self.parent_fd)
-        self._close_entry(entry)
+        try:
+            self._clear_directory(entry.fd)
+            current = self._lstat(entry.name)
+            retained = os.fstat(entry.fd)
+            if (
+                current is None
+                or not stat.S_ISDIR(current.st_mode)
+                or not self._matches(current, entry)
+                or not self._matches(retained, entry)
+            ):
+                raise PathIdentityError(
+                    "owned directory identity changed after clearing"
+                )
+            os.rmdir(entry.name, dir_fd=self.parent_fd)
+            os.fsync(self.parent_fd)
+        finally:
+            self._close_entry(entry)
 
     def close(self) -> None:
         if self.parent_fd >= 0:
@@ -1782,6 +1792,9 @@ def _publish_install_directory_locked(
     _raise_if_interrupted(signal_latch)
     committed = False
     installed_fd = -1
+    marker_fd = -1
+    marker_device = None
+    marker_inode = None
     transition = PublicationTransition(
         "STAGED",
         str(destination),
@@ -1796,15 +1809,28 @@ def _publish_install_directory_locked(
         marker = _approval_payload(measurement, pins)
         marker_fd = os.open(
             APPROVAL_MARKER,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC,
             0o600,
             dir_fd=measurement.root_fd,
         )
-        try:
-            _write_fd(marker_fd, marker)
-            os.fsync(marker_fd)
-        finally:
-            os.close(marker_fd)
+        marker_value = os.fstat(marker_fd)
+        if not stat.S_ISREG(marker_value.st_mode):
+            raise PublicationError("approval marker is not a regular file")
+        marker_device = marker_value.st_dev
+        marker_inode = marker_value.st_ino
+        _write_fd(marker_fd, marker)
+        os.fchmod(marker_fd, 0o600)
+        os.fsync(marker_fd)
+        _verify_retained_marker_name(
+            measurement.root_fd,
+            marker_fd,
+            marker_device,
+            marker_inode,
+        )
         os.fsync(measurement.root_fd)
         _verify_approved_install_at(
             measurement.parent_fd,
@@ -1814,6 +1840,9 @@ def _publish_install_directory_locked(
             deadline=deadline,
             retained_elf_fd=measurement.elf_fd,
             elf_lock_held=True,
+            retained_marker_fd=marker_fd,
+            retained_marker_device=marker_device,
+            retained_marker_inode=marker_inode,
         )
         if before_rename is not None:
             before_rename(staged)
@@ -1851,6 +1880,9 @@ def _publish_install_directory_locked(
             deadline=deadline,
             retained_elf_fd=measurement.elf_fd,
             elf_lock_held=True,
+            retained_marker_fd=marker_fd,
+            retained_marker_device=marker_device,
+            retained_marker_inode=marker_inode,
         )
         _raise_if_interrupted(signal_latch)
         os.fsync(measurement.parent_fd)
@@ -1861,6 +1893,9 @@ def _publish_install_directory_locked(
                 _transition_marker_state(
                     installed_fd,
                     "ROLLBACK_PREPARED",
+                    retained_marker_fd=marker_fd,
+                    retained_marker_device=marker_device,
+                    retained_marker_inode=marker_inode,
                     rollback_state="PREPARED",
                 )
                 transition = PublicationTransition(
@@ -1910,6 +1945,8 @@ def _publish_install_directory_locked(
             "STAGED_INSTALL_NOT_PUBLISHED", transition=transition
         ) from error
     finally:
+        if marker_fd >= 0:
+            os.close(marker_fd)
         if installed_fd >= 0:
             os.close(installed_fd)
 
@@ -1930,35 +1967,82 @@ def _verify_retained_directory_name(parent_fd, name, retained_fd, device, inode)
         raise PublicationError("retained directory name changed")
 
 
-def _transition_marker_state(directory_fd, state, **fields):
+def _verify_retained_marker_name(
+    directory_fd,
+    retained_marker_fd,
+    retained_marker_device,
+    retained_marker_inode,
+):
+    if retained_marker_fd is None or retained_marker_fd < 0:
+        raise PublicationError("retained approval marker is unavailable")
+    if retained_marker_device is None or retained_marker_inode is None:
+        raise PublicationError("retained approval marker identity is unavailable")
+    try:
+        named = os.stat(
+            APPROVAL_MARKER,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        retained = os.fstat(retained_marker_fd)
+    except OSError as error:
+        raise PublicationError("approval marker identity changed") from error
+    expected = (retained_marker_device, retained_marker_inode)
+    if (
+        not stat.S_ISREG(named.st_mode)
+        or not stat.S_ISREG(retained.st_mode)
+        or (named.st_dev, named.st_ino) != expected
+        or (retained.st_dev, retained.st_ino) != expected
+    ):
+        raise PublicationError("approval marker identity changed")
+
+
+def _transition_marker_state(
+    directory_fd,
+    state,
+    *,
+    retained_marker_fd,
+    retained_marker_device,
+    retained_marker_inode,
+    **fields,
+):
     if state != "ROLLBACK_PREPARED":
         raise PublicationError("invalid rollback marker transition")
-    marker_fd = os.open(
-        APPROVAL_MARKER,
-        os.O_RDWR | os.O_NOFOLLOW,
-        dir_fd=directory_fd,
+    _verify_retained_marker_name(
+        directory_fd,
+        retained_marker_fd,
+        retained_marker_device,
+        retained_marker_inode,
     )
-    try:
-        value = os.fstat(marker_fd)
-        if not stat.S_ISREG(value.st_mode):
-            raise PublicationError("rollback marker identity changed")
-        payload = os.read(marker_fd, 8193)
-        if len(payload) > 8192:
-            raise PublicationError("oversized rollback marker")
-        marker = _closed_json(payload)
-        if marker.get("state") != "APPROVED":
-            raise PublicationError("invalid rollback marker source state")
-        marker["state"] = state
-        marker.update(fields)
-        encoded = (
-            json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode()
-        _write_fd(marker_fd, encoded)
-        os.fchmod(marker_fd, 0o600)
-        os.fsync(marker_fd)
-    finally:
-        os.close(marker_fd)
+    value = os.fstat(retained_marker_fd)
+    if not stat.S_ISREG(value.st_mode):
+        raise PublicationError("rollback marker identity changed")
+    payload = os.pread(retained_marker_fd, 8193, 0)
+    if len(payload) > 8192:
+        raise PublicationError("oversized rollback marker")
+    marker = _closed_json(payload)
+    if marker.get("state") != "APPROVED":
+        raise PublicationError("invalid rollback marker source state")
+    marker["state"] = state
+    marker.update(fields)
+    encoded = (
+        json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    _write_fd(retained_marker_fd, encoded)
+    os.fchmod(retained_marker_fd, 0o600)
+    os.fsync(retained_marker_fd)
+    _verify_retained_marker_name(
+        directory_fd,
+        retained_marker_fd,
+        retained_marker_device,
+        retained_marker_inode,
+    )
     os.fsync(directory_fd)
+    _verify_retained_marker_name(
+        directory_fd,
+        retained_marker_fd,
+        retained_marker_device,
+        retained_marker_inode,
+    )
 
 
 def verify_approved_install(destination, pins, runner, *, deadline):
@@ -1983,6 +2067,9 @@ def _verify_approved_install_at(
     deadline,
     retained_elf_fd=None,
     elf_lock_held=False,
+    retained_marker_fd=None,
+    retained_marker_device=None,
+    retained_marker_inode=None,
 ):
     installed_fd = os.open(
         destination_name,
@@ -1992,16 +2079,28 @@ def _verify_approved_install_at(
     bin_fd = marker_fd = elf_fd = -1
     try:
         installed = os.fstat(installed_fd)
-        marker_fd = os.open(
-            APPROVAL_MARKER, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=installed_fd
-        )
-        marker_value = os.fstat(marker_fd)
+        if retained_marker_fd is None:
+            marker_fd = os.open(
+                APPROVAL_MARKER,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=installed_fd,
+            )
+            marker_value = os.fstat(marker_fd)
+            payload = os.read(marker_fd, 8193)
+        else:
+            _verify_retained_marker_name(
+                installed_fd,
+                retained_marker_fd,
+                retained_marker_device,
+                retained_marker_inode,
+            )
+            marker_value = os.fstat(retained_marker_fd)
+            payload = os.pread(retained_marker_fd, 8193, 0)
         if (
             not stat.S_ISREG(marker_value.st_mode)
             or marker_value.st_mode & 0o777 != 0o600
         ):
             raise PublicationError("invalid approval marker")
-        payload = os.read(marker_fd, 8193)
         if len(payload) > 8192:
             raise PublicationError("oversized approval marker")
         marker = _closed_json(payload)
@@ -2031,6 +2130,13 @@ def _verify_approved_install_at(
             if retained_elf_fd is not None:
                 raise PublicationError("retained ELF requires an existing lock")
             _verify_elf_fd(elf_fd, pins, runner, deadline)
+        if retained_marker_fd is not None:
+            _verify_retained_marker_name(
+                installed_fd,
+                retained_marker_fd,
+                retained_marker_device,
+                retained_marker_inode,
+            )
     finally:
         for fd in (elf_fd, marker_fd, bin_fd, installed_fd):
             if fd >= 0:
@@ -2593,18 +2699,15 @@ def _bounded_file_measurement(fd, runner, *, phase, deadline):
 
 
 def cleanup_publication_stage(registry, entry, transition):
-    if transition is not None and transition.state == "PUBLISHED":
+    if transition is not None and transition.state in {
+        "PUBLISHED",
+        "ROLLBACK_PREPARED",
+    }:
+        registry.forget(entry)
         raise PublicationError(
             "published install has an unresolved cleanup transition",
             transition=transition,
         )
-    current = registry._lstat(entry.name)
-    if (
-        current is None
-        or not stat.S_ISDIR(current.st_mode)
-        or not registry._matches(current, entry)
-    ):
-        raise PathIdentityError("owned publication identity changed")
     registry.remove_tree(entry)
 
 
