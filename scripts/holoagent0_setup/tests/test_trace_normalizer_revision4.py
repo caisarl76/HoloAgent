@@ -70,7 +70,7 @@ def test_resumed_result_alignment_uses_the_actual_resumed_line_column():
 @pytest.mark.parametrize(("phase", "prefix"), [("BEGIN", "H0B"), ("END", "H0E")])
 def test_prctl_dds_markers_preserve_phase_token_and_ordering_fields(phase, prefix):
     token = "0123456789ab"
-    record = normalize_bytes(_line(f'prctl(PR_SET_NAME, "{prefix}{token}")'))[0]
+    record = normalize_bytes(_line(f'prctl(PR_SET_NAME, "{prefix}{token}"...)'))[0]
     assert record["marker"] == {"phase": phase, "token": token}
     assert {
         key: record[key] for key in ("pid", "entry_index", "exit_index", "result")
@@ -80,7 +80,7 @@ def test_prctl_dds_markers_preserve_phase_token_and_ordering_fields(phase, prefi
 def test_failed_marker_attempt_remains_visible_but_result_prevents_authorization():
     record = normalize_bytes(
         _line(
-            'prctl(PR_SET_NAME, "H0B0123456789ab")',
+            'prctl(PR_SET_NAME, "H0B0123456789ab"...)',
             "-1 EPERM (Operation not permitted)",
         )
     )[0]
