@@ -582,6 +582,182 @@ def test_concurrent_duplicate_requests_authorize_exactly_one_without_loser_mutat
     assert forwarded == [(identity.pgid, "INT")]
 
 
+def test_trace_verifier_reentrant_failure_cannot_be_overwritten_by_ready(identity):
+    holder = {}
+
+    def verifier(_evidence):
+        holder["coordinator"].fail("trace verifier reentry")
+        return True
+
+    coordinator = _coordinator(identity, verifier=verifier)
+    holder["coordinator"] = coordinator
+    supervisor = _supervisor(identity)
+    request, _acceptance = _round_trip(coordinator, supervisor)
+
+    with pytest.raises(SignalHandoffError):
+        coordinator.finalize_ready(_evidence(request))
+
+    snapshot = coordinator.snapshot()
+    assert snapshot.state == snapshot.terminal_state == "FAILED"
+    assert snapshot.acceptance_validated
+    assert snapshot.unblock_count == 1
+    assert snapshot.functional_count == 0
+    assert snapshot.events[-1].name == "failed:trace verifier reentry"
+    assert all(event.name != "terminal_ready" for event in snapshot.events)
+
+
+@pytest.mark.parametrize("reentry_call", [1, 2])
+def test_identity_validator_reentry_preserves_acceptance_boundary(
+    identity, reentry_call
+):
+    holder = {}
+    calls = 0
+
+    def identity_validator(_identity):
+        nonlocal calls
+        calls += 1
+        if calls == reentry_call:
+            holder["supervisor"].fail("identity validator reentry")
+        return True
+
+    supervisor = SupervisorSignalHandoff(
+        "run-0123456789abcdef",
+        identity_validator=identity_validator,
+        forwarder=lambda _pgid, _name: None,
+    )
+    holder["supervisor"] = supervisor
+    if reentry_call == 2:
+        supervisor.collect_signal("TERM")
+    _request, request_read = _send_request(_coordinator(identity))
+    response_read, response_write = os.pipe()
+    try:
+        with pytest.raises(SignalHandoffError):
+            supervisor.receive_and_accept(
+                request_read,
+                response_write,
+                deadline=time.monotonic() + 0.2,
+            )
+    finally:
+        os.close(request_read)
+        os.close(response_read)
+        os.close(response_write)
+
+    snapshot = supervisor.snapshot()
+    assert snapshot.state == snapshot.terminal_state == "FAILED"
+    assert snapshot.acceptance_count == reentry_call - 1
+    assert snapshot.forward_count == 0
+    assert snapshot.next_sequence == reentry_call
+    assert snapshot.events[-1].name == "failed:identity validator reentry"
+    assert all(event.name != "signal_forward" for event in snapshot.events)
+
+
+def test_forwarder_reentrant_failure_cannot_commit_forward(identity):
+    holder = {}
+
+    def forwarder(_pgid, _name):
+        holder["supervisor"].fail("forwarder reentry")
+        return None
+
+    supervisor = SupervisorSignalHandoff(
+        "run-0123456789abcdef",
+        identity_validator=lambda value: value == identity,
+        forwarder=forwarder,
+    )
+    holder["supervisor"] = supervisor
+    supervisor.collect_signal("HUP")
+    _request, request_read = _send_request(_coordinator(identity))
+    response_read, response_write = os.pipe()
+    try:
+        with pytest.raises(SignalHandoffError):
+            supervisor.receive_and_accept(
+                request_read,
+                response_write,
+                deadline=time.monotonic() + 0.2,
+            )
+    finally:
+        os.close(request_read)
+        os.close(response_read)
+        os.close(response_write)
+
+    snapshot = supervisor.snapshot()
+    assert snapshot.state == snapshot.terminal_state == "FAILED"
+    assert snapshot.acceptance_count == 1
+    assert snapshot.forward_count == 0
+    assert snapshot.next_sequence == 2
+    assert snapshot.events[-1].name == "failed:forwarder reentry"
+    assert all(event.name != "signal_forward" for event in snapshot.events)
+
+
+def test_coordinator_writer_reentrant_failure_cannot_commit_request(
+    identity, monkeypatch
+):
+    coordinator = _coordinator(identity)
+    real_write_frame = signal_handoff_module.write_frame
+
+    def reentrant_write(*args, **kwargs):
+        coordinator.fail("coordinator writer reentry")
+        return real_write_frame(*args, **kwargs)
+
+    monkeypatch.setattr(signal_handoff_module, "write_frame", reentrant_write)
+    read_fd, write_fd = os.pipe()
+    try:
+        with pytest.raises(SignalHandoffError):
+            coordinator.send_ready(
+                write_fd,
+                blocked=set(MASK),
+                dispositions=dict(DISPOSITIONS),
+                deadline=time.monotonic() + 0.2,
+            )
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    snapshot = coordinator.snapshot()
+    assert snapshot.state == snapshot.terminal_state == "FAILED"
+    assert snapshot.request_sequence is None
+    assert snapshot.acceptance_validated is False
+    assert snapshot.unblock_count == 0
+    assert snapshot.events[-1].name == "failed:coordinator writer reentry"
+    assert all(event.name != "ready_request_write" for event in snapshot.events)
+
+
+@pytest.mark.parametrize("reentry", ["fail", "second_transition"])
+def test_supervisor_writer_reentry_cannot_commit_acceptance(
+    identity, monkeypatch, reentry
+):
+    supervisor = _supervisor(identity)
+    _request, request_read = _send_request(_coordinator(identity))
+    response_read, response_write = os.pipe()
+    real_write_frame = signal_handoff_module.write_frame
+
+    def reentrant_write(*args, **kwargs):
+        if reentry == "fail":
+            supervisor.fail("supervisor writer reentry")
+        else:
+            supervisor.collect_signal("INT")
+        return real_write_frame(*args, **kwargs)
+
+    monkeypatch.setattr(signal_handoff_module, "write_frame", reentrant_write)
+    try:
+        with pytest.raises(SignalHandoffError):
+            supervisor.receive_and_accept(
+                request_read,
+                response_write,
+                deadline=time.monotonic() + 0.2,
+            )
+    finally:
+        os.close(request_read)
+        os.close(response_read)
+        os.close(response_write)
+
+    snapshot = supervisor.snapshot()
+    assert snapshot.state == snapshot.terminal_state == "FAILED"
+    assert snapshot.acceptance_count == snapshot.forward_count == 0
+    assert snapshot.next_sequence == 1
+    assert snapshot.events[-1].name.startswith("failed:")
+    assert all(event.name != "acceptance_write" for event in snapshot.events)
+
+
 def test_terminal_role_states_are_immutable(identity):
     coordinator = _coordinator(identity)
     coordinator.fail("timeout")

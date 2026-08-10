@@ -292,6 +292,8 @@ class CoordinatorSignalHandoff:
         self._unblock_count = 0
         self._functional_count = 0
         self._events: list[HandoffEvent] = []
+        self._state_version = 0
+        self._transition: str | None = None
 
     def send_ready(
         self,
@@ -304,11 +306,21 @@ class CoordinatorSignalHandoff:
         """Observe and write one request; the descriptor remains caller-owned."""
 
         with self._lock:
-            self._require_nonterminal()
+            self._require_transition_idle()
             if self._sent_request is not None or self._state != "AWAITING_READY":
                 return self._reject("coordinator ready request is out of order")
             proof = _require_signal_proof(blocked, dispositions)
+            transition = "ready request"
+            version = self._start_transition_locked(transition)
+        try:
             observed = self._observe()
+        except Exception as error:
+            with self._lock:
+                if self._terminal_state is None:
+                    self._fail_locked("signal observation failed")
+            raise SignalHandoffError("signal observation failed") from error
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
             if observed.blocked_signals != _SIGNAL_SET:
                 return self._reject("reviewed signals are not all blocked")
             if observed.dispositions != proof:
@@ -323,17 +335,23 @@ class CoordinatorSignalHandoff:
                 dispositions=proof,
             )
             self._event("handlers_observed")
-            try:
-                write_frame(write_fd, request.as_message(), deadline=deadline)
-            except (BrokerProtocolError, OSError, SignalHandoffError) as error:
-                self._fail_locked("ready request write failed")
-                raise SignalHandoffError("ready request write failed") from error
+            version = self._state_version
+        try:
+            write_frame(write_fd, request.as_message(), deadline=deadline)
+        except (BrokerProtocolError, OSError, SignalHandoffError) as error:
+            with self._lock:
+                if self._terminal_state is None:
+                    self._fail_locked("ready request write failed")
+            raise SignalHandoffError("ready request write failed") from error
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
             self._sent_request = request
             self._installed_dispositions = observed.dispositions
             self._installed_handler_tokens = observed.handler_tokens
             self._next_sequence += 1
             self._state = "AWAITING_ACCEPTANCE"
             self._event("ready_request_write")
+            self._finish_transition_locked(transition)
             return request
 
     def receive_acceptance(
@@ -342,41 +360,64 @@ class CoordinatorSignalHandoff:
         """Read exact acceptance, unblock in the OS, and re-observe the mask."""
 
         with self._lock:
-            self._require_nonterminal()
+            self._require_transition_idle()
             if self._state != "AWAITING_ACCEPTANCE" or self._sent_request is None:
                 return self._reject("coordinator is not awaiting acceptance")
-            try:
-                message = read_frame(read_fd, deadline=deadline, exact_one=True)
-                acceptance = SignalReadyAccepted.from_message(message)
-            except (BrokerProtocolError, SignalHandoffError) as error:
-                self._fail_locked("acceptance response read failed")
-                raise SignalHandoffError("acceptance response read failed") from error
-            expected = _acceptance_for(self._sent_request)
+            transition = "acceptance"
+            version = self._start_transition_locked(transition)
+            request = self._sent_request
+            installed_dispositions = self._installed_dispositions
+            installed_handler_tokens = self._installed_handler_tokens
+        try:
+            message = read_frame(read_fd, deadline=deadline, exact_one=True)
+            acceptance = SignalReadyAccepted.from_message(message)
+        except (BrokerProtocolError, SignalHandoffError) as error:
+            with self._lock:
+                if self._terminal_state is None:
+                    self._fail_locked("acceptance response read failed")
+            raise SignalHandoffError("acceptance response read failed") from error
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
+            expected = _acceptance_for(request)
             if acceptance != expected:
                 return self._reject("coordinator acceptance binding mismatch")
             self._acceptance_validated = True
             self._event("acceptance_validated")
-            try:
-                self._signal_operations.unblock_reviewed()
-                observed = self._observe()
-            except Exception as error:
-                self._fail_locked("reviewed signal unblock failed")
-                raise SignalHandoffError("reviewed signal unblock failed") from error
+            version = self._state_version
+        try:
+            self._signal_operations.unblock_reviewed()
+        except Exception as error:
+            with self._lock:
+                if self._terminal_state is None:
+                    self._fail_locked("reviewed signal unblock failed")
+            raise SignalHandoffError("reviewed signal unblock failed") from error
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
+        try:
+            observed = self._observe()
+        except Exception as error:
+            with self._lock:
+                if self._terminal_state is None:
+                    self._fail_locked("reviewed signal unblock failed")
+            raise SignalHandoffError("reviewed signal unblock failed") from error
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
             if observed.blocked_signals:
                 return self._reject("reviewed signals remain blocked after unblock")
             if (
-                observed.dispositions != self._installed_dispositions
-                or observed.handler_tokens != self._installed_handler_tokens
+                observed.dispositions != installed_dispositions
+                or observed.handler_tokens != installed_handler_tokens
             ):
                 return self._reject("handler dispositions changed during unblock")
             self._unblock_count = 1
             self._state = "READY"
             self._event("signals_unblocked")
+            self._finish_transition_locked(transition)
             return acceptance
 
     def record_functional_progress(self) -> None:
         with self._lock:
-            self._require_nonterminal()
+            self._require_transition_idle()
             if self._state != "READY" or self._unblock_count != 1:
                 return self._reject("functional progress preceded OS unblock")
             self._functional_count += 1
@@ -384,7 +425,7 @@ class CoordinatorSignalHandoff:
 
     def finalize_ready(self, evidence: TraceUnblockEvidence) -> None:
         with self._lock:
-            self._require_nonterminal()
+            self._require_transition_idle()
             if (
                 self._state != "READY"
                 or not self._acceptance_validated
@@ -413,13 +454,20 @@ class CoordinatorSignalHandoff:
                 evidence.unblock_trace_record_index < functional_index
             ):
                 return self._reject("trace evidence functional ordering is invalid")
-            try:
-                trusted = self._trace_verifier(evidence)
-            except Exception as error:
-                self._fail_locked("trusted trace verifier failed")
-                raise SignalHandoffError("trusted trace verifier failed") from error
+            transition = "trace verification"
+            version = self._start_transition_locked(transition)
+        try:
+            trusted = self._trace_verifier(evidence)
+        except Exception as error:
+            with self._lock:
+                if self._terminal_state is None:
+                    self._fail_locked("trusted trace verifier failed")
+            raise SignalHandoffError("trusted trace verifier failed") from error
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
             if trusted is not True:
                 return self._reject("trusted trace verifier rejected evidence")
+            self._transition = None
             self._terminal_state = "READY"
             self._event("terminal_ready")
 
@@ -459,8 +507,35 @@ class CoordinatorSignalHandoff:
                 f"terminal coordinator state is immutable: {self._terminal_state}"
             )
 
+    def _require_transition_idle(self) -> None:
+        self._require_nonterminal()
+        if self._transition is not None:
+            self._reject("coordinator transition reentry")
+
+    def _start_transition_locked(self, name: str) -> int:
+        if self._transition is not None:
+            self._reject("coordinator transition reentry")
+        self._transition = name
+        self._state_version += 1
+        return self._state_version
+
+    def _require_transition_unchanged_locked(self, name: str, version: int) -> None:
+        if (
+            self._terminal_state is not None
+            or self._transition != name
+            or self._state_version != version
+        ):
+            raise SignalHandoffError(f"coordinator state changed during {name}")
+
+    def _finish_transition_locked(self, name: str) -> None:
+        if self._transition != name:
+            raise SignalHandoffError(f"coordinator state changed during {name}")
+        self._transition = None
+        self._state_version += 1
+
     def _event(self, name: str) -> None:
         self._events.append(HandoffEvent(len(self._events), name, self._state))
+        self._state_version += 1
 
     def _reject(self, reason: str):
         self._require_nonterminal()
@@ -471,6 +546,7 @@ class CoordinatorSignalHandoff:
         self._require_nonterminal()
         self._state = "FAILED"
         self._terminal_state = "FAILED"
+        self._transition = None
         self._event(f"failed:{reason}")
 
 
@@ -507,6 +583,8 @@ class SupervisorSignalHandoff:
         self._forward_target_pgid: int | None = None
         self._last_accepted_identity: ProcessIdentity | None = None
         self._events: list[HandoffEvent] = []
+        self._state_version = 0
+        self._transition: str | None = None
 
     @classmethod
     def not_applicable(cls, run_nonce: str) -> SupervisorSignalHandoff:
@@ -528,9 +606,18 @@ class SupervisorSignalHandoff:
         """Build a response without changing authorization or sequence state."""
 
         with self._lock:
-            self._require_nonterminal()
-            self._validate_request(request)
-            return _acceptance_for(request)
+            self._require_transition_idle()
+            self._validate_request_structure(request)
+            transition = "acceptance build"
+            version = self._start_transition_locked(transition)
+        valid_identity = self._validate_identity(request.identity)
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
+            if not valid_identity:
+                return self._reject("request process identity mismatch")
+            acceptance = _acceptance_for(request)
+            self._finish_transition_locked(transition)
+            return acceptance
 
     def receive_and_accept(
         self,
@@ -554,33 +641,68 @@ class SupervisorSignalHandoff:
         with self._lock:
             self._require_ready_acceptance_open()
             try:
-                self._validate_request(request)
+                self._validate_request_structure(request)
             except SignalHandoffError as error:
                 self._fail_locked(str(error))
                 raise
+            transition = "readiness acceptance"
+            version = self._start_transition_locked(transition)
+        valid_identity = self._validate_identity(request.identity)
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
+            if not valid_identity:
+                return self._reject("request process identity mismatch")
             acceptance = _acceptance_for(request)
             self._event("ready_request_validated")
-            try:
-                write_frame(
-                    response_write_fd,
-                    acceptance.as_message(),
-                    deadline=deadline,
-                )
-            except (BrokerProtocolError, OSError, SignalHandoffError) as error:
-                self._fail_locked("acceptance response write failed")
-                raise SignalHandoffError("acceptance response write failed") from error
+            version = self._state_version
+        try:
+            write_frame(
+                response_write_fd,
+                acceptance.as_message(),
+                deadline=deadline,
+            )
+        except (BrokerProtocolError, OSError, SignalHandoffError) as error:
+            with self._lock:
+                if self._terminal_state is None:
+                    self._fail_locked("acceptance response write failed")
+            raise SignalHandoffError("acceptance response write failed") from error
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
             self._acceptance_count = 1
             self._next_sequence += 1
             self._last_accepted_identity = request.identity
             self._state = "READY"
             self._event("acceptance_write")
-            if self._pending_signal is not None:
-                self._forward_locked(request.identity)
+            if self._pending_signal is None:
+                self._finish_transition_locked(transition)
+                return acceptance
+            version = self._state_version
+        valid_identity = self._validate_identity(request.identity)
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
+            if not valid_identity:
+                return self._reject("process identity changed before forward")
+            pending_signal = self._pending_signal
+        try:
+            result = self._forwarder(request.identity.pgid, pending_signal)
+        except Exception as error:
+            with self._lock:
+                if self._terminal_state is None:
+                    self._fail_locked("modeled signal forward failed")
+            raise SignalHandoffError("modeled signal forward failed") from error
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
+            if result is not None:
+                return self._reject("modeled signal forward was not exact")
+            self._forward_count = 1
+            self._forward_target_pgid = request.identity.pgid
+            self._event("signal_forward")
+            self._finish_transition_locked(transition)
             return acceptance
 
     def collect_signal(self, signal_name: str) -> None:
         with self._lock:
-            self._require_nonterminal()
+            self._require_transition_idle()
             if type(signal_name) is not str or signal_name not in _SIGNAL_SET:
                 raise SignalHandoffError("signal must be exactly HUP, INT, or TERM")
             if self._pending_signal is not None:
@@ -590,8 +712,31 @@ class SupervisorSignalHandoff:
             identity = self._last_accepted_identity
             if identity is None:
                 self._state = "PENDING_FORWARD"
-            else:
-                self._forward_locked(identity)
+                self._state_version += 1
+                return
+            transition = "signal forward"
+            version = self._start_transition_locked(transition)
+        valid_identity = self._validate_identity(identity)
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
+            if not valid_identity:
+                return self._reject("process identity changed before forward")
+            pending_signal = self._pending_signal
+        try:
+            result = self._forwarder(identity.pgid, pending_signal)
+        except Exception as error:
+            with self._lock:
+                if self._terminal_state is None:
+                    self._fail_locked("modeled signal forward failed")
+            raise SignalHandoffError("modeled signal forward failed") from error
+        with self._lock:
+            self._require_transition_unchanged_locked(transition, version)
+            if result is not None:
+                return self._reject("modeled signal forward was not exact")
+            self._forward_count = 1
+            self._forward_target_pgid = identity.pgid
+            self._event("signal_forward")
+            self._finish_transition_locked(transition)
 
     def fail(self, reason: str) -> None:
         with self._lock:
@@ -613,7 +758,7 @@ class SupervisorSignalHandoff:
                 events=tuple(self._events),
             )
 
-    def _validate_request(self, request: SignalReady) -> None:
+    def _validate_request_structure(self, request: SignalReady) -> None:
         if type(request) is not SignalReady:
             raise SignalHandoffError("request must be an exact SignalReady")
         request.as_message()
@@ -627,8 +772,6 @@ class SupervisorSignalHandoff:
             value is not True for _name, value in request.dispositions
         ):
             raise SignalHandoffError("request signal proof is invalid")
-        if not self._validate_identity(request.identity):
-            raise SignalHandoffError("request process identity mismatch")
 
     def _validate_identity(self, identity: ProcessIdentity) -> bool:
         try:
@@ -636,32 +779,44 @@ class SupervisorSignalHandoff:
         except Exception:
             return False
 
-    def _forward_locked(self, identity: ProcessIdentity) -> None:
-        if self._forward_count or self._pending_signal is None:
-            return
-        if self._acceptance_count <= 0:
-            return self._reject("forward preceded complete acceptance write")
-        if not self._validate_identity(identity):
-            return self._reject("process identity changed before forward")
-        try:
-            result = self._forwarder(identity.pgid, self._pending_signal)
-        except Exception as error:
-            self._fail_locked("modeled signal forward failed")
-            raise SignalHandoffError("modeled signal forward failed") from error
-        if result is not None:
-            return self._reject("modeled signal forward was not exact")
-        self._forward_count = 1
-        self._forward_target_pgid = identity.pgid
-        self._event("signal_forward")
-
     def _require_nonterminal(self) -> None:
         if self._terminal_state is not None:
             raise SignalHandoffError(
                 f"terminal supervisor state is immutable: {self._terminal_state}"
             )
 
+    def _require_transition_idle(self) -> None:
+        self._require_nonterminal()
+        if self._transition is not None:
+            self._reject("supervisor transition reentry")
+
+    def _start_transition_locked(self, name: str) -> int:
+        if self._transition is not None:
+            self._reject("supervisor transition reentry")
+        self._transition = name
+        self._state_version += 1
+        return self._state_version
+
+    def _require_transition_unchanged_locked(self, name: str, version: int) -> None:
+        if (
+            self._terminal_state is not None
+            or self._transition != name
+            or self._state_version != version
+        ):
+            raise SignalHandoffError(f"supervisor state changed during {name}")
+
+    def _finish_transition_locked(self, name: str) -> None:
+        if self._transition != name:
+            raise SignalHandoffError(f"supervisor state changed during {name}")
+        self._transition = None
+        self._state_version += 1
+
     def _require_ready_acceptance_open(self) -> None:
         self._require_nonterminal()
+        if self._transition == "readiness acceptance":
+            raise SignalHandoffError("readiness already accepted")
+        if self._transition is not None:
+            self._reject("supervisor transition reentry")
         if self._acceptance_count != 0 or self._state not in {
             "AWAITING_READY",
             "PENDING_FORWARD",
@@ -670,6 +825,7 @@ class SupervisorSignalHandoff:
 
     def _event(self, name: str) -> None:
         self._events.append(HandoffEvent(len(self._events), name, self._state))
+        self._state_version += 1
 
     def _reject(self, reason: str):
         self._require_nonterminal()
@@ -680,6 +836,7 @@ class SupervisorSignalHandoff:
         self._require_nonterminal()
         self._state = "FAILED"
         self._terminal_state = "FAILED"
+        self._transition = None
         self._event(f"failed:{reason}")
 
 

@@ -41,6 +41,24 @@ def ready_message() -> dict[str, object]:
     }
 
 
+def ledger_candidate_message() -> dict[str, object]:
+    nonce = "b" * 64
+    return {
+        "type": MessageType.LEDGER_CANDIDATE.value,
+        "run_nonce": nonce,
+        "sequence": 1,
+        "generation": 0,
+        "previous_generation": None,
+        "previous_digest": None,
+        "candidate": {
+            "ledger_nonce": nonce,
+            "generation": 0,
+            "previous_generation": None,
+            "previous_digest": None,
+        },
+    }
+
+
 def _raw_frame(payload: bytes) -> bytes:
     return len(payload).to_bytes(4, "big") + payload
 
@@ -229,6 +247,145 @@ def test_short_reads_writes_and_eintr_are_retried(monkeypatch):
     finally:
         os.close(read_fd)
         os.close(write_fd)
+
+
+def test_writer_uses_stable_pipe_duplicate_across_validator_fd_rebind(tmp_path):
+    message = ledger_candidate_message()
+    rebound_path = tmp_path / "rebound-write"
+    rebound_fd = os.open(rebound_path, os.O_RDWR | os.O_CREAT, 0o600)
+    read_fd, write_fd = os.pipe()
+    rebound = False
+
+    def rebind_original(_candidate):
+        nonlocal rebound
+        if not rebound:
+            os.close(write_fd)
+            os.dup2(rebound_fd, write_fd)
+            rebound = True
+        return True
+
+    try:
+        write_frame(
+            write_fd,
+            message,
+            deadline=time.monotonic() + 0.2,
+            ledger_validator=rebind_original,
+        )
+        assert rebound_path.read_bytes() == b""
+        assert (
+            read_frame(
+                read_fd,
+                deadline=time.monotonic() + 0.2,
+                exact_one=True,
+                ledger_validator=lambda _candidate: True,
+            )
+            == message
+        )
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+        os.close(rebound_fd)
+
+
+def test_reader_uses_stable_pipe_duplicate_for_exact_one_after_validator_rebind(
+    tmp_path,
+):
+    message = ledger_candidate_message()
+    payload = canonical_json_bytes(message)
+    rebound_path = tmp_path / "rebound-read"
+    rebound_fd = os.open(rebound_path, os.O_RDWR | os.O_CREAT, 0o600)
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, _raw_frame(payload) + b"x")
+    os.close(write_fd)
+    write_fd = -1
+
+    def rebind_original(_candidate):
+        os.close(read_fd)
+        os.dup2(rebound_fd, read_fd)
+        return True
+
+    try:
+        with pytest.raises(BrokerProtocolError, match="trailing"):
+            read_frame(
+                read_fd,
+                deadline=time.monotonic() + 0.2,
+                exact_one=True,
+                ledger_validator=rebind_original,
+            )
+        assert rebound_path.read_bytes() == b""
+    finally:
+        os.close(read_fd)
+        os.close(rebound_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
+def test_stable_broker_duplicates_close_after_success(monkeypatch):
+    duplicated = []
+    real_dup = os.dup
+
+    def track_dup(fd):
+        duplicated.append(real_dup(fd))
+        return duplicated[-1]
+
+    monkeypatch.setattr(broker_module.os, "dup", track_dup)
+    read_fd, write_fd = os.pipe()
+    try:
+        write_frame(write_fd, ready_message(), deadline=time.monotonic() + 0.2)
+        os.close(write_fd)
+        write_fd = -1
+        assert (
+            read_frame(read_fd, deadline=time.monotonic() + 0.2, exact_one=True)
+            == ready_message()
+        )
+        assert len(duplicated) == 2
+        for duplicated_fd in duplicated:
+            with pytest.raises(OSError):
+                os.fstat(duplicated_fd)
+        os.fstat(read_fd)
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
+def test_stable_broker_duplicates_close_after_validator_failures(monkeypatch):
+    duplicated = []
+    real_dup = os.dup
+
+    def track_dup(fd):
+        duplicated.append(real_dup(fd))
+        return duplicated[-1]
+
+    monkeypatch.setattr(broker_module.os, "dup", track_dup)
+    message = ledger_candidate_message()
+    payload = canonical_json_bytes(message)
+    read_fd, write_fd = os.pipe()
+    try:
+        with pytest.raises(BrokerProtocolError, match="validation"):
+            write_frame(
+                write_fd,
+                message,
+                deadline=time.monotonic() + 0.2,
+                ledger_validator=lambda _candidate: False,
+            )
+        os.write(write_fd, _raw_frame(payload))
+        os.close(write_fd)
+        write_fd = -1
+        with pytest.raises(BrokerProtocolError, match="validation"):
+            read_frame(
+                read_fd,
+                deadline=time.monotonic() + 0.2,
+                ledger_validator=lambda _candidate: False,
+            )
+        assert len(duplicated) == 2
+        for duplicated_fd in duplicated:
+            with pytest.raises(OSError):
+                os.fstat(duplicated_fd)
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
 
 
 def test_deadlines_and_exact_builtin_fd_and_message_types_are_enforced():

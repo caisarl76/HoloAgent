@@ -96,17 +96,27 @@ def write_frame(
     """Write one canonical length-prefixed message before an absolute deadline."""
 
     _require_fd(fd)
-    _require_anonymous_pipe(fd, readable=False)
     absolute_deadline = _deadline(deadline)
-    validated = validate_message(message, ledger_validator=ledger_validator)
+    stable_fd = _duplicate_broker_fd(fd)
     try:
-        payload = canonical_json_bytes(validated)
-    except (CanonicalJSONError, RuntimeError) as error:
-        raise BrokerProtocolError("message cannot be encoded canonically") from error
-    if not payload or len(payload) > MAX_PAYLOAD_BYTES:
-        raise BrokerProtocolError("frame exceeds reviewed bound")
-    _decode_canonical_message(payload, ledger_validator=ledger_validator)
-    _write_all(fd, len(payload).to_bytes(4, "big") + payload, absolute_deadline)
+        _require_anonymous_pipe(stable_fd, readable=False)
+        validated = validate_message(message, ledger_validator=ledger_validator)
+        try:
+            payload = canonical_json_bytes(validated)
+        except (CanonicalJSONError, RuntimeError) as error:
+            raise BrokerProtocolError(
+                "message cannot be encoded canonically"
+            ) from error
+        if not payload or len(payload) > MAX_PAYLOAD_BYTES:
+            raise BrokerProtocolError("frame exceeds reviewed bound")
+        _decode_canonical_message(payload, ledger_validator=ledger_validator)
+        _write_all(
+            stable_fd,
+            len(payload).to_bytes(4, "big") + payload,
+            absolute_deadline,
+        )
+    finally:
+        os.close(stable_fd)
 
 
 def read_frame(
@@ -121,19 +131,23 @@ def read_frame(
     _require_fd(fd)
     if type(exact_one) is not bool:
         raise BrokerProtocolError("exact_one must be an exact boolean")
-    _require_anonymous_pipe(fd, readable=True)
     absolute_deadline = _deadline(deadline)
-    prefix = _read_exact(fd, 4, absolute_deadline, "length prefix")
-    length = int.from_bytes(prefix, "big")
-    if length == 0:
-        raise BrokerProtocolError("zero-length frames are prohibited")
-    if length > MAX_PAYLOAD_BYTES:
-        raise BrokerProtocolError("frame exceeds reviewed bound")
-    payload = _read_exact(fd, length, absolute_deadline, "payload")
-    message = _decode_canonical_message(payload, ledger_validator=ledger_validator)
-    if exact_one:
-        _require_channel_eof(fd, absolute_deadline)
-    return message
+    stable_fd = _duplicate_broker_fd(fd)
+    try:
+        _require_anonymous_pipe(stable_fd, readable=True)
+        prefix = _read_exact(stable_fd, 4, absolute_deadline, "length prefix")
+        length = int.from_bytes(prefix, "big")
+        if length == 0:
+            raise BrokerProtocolError("zero-length frames are prohibited")
+        if length > MAX_PAYLOAD_BYTES:
+            raise BrokerProtocolError("frame exceeds reviewed bound")
+        payload = _read_exact(stable_fd, length, absolute_deadline, "payload")
+        message = _decode_canonical_message(payload, ledger_validator=ledger_validator)
+        if exact_one:
+            _require_channel_eof(stable_fd, absolute_deadline)
+        return message
+    finally:
+        os.close(stable_fd)
 
 
 def validate_message(
@@ -280,6 +294,13 @@ def _require_fd(fd: object) -> None:
         raise BrokerProtocolError(
             "file descriptor must be an exact nonnegative integer"
         )
+
+
+def _duplicate_broker_fd(fd: int) -> int:
+    try:
+        return os.dup(fd)
+    except OSError as error:
+        raise BrokerProtocolError("broker descriptor is invalid") from error
 
 
 def _require_anonymous_pipe(fd: int, *, readable: bool) -> None:
