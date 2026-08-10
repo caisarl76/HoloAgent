@@ -29,7 +29,8 @@ def _namespace():
     )
     assert match is not None, "the complete provisioner must be embedded in the recipe"
     namespace = {"__name__": "holoagent0_embedded_provisioner_base_test"}
-    exec(compile(match.group(1), str(SCRIPT), "exec"), namespace)
+    padding = "\n" * source[: match.start(1)].count("\n")
+    exec(compile(padding + match.group(1), str(SCRIPT), "exec"), namespace)
     return namespace
 
 
@@ -275,9 +276,11 @@ def test_build_argv_is_deterministic_offline_and_uses_fixed_gcc_repository(tmp_p
 
 
 def test_no_archive_mode_validates_build_pins_before_transfer(tmp_path):
-    ns = _namespace()
+    _namespace()
     source = SCRIPT.read_text(encoding="utf-8")
-    main_source = ns["inspect"].getsource(ns["provision"])
+    main_source = re.search(
+        r"def provision\(.*?\n(?=def main\()", source, flags=re.DOTALL
+    ).group(0)
     assert main_source.index("validate_build_pins") < main_source.index(
         "transfer_archive"
     )
@@ -290,11 +293,16 @@ def test_no_archive_mode_validates_build_pins_before_transfer(tmp_path):
 
 def test_candidate_measurement_never_amends_policy_or_claims_reviewed_install():
     ns = _namespace()
-    source = ns["inspect"].getsource(ns["publish_candidate_evidence"])
+    source = SCRIPT.read_text(encoding="utf-8")
+    publisher = re.search(
+        r"def publish_candidate_evidence\(.*?\n(?=def publish_install_directory\()",
+        source,
+        flags=re.DOTALL,
+    ).group(0)
     assert "CANDIDATE_MEASUREMENT" in json.dumps(
         ns["candidate_evidence"](
             "recipe", "sha256:" + "a" * 64, ns["ElfPins"](1, "b" * 64, "c" * 64)
         )
     )
-    assert "POLICY_PATH" not in source
-    assert "write_text" not in source
+    assert "POLICY_PATH" not in publisher
+    assert "write_text" not in publisher

@@ -23,7 +23,8 @@ def _namespace():
     )
     assert match is not None, "the complete provisioner must be embedded in the recipe"
     namespace = {"__name__": "holoagent0_embedded_provisioner_test"}
-    exec(compile(match.group(1), str(SCRIPT), "exec"), namespace)
+    padding = "\n" * source[: match.start(1)].count("\n")
+    exec(compile(padding + match.group(1), str(SCRIPT), "exec"), namespace)
     return namespace
 
 

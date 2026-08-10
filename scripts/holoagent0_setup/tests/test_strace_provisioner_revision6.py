@@ -23,7 +23,8 @@ def _namespace():
     )
     assert match is not None, "the complete provisioner must be embedded in the recipe"
     namespace = {"__name__": "holoagent0_embedded_provisioner_revision6_test"}
-    exec(compile(match.group(1), str(SCRIPT), "exec"), namespace)
+    padding = "\n" * source[: match.start(1)].count("\n")
+    exec(compile(padding + match.group(1), str(SCRIPT), "exec"), namespace)
     return namespace
 
 
@@ -61,7 +62,11 @@ def test_recipe_has_no_executed_helper_outside_closed_digest_boundary():
 
 def test_signal_latch_precedes_allocation_and_cleanup_failure_beats_signal(tmp_path):
     ns = _namespace()
-    source = ns["inspect"].getsource(ns["provision"])
+    source = re.search(
+        r"def provision\(.*?\n(?=def main\()",
+        SCRIPT.read_text(encoding="utf-8"),
+        flags=re.DOTALL,
+    ).group(0)
     assert source.index("SignalLatch") < source.index("OwnedPathRegistry")
     latch = ns["SignalLatch"]()
     latch.record(signal.SIGTERM)
