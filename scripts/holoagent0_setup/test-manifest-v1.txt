@@ -10,6 +10,8 @@ scripts/holoagent0_setup/tests/test_trace_normalizer.py
 scripts/holoagent0_setup/tests/test_trace_normalizer_revision3.py
 scripts/holoagent0_setup/tests/test_trace_normalizer_revision4.py
 scripts/holoagent0_setup/tests/test_trace_normalizer_revision5.py
+scripts/holoagent0_setup/tests/test_trace_policy.py
+scripts/holoagent0_setup/tests/test_cyclone_policy.py
 scripts/holoagent0_setup/tests/test_strace_provisioner.py
 scripts/holoagent0_setup/tests/test_strace_provisioner_revision6.py
 scripts/holoagent0_setup/tests/test_strace_provisioner_revision7.py
