@@ -30,7 +30,7 @@
       },
       "parser": {
         "path": "scripts/holoagent0_setup/holoagent0_setup/trace_normalizer.py",
-        "sha256": "582b456cc7f7590e94240d307eb472e85cd887f426507cdf2e3f9af301e6c5c3",
+        "sha256": "21421de7552694f3aaba7dc46602fe13adceb26b7441fc3defe894f1dbdec462",
         "digest_algorithm": "sha256",
         "review_state": "REVIEWED"
       },

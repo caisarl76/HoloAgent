@@ -154,8 +154,9 @@ if [[ "$command" == "run" ]]; then
     [[ -n "$cidfile" ]]
     cid="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     printf '%s\n' "$cid" > "$cidfile"
-    /usr/bin/setsid /usr/bin/sleep 300 &
+    /usr/bin/sleep 300 &
     container_pid=$!
+    trap 'kill -TERM "$container_pid" 2>/dev/null || :; wait "$container_pid" 2>/dev/null || :; exit 143' HUP INT TERM
     printf '%s\n' "$$" > "$state_dir/client.pid"
     printf '%s\n' "$container_pid" > "$state_dir/container.pid"
     : > "$state_dir/ready"
@@ -164,7 +165,7 @@ elif [[ "$command" == "rm" ]]; then
     [[ "$1" == "--force" ]]
     [[ "$2" == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ]]
     container_pid="$(cat "$state_dir/container.pid")"
-    /bin/kill -TERM -- "-$container_pid"
+    /bin/kill -TERM -- "-$container_pid" 2>/dev/null || :
     printf '%s\n' "$2" > "$state_dir/removed.cid"
 else
     exit 64

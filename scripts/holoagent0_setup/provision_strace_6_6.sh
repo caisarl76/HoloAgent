@@ -113,23 +113,176 @@ if [[ -z "$archive" ]]; then
     validate_build_pins
 fi
 
-temp_dir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/holoagent0-strace.XXXXXXXX")"
+# Reviewed installs are built in the destination parent so their final directory
+# publication is a same-filesystem rename. Candidate builds remain private in TMPDIR.
+if [[ -n "$output_dir" ]]; then
+    temp_parent="$(/usr/bin/dirname -- "$output_dir")"
+    [[ -d "$temp_parent" && ! -L "$temp_parent" ]] || {
+        printf 'error: output parent must be a real directory\n' >&2
+        exit 2
+    }
+    temp_dir="$(/usr/bin/mktemp -d "$temp_parent/.holoagent0-strace.XXXXXXXX")"
+    install_staging_dir="$(/usr/bin/mktemp -d \
+        "$temp_parent/.holoagent0-strace-install.XXXXXXXX")"
+else
+    temp_dir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/holoagent0-strace.XXXXXXXX")"
+    install_staging_dir="$temp_dir/install"
+fi
+
+# BEGIN_OWNED_PROCESS_HELPERS
 cleanup() {
     local status=$?
-    trap - EXIT
+    trap - EXIT HUP INT TERM
+    stop_owned_child
+    remove_owned_container
+    if [[ -n "${install_staging_dir:-}" ]]; then
+        /usr/bin/rm -rf -- "$install_staging_dir" || :
+    fi
     /usr/bin/rm -rf -- "$temp_dir" || :
     exit "$status"
 }
 terminate() {
     local status="$1"
     trap - EXIT HUP INT TERM
+    stop_owned_child
+    remove_owned_container
+    if [[ -n "${install_staging_dir:-}" ]]; then
+        /usr/bin/rm -rf -- "$install_staging_dir" || :
+    fi
     /usr/bin/rm -rf -- "$temp_dir" || :
     exit "$status"
 }
-trap cleanup EXIT
-trap 'terminate 129' HUP
-trap 'terminate 130' INT
-trap 'terminate 143' TERM
+active_child_pid=""
+active_child_pgid=""
+active_child_starttime=""
+active_docker_bin=""
+active_container_cidfile=""
+launching_child=0
+first_signal_status=0
+
+process_identity() {
+    /usr/bin/python3.10 - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(f"/proc/{int(sys.argv[1])}/stat").read_text(encoding="ascii")
+closing = text.rfind(")")
+if closing < 0:
+    raise SystemExit(1)
+fields = text[closing + 2 :].split()
+if len(fields) < 20:
+    raise SystemExit(1)
+print(fields[2], fields[19])
+PY
+}
+
+owned_child_matches() {
+    [[ -n "${active_child_pid:-}" && -n "${active_child_pgid:-}" && \
+       -n "${active_child_starttime:-}" ]] || return 1
+    local identity current_pgid current_starttime
+    identity="$(process_identity "$active_child_pid" 2>/dev/null)" || return 1
+    read -r current_pgid current_starttime <<<"$identity"
+    [[ "$current_pgid" == "$active_child_pgid" && \
+       "$current_starttime" == "$active_child_starttime" ]]
+}
+
+clear_owned_child() {
+    active_child_pid=""
+    active_child_pgid=""
+    active_child_starttime=""
+}
+
+stop_owned_child() {
+    local count
+    if owned_child_matches; then
+        kill -TERM -- "-$active_child_pgid" 2>/dev/null || :
+        for ((count = 0; count < 100; count++)); do
+            owned_child_matches || break
+            /usr/bin/sleep 0.01
+        done
+        if owned_child_matches; then
+            kill -KILL -- "-$active_child_pgid" 2>/dev/null || :
+        fi
+    fi
+    if [[ -n "${active_child_pid:-}" ]]; then
+        wait "$active_child_pid" 2>/dev/null || :
+    fi
+    clear_owned_child
+}
+
+remove_owned_container() {
+    [[ -n "${active_docker_bin:-}" && -n "${active_container_cidfile:-}" ]] || return 0
+    local cid=""
+    if [[ -f "$active_container_cidfile" && ! -L "$active_container_cidfile" ]]; then
+        cid="$(/bin/cat -- "$active_container_cidfile")" || cid=""
+        if [[ "$cid" =~ ^[0-9a-f]{64}$ ]]; then
+            "$active_docker_bin" rm --force "$cid" >/dev/null 2>&1 || :
+        fi
+    fi
+    active_docker_bin=""
+    active_container_cidfile=""
+}
+
+signal_received() {
+    local status="$1"
+    if ((first_signal_status == 0)); then
+        first_signal_status="$status"
+    fi
+    if ((launching_child == 0)); then
+        terminate "$first_signal_status"
+    fi
+}
+
+run_owned_process() {
+    local identity status=0
+    launching_child=1
+    /usr/bin/setsid -- "$@" &
+    active_child_pid=$!
+    identity="$(process_identity "$active_child_pid")" || {
+        launching_child=0
+        stop_owned_child
+        return 3
+    }
+    read -r active_child_pgid active_child_starttime <<<"$identity"
+    if [[ "$active_child_pgid" != "$active_child_pid" ]]; then
+        launching_child=0
+        stop_owned_child
+        return 3
+    fi
+    launching_child=0
+    if ((first_signal_status != 0)); then
+        terminate "$first_signal_status"
+    fi
+    wait "$active_child_pid" || status=$?
+    clear_owned_child
+    return "$status"
+}
+
+run_owned_docker() {
+    local docker_bin="$1"
+    shift
+    [[ "${1:-}" == "run" ]] || return 2
+    shift
+    active_docker_bin="$docker_bin"
+    active_container_cidfile="$temp_dir/docker.cid"
+    local status=0
+    run_owned_process "$docker_bin" run --cidfile "$active_container_cidfile" "$@" || status=$?
+    remove_owned_container
+    return "$status"
+}
+
+run_owned_publication() {
+    run_owned_process "$@"
+}
+
+install_provisioner_traps() {
+    trap cleanup EXIT
+    trap 'signal_received 129' HUP
+    trap 'signal_received 130' INT
+    trap 'signal_received 143' TERM
+}
+# END_OWNED_PROCESS_HELPERS
+install_provisioner_traps
 snapshot="$temp_dir/strace-6.6.tar.xz"
 
 if [[ -n "$archive" ]]; then
@@ -199,21 +352,24 @@ if [[ -n "$output_dir" ]]; then
     validate_runtime_pins
 fi
 
-/usr/bin/mkdir "$temp_dir/source" "$temp_dir/build" "$temp_dir/install"
+/usr/bin/mkdir "$temp_dir/source" "$temp_dir/build"
+if [[ -z "$output_dir" ]]; then
+    /usr/bin/mkdir "$install_staging_dir"
+fi
 /usr/bin/tar --extract --xz --file "$snapshot" --directory "$temp_dir/source" \
     --no-same-owner --no-same-permissions "$TOP_DIRECTORY"
 
 umask 0022
-/usr/bin/docker run --rm --pull=never --network=none \
+run_owned_docker /usr/bin/docker run --pull=never --network=none \
     --user "$(/usr/bin/id -u):$(/usr/bin/id -g)" \
     --env LC_ALL=C --env LANG=C --env TZ=UTC --env SOURCE_DATE_EPOCH=0 \
     --volume "$temp_dir/source/$TOP_DIRECTORY:/src:ro" \
     --volume "$temp_dir/build:/build" \
-    --volume "$temp_dir/install:/out" \
+    --volume "$install_staging_dir:/out" \
     "docker.io/library/gcc@${pins[2]}" \
     /bin/sh -eu -c 'cd /build && /src/configure --prefix=/out --disable-gcc-Werror && make -j1 && make install'
 
-elf="$temp_dir/install/bin/strace"
+elf="$install_staging_dir/bin/strace"
 [[ -f "$elf" && ! -L "$elf" ]] || { printf 'error: build did not produce strace ELF\n' >&2; exit 3; }
 /usr/bin/python3.10 - "$elf" <<'PY'
 from pathlib import Path
@@ -239,36 +395,21 @@ esac
 version_sha256="$(printf '%s\n' "$version_output" | /usr/bin/sha256sum | /usr/bin/cut -d ' ' -f 1)"
 
 if [[ -n "$candidate_evidence" ]]; then
-    /usr/bin/python3.10 - "$candidate_evidence" "${pins[1]}" "${pins[2]}" \
-        "$elf_size" "$elf_sha256" "$version_sha256" <<'PY'
-import json
-import os
-from pathlib import Path
-import sys
-import tempfile
-
-destination = Path(sys.argv[1])
-evidence = {
-    "schema_version": "holoagent0.strace-candidate-evidence.v1",
-    "measurement_kind": "CANDIDATE_MEASUREMENT",
-    "recipe_sha256": sys.argv[2],
-    "container_image_digest": sys.argv[3],
-    "elf_size": int(sys.argv[4]),
-    "elf_sha256": sys.argv[5],
-    "version_output_sha256": sys.argv[6],
-}
-payload = (json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n").encode()
-with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as temporary:
-    temporary.write(payload)
-    temporary.flush()
-    os.fsync(temporary.fileno())
-    temporary_path = temporary.name
-os.replace(temporary_path, destination)
-PY
+    # This path publishes only CANDIDATE_MEASUREMENT, never a reviewed install.
+    # The publisher delegates to atomic_write_json_no_replace and runs as an
+    # owned process, making signal delivery and the rename one linearized race.
+    run_owned_publication /usr/bin/env \
+        PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$SCRIPT_DIR" \
+        /usr/bin/python3.10 -m holoagent0_setup.strace_publication candidate \
+        "$candidate_evidence" "${pins[1]}" "${pins[2]}" \
+        "$elf_size" "$elf_sha256" "$version_sha256"
     exit 0
 fi
 
 [[ "$elf_size" == "${pins[4]}" ]] || { printf 'error: ELF size mismatch\n' >&2; exit 3; }
 [[ "$elf_sha256" == "${pins[5]}" ]] || { printf 'error: ELF sha256 mismatch\n' >&2; exit 3; }
 [[ "$version_sha256" == "${pins[6]}" ]] || { printf 'error: version output sha256 mismatch\n' >&2; exit 3; }
-/usr/bin/mv -- "$temp_dir/install" "$output_dir"
+run_owned_publication /usr/bin/env \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$SCRIPT_DIR" \
+    /usr/bin/python3.10 -m holoagent0_setup.strace_publication install \
+    "$install_staging_dir" "$output_dir"

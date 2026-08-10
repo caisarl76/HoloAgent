@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import errno as errno_module
 import ipaddress
@@ -1613,7 +1614,7 @@ class TraceNormalizer:
         self._records += 1
         if self._record_sink is not None:
             try:
-                self._record_sink(record)
+                self._record_sink(copy.deepcopy(record))
             except Exception:
                 raise _fail("record-sink") from None
         return record
