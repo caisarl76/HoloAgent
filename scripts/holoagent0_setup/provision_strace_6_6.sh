@@ -93,11 +93,10 @@ class PublicationError(ProvisioningError):
         self.transition = transition
 
 
-class ProvisioningInterrupted(ProvisioningError):
+class ProvisioningInterrupted(PublicationError):
     def __init__(self, status: int, *, transition=None):
-        super().__init__(f"interrupted with status {status}")
+        super().__init__(f"interrupted with status {status}", transition=transition)
         self.status = status
-        self.transition = transition
 
 
 @dataclass(frozen=True)
@@ -1643,13 +1642,19 @@ def publish_install_directory(
                 raise PublicationError(
                     "AMBIGUOUS_INSTALL_COMMIT", transition=transition
                 ) from rollback_error
-            if signal_latch is not None and signal_latch.status:
+            if isinstance(error, ProvisioningInterrupted) or (
+                signal_latch is not None and signal_latch.status
+            ):
                 interruption = (
                     error
                     if isinstance(error, ProvisioningInterrupted)
                     else ProvisioningInterrupted(signal_latch.status)
                 )
                 interruption.transition = transition
+                interruption.args = (
+                    f"ROLLED_BACK_INSTALL_COMMIT: interrupted with status "
+                    f"{interruption.status}",
+                )
                 raise interruption
             raise PublicationError(
                 "ROLLED_BACK_INSTALL_COMMIT", transition=transition
