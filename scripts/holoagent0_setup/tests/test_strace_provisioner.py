@@ -67,9 +67,6 @@ def _validate_members(archive: Path):
 
 
 def _run_cleanup_trap_harness(tmp_path: Path, command: str):
-    source = SCRIPT.read_text(encoding="utf-8")
-    start = source.index("cleanup() {")
-    end = source.index('snapshot="$temp_dir/strace-6.6.tar.xz"')
     private_temp = tmp_path / "private-temp"
     private_temp.mkdir()
     (private_temp / "owned").write_text("owned", encoding="utf-8")
@@ -79,7 +76,8 @@ def _run_cleanup_trap_harness(tmp_path: Path, command: str):
             "set -euo pipefail",
             'temp_dir="$1"',
             'candidate="$2"',
-            source[start:end],
+            _source_section("OWNED_PROCESS_HELPERS"),
+            "install_provisioner_traps",
             command,
             ': > "$candidate"',
         )
@@ -144,48 +142,6 @@ def _wait_gone(pid: int, timeout: float = 5.0) -> None:
             return
         time.sleep(0.01)
     raise AssertionError(f"owned process {pid} survived cleanup")
-
-
-def _write_fake_docker(path: Path) -> None:
-    path.write_text(
-        """#!/bin/bash
-set -euo pipefail
-state_dir="${FAKE_DOCKER_STATE:?}"
-command="$1"
-shift
-if [[ "$command" == "run" ]]; then
-    cidfile=""
-    while (($#)); do
-        if [[ "$1" == "--cidfile" ]]; then
-            cidfile="$2"
-            shift 2
-        else
-            shift
-        fi
-    done
-    [[ -n "$cidfile" ]]
-    cid="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    printf '%s\n' "$cid" > "$cidfile"
-    /usr/bin/sleep 300 &
-    container_pid=$!
-    trap 'kill -TERM "$container_pid" 2>/dev/null || :; wait "$container_pid" 2>/dev/null || :; exit 143' HUP INT TERM
-    printf '%s\n' "$$" > "$state_dir/client.pid"
-    printf '%s\n' "$container_pid" > "$state_dir/container.pid"
-    : > "$state_dir/ready"
-    wait "$container_pid"
-elif [[ "$command" == "rm" ]]; then
-    [[ "$1" == "--force" ]]
-    [[ "$2" == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ]]
-    container_pid="$(cat "$state_dir/container.pid")"
-    /bin/kill -TERM -- "-$container_pid" 2>/dev/null || :
-    printf '%s\n' "$2" > "$state_dir/removed.cid"
-else
-    exit 64
-fi
-""",
-        encoding="utf-8",
-    )
-    path.chmod(0o700)
 
 
 def test_script_has_exact_usage_and_fails_closed_for_bad_cli(tmp_path):
@@ -282,70 +238,6 @@ def test_private_temp_cleanup_and_no_policy_mutation(tmp_path):
     assert result.returncode == 2
     assert list(temp_parent.iterdir()) == []
     assert POLICY.read_bytes() == before
-
-
-@pytest.mark.parametrize(
-    ("signal_name", "expected_status"),
-    [("HUP", 129), ("INT", 130), ("TERM", 143)],
-)
-def test_signal_terminates_reaps_owned_fake_docker_and_removes_exact_container_only(
-    tmp_path, signal_name, expected_status
-):
-    helpers = _source_section("OWNED_PROCESS_HELPERS")
-    state = tmp_path / "state"
-    state.mkdir()
-    private_temp = tmp_path / "private-temp"
-    private_temp.mkdir()
-    fake_docker = tmp_path / "fake-docker"
-    _write_fake_docker(fake_docker)
-    unrelated = subprocess.Popen(
-        ["/usr/bin/setsid", "/usr/bin/sleep", "300"], start_new_session=False
-    )
-    harness = "\n".join(
-        (
-            "set -euo pipefail",
-            'temp_dir="$1"',
-            'docker_bin="$2"',
-            helpers,
-            "install_provisioner_traps",
-            'run_owned_docker "$docker_bin" run --network=none fake-image true',
-        )
-    )
-    environment = os.environ.copy()
-    environment["FAKE_DOCKER_STATE"] = str(state)
-    process = subprocess.Popen(
-        [
-            "bash",
-            "-c",
-            harness,
-            "owned-docker-harness",
-            str(private_temp),
-            str(fake_docker),
-        ],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=environment,
-    )
-    try:
-        _wait_for(state / "ready")
-        client_pid = int((state / "client.pid").read_text())
-        container_pid = int((state / "container.pid").read_text())
-        os.kill(process.pid, getattr(signal, f"SIG{signal_name}"))
-        _stdout, stderr = process.communicate(timeout=10)
-        assert process.returncode == expected_status, stderr
-        _wait_gone(client_pid)
-        _wait_gone(container_pid)
-        assert (state / "removed.cid").read_text().strip() == "a" * 64
-        assert _process_exists(unrelated.pid)
-        assert not private_temp.exists()
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
-        if unrelated.poll() is None:
-            unrelated.terminate()
-            unrelated.wait()
 
 
 def test_precommit_signal_kills_owned_publisher_before_any_artifact_is_visible(
@@ -540,12 +432,12 @@ def test_reviewed_commands_are_absolute_and_caller_path_cannot_replace_integrity
         "cut",
         "docker",
         "mkdir",
-        "mktemp",
         "rm",
         "setsid",
         "sha256sum",
         "stat",
         "tar",
+        "timeout",
     ):
         assert f"/usr/bin/{tool}" in source
     assert re.search(r"(?m)(?<!/usr/bin/)\bdocker run\b", source) is None

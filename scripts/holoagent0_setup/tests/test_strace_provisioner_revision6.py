@@ -229,8 +229,12 @@ target="${!#}"
     assert not created.exists()
 
 
+@pytest.mark.parametrize(
+    ("signal_name", "expected_status"),
+    [("HUP", 129), ("INT", 130), ("TERM", 143)],
+)
 def test_signal_before_cid_creation_removes_external_daemon_container_by_owned_name(
-    tmp_path,
+    tmp_path, signal_name, expected_status
 ):
     process, external, state, private_temp = _start_fake_docker_harness(
         tmp_path, "success"
@@ -240,9 +244,9 @@ def test_signal_before_cid_creation_removes_external_daemon_container_by_owned_n
     )
     try:
         _wait_for(state / "run-ready-before-cid")
-        os.kill(process.pid, signal.SIGTERM)
+        os.kill(process.pid, getattr(signal, f"SIG{signal_name}"))
         _stdout, stderr = process.communicate(timeout=10)
-        assert process.returncode == 143, stderr
+        assert process.returncode == expected_status, stderr
         external.wait(timeout=2)
         assert (state / "rm-called").exists()
         assert "holoagent0-strace-" in (state / "removed-args").read_text()
@@ -361,13 +365,14 @@ def test_killed_candidate_publisher_cleans_parent_known_staging_file(tmp_path):
     private_temp = tmp_path / "private-temp"
     private_temp.mkdir()
     stage = tmp_path / ".candidate-owned-stage"
+    stage.write_bytes(b"")
+    stage.chmod(0o600)
     destination = tmp_path / "candidate.json"
     ready = tmp_path / "candidate-ready"
     publisher = tmp_path / "candidate-publisher"
     publisher.write_text(
         """#!/bin/bash
 set -euo pipefail
-: > "$1"
 : > "$3"
 /usr/bin/sleep 300
 : > "$2"
@@ -381,6 +386,8 @@ set -euo pipefail
             'temp_dir="$1"',
             'install_staging_dir=""',
             'owned_candidate_staging_path="$2"',
+            'owned_candidate_device="$(/usr/bin/stat -c %d -- "$2")"',
+            'owned_candidate_inode="$(/usr/bin/stat -c %i -- "$2")"',
             helpers,
             "install_provisioner_traps",
             'run_owned_publication "$3" "$2" "$4" "$5"',
