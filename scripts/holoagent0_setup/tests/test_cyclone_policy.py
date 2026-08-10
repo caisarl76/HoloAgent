@@ -54,6 +54,8 @@ def test_four_configs_are_closed_byte_pinned_and_differ_only_by_index():
 
 def test_exact_cyclone_semantics_and_ports_are_pinned():
     contract = load_pinned_cyclone_configs(CONFIG_DIR)
+    for config in contract.configs:
+        assert config.path.read_bytes().count(b'allow_multicast="spdp"') == 1
     assert contract.domain_id == 77
     assert contract.interface == {
         "name": "lo",
