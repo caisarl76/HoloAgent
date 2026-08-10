@@ -4,6 +4,7 @@ import pytest
 
 from holoagent0_setup.trace_normalizer import (
     TraceDecodeError,
+    TraceNormalizer,
     canonical_ndjson,
     normalize_bytes,
 )
@@ -183,3 +184,24 @@ def test_pinned_test_manifest_includes_revision5_suite():
     paths = TEST_MANIFEST.read_text(encoding="utf-8").splitlines()
     assert "scripts/holoagent0_setup/tests/test_trace_normalizer_revision5.py" in paths
     assert len(paths) == len(set(paths))
+
+
+def test_record_sink_mutation_cannot_change_returned_nested_evidence():
+    sink_records = []
+
+    def mutating_sink(record):
+        sink_records.append(record)
+        record["result"]["value"] = 999
+        record["transition"]["created_fd"]["provenance"]["protocol"] = "MUTATED"
+        record["sink_only"] = {"nested": ["mutation"]}
+
+    normalizer = TraceNormalizer(record_sink=mutating_sink)
+    records = normalizer.feed(
+        _line("socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_UDP)", "7<UDP:[7]>")
+    )
+    records.extend(normalizer.finish())
+
+    assert len(sink_records) == 1
+    assert records[0]["result"]["value"] == 7
+    assert records[0]["transition"]["created_fd"]["provenance"]["protocol"] == "UDP"
+    assert "sink_only" not in records[0]

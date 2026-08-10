@@ -1,11 +1,14 @@
 import hashlib
+import importlib
 import io
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import tarfile
+import time
 
 import pytest
 
@@ -14,8 +17,9 @@ ROOT = Path(__file__).parents[1]
 REPOSITORY_ROOT = ROOT.parents[1]
 SCRIPT = ROOT / "provision_strace_6_6.sh"
 POLICY = ROOT / "policies/holoagent0-trace-tool-v1.json"
-REAL_ARCHIVE = Path("/tmp/strace-6.6.tar.xz")
 EXPECTED_SHA256 = "421b4186c06b705163e64dc85f271ebdcf67660af8667283147d5e859fc8a96c"
+REAL_ARCHIVE_OPT_IN = "HOLOAGENT0_VERIFY_STRACE_SOURCE_ARCHIVE"
+REAL_ARCHIVE_PATH = "HOLOAGENT0_STRACE_SOURCE_ARCHIVE"
 
 
 def _run(*args: str, env=None):
@@ -97,6 +101,80 @@ def _run_cleanup_trap_harness(tmp_path: Path, command: str):
     return completed, private_temp, candidate
 
 
+def _source_section(name: str) -> str:
+    source = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(rf"# BEGIN_{name}\n(.*?)\n# END_{name}", source, flags=re.DOTALL)
+    assert match is not None, f"provisioner must expose its exact {name} helpers"
+    return match.group(1)
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_for(path: Path, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {path}")
+
+
+def _wait_gone(pid: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _process_exists(pid):
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"owned process {pid} survived cleanup")
+
+
+def _write_fake_docker(path: Path) -> None:
+    path.write_text(
+        """#!/bin/bash
+set -euo pipefail
+state_dir="${FAKE_DOCKER_STATE:?}"
+command="$1"
+shift
+if [[ "$command" == "run" ]]; then
+    cidfile=""
+    while (($#)); do
+        if [[ "$1" == "--cidfile" ]]; then
+            cidfile="$2"
+            shift 2
+        else
+            shift
+        fi
+    done
+    [[ -n "$cidfile" ]]
+    cid="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    printf '%s\n' "$cid" > "$cidfile"
+    /usr/bin/setsid /usr/bin/sleep 300 &
+    container_pid=$!
+    printf '%s\n' "$$" > "$state_dir/client.pid"
+    printf '%s\n' "$container_pid" > "$state_dir/container.pid"
+    : > "$state_dir/ready"
+    wait "$container_pid"
+elif [[ "$command" == "rm" ]]; then
+    [[ "$1" == "--force" ]]
+    [[ "$2" == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ]]
+    container_pid="$(cat "$state_dir/container.pid")"
+    /bin/kill -TERM -- "-$container_pid"
+    printf '%s\n' "$2" > "$state_dir/removed.cid"
+else
+    exit 64
+fi
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+
+
 def test_script_has_exact_usage_and_fails_closed_for_bad_cli(tmp_path):
     completed = _run()
     assert completed.returncode == 2
@@ -109,32 +187,45 @@ def test_script_has_exact_usage_and_fails_closed_for_bad_cli(tmp_path):
     assert _run("--output-dir", str(tmp_path / "../escape")).returncode != 0
 
 
-def test_real_archive_contract_is_verified_offline_before_pins(tmp_path):
-    assert REAL_ARCHIVE.stat().st_size == 2420364
-    assert hashlib.sha256(REAL_ARCHIVE.read_bytes()).hexdigest() == EXPECTED_SHA256
+def test_source_archive_contract_is_explicit_opt_in_and_fails_clearly_without_path():
+    if os.environ.get(REAL_ARCHIVE_OPT_IN) != "1":
+        pytest.skip(f"set {REAL_ARCHIVE_OPT_IN}=1 to run the pinned source gate")
+    configured = os.environ.get(REAL_ARCHIVE_PATH)
+    assert configured, (
+        f"{REAL_ARCHIVE_PATH} must name the immutable strace 6.6 archive when "
+        f"{REAL_ARCHIVE_OPT_IN}=1"
+    )
+    archive = Path(configured)
+    assert archive.is_file() and not archive.is_symlink()
+    assert archive.stat().st_size == 2420364
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == EXPECTED_SHA256
+
+
+def test_archive_contract_is_checked_before_pending_build_pins(tmp_path):
+    archive = tmp_path / "not-the-pinned-source.tar.xz"
+    archive.write_bytes(b"hermetic-invalid-source")
     before = POLICY.read_bytes()
     completed = _run(
-        "--archive", str(REAL_ARCHIVE), "--output-dir", str(tmp_path / "install")
+        "--archive", str(archive), "--output-dir", str(tmp_path / "install")
     )
-    assert completed.returncode == 3
-    assert "PENDING_REPRODUCIBLE_BUILD" in completed.stderr
+    assert completed.returncode == 2
+    assert "source archive size mismatch" in completed.stderr
+    assert "PENDING_REPRODUCIBLE_BUILD" not in completed.stderr
     assert POLICY.read_bytes() == before
     assert not (tmp_path / "install").exists()
 
 
 def test_archive_must_be_regular_nonsymlink_and_exact_size_hash(tmp_path):
     output = str(tmp_path / "install")
-    symlink = tmp_path / "archive-link"
-    symlink.symlink_to(REAL_ARCHIVE)
-    assert _run("--archive", str(symlink), "--output-dir", output).returncode != 0
     wrong_size = tmp_path / "wrong-size.tar.xz"
     wrong_size.write_bytes(b"bad")
+    symlink = tmp_path / "archive-link"
+    symlink.symlink_to(wrong_size)
+    assert _run("--archive", str(symlink), "--output-dir", output).returncode != 0
     result = _run("--archive", str(wrong_size), "--output-dir", output)
     assert result.returncode != 0 and "size" in result.stderr.lower()
     wrong_hash = tmp_path / "wrong-hash.tar.xz"
-    data = bytearray(REAL_ARCHIVE.read_bytes())
-    data[-1] ^= 1
-    wrong_hash.write_bytes(data)
+    wrong_hash.write_bytes(b"\0" * 2420364)
     result = _run("--archive", str(wrong_hash), "--output-dir", output)
     assert result.returncode != 0 and "sha256" in result.stderr.lower()
 
@@ -166,16 +257,175 @@ def test_private_temp_cleanup_and_no_policy_mutation(tmp_path):
     env = os.environ.copy()
     env["TMPDIR"] = str(temp_parent)
     before = POLICY.read_bytes()
+    archive = tmp_path / "invalid-source.tar.xz"
+    archive.write_bytes(b"invalid")
     result = _run(
         "--archive",
-        str(REAL_ARCHIVE),
+        str(archive),
         "--output-dir",
         str(tmp_path / "install"),
         env=env,
     )
-    assert result.returncode == 3
+    assert result.returncode == 2
     assert list(temp_parent.iterdir()) == []
     assert POLICY.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("signal_name", "expected_status"),
+    [("HUP", 129), ("INT", 130), ("TERM", 143)],
+)
+def test_signal_terminates_reaps_owned_fake_docker_and_removes_exact_container_only(
+    tmp_path, signal_name, expected_status
+):
+    helpers = _source_section("OWNED_PROCESS_HELPERS")
+    state = tmp_path / "state"
+    state.mkdir()
+    private_temp = tmp_path / "private-temp"
+    private_temp.mkdir()
+    fake_docker = tmp_path / "fake-docker"
+    _write_fake_docker(fake_docker)
+    unrelated = subprocess.Popen(
+        ["/usr/bin/setsid", "/usr/bin/sleep", "300"], start_new_session=False
+    )
+    harness = "\n".join(
+        (
+            "set -euo pipefail",
+            'temp_dir="$1"',
+            'docker_bin="$2"',
+            helpers,
+            "install_provisioner_traps",
+            'run_owned_docker "$docker_bin" run --network=none fake-image true',
+        )
+    )
+    environment = os.environ.copy()
+    environment["FAKE_DOCKER_STATE"] = str(state)
+    process = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            harness,
+            "owned-docker-harness",
+            str(private_temp),
+            str(fake_docker),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+    )
+    try:
+        _wait_for(state / "ready")
+        client_pid = int((state / "client.pid").read_text())
+        container_pid = int((state / "container.pid").read_text())
+        os.kill(process.pid, getattr(signal, f"SIG{signal_name}"))
+        _stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == expected_status, stderr
+        _wait_gone(client_pid)
+        _wait_gone(container_pid)
+        assert (state / "removed.cid").read_text().strip() == "a" * 64
+        assert _process_exists(unrelated.pid)
+        assert not private_temp.exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        if unrelated.poll() is None:
+            unrelated.terminate()
+            unrelated.wait()
+
+
+def test_precommit_signal_kills_owned_publisher_before_any_artifact_is_visible(
+    tmp_path,
+):
+    helpers = _source_section("OWNED_PROCESS_HELPERS")
+    private_temp = tmp_path / "private-temp"
+    private_temp.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    destination = tmp_path / "candidate.json"
+    publisher = tmp_path / "fake-publisher"
+    publisher.write_text(
+        """#!/bin/bash
+set -euo pipefail
+: > "$1/ready"
+/usr/bin/sleep 300
+: > "$2"
+""",
+        encoding="utf-8",
+    )
+    publisher.chmod(0o700)
+    harness = "\n".join(
+        (
+            "set -euo pipefail",
+            'temp_dir="$1"',
+            helpers,
+            "install_provisioner_traps",
+            'run_owned_publication "$2" "$3" "$4"',
+        )
+    )
+    process = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            harness,
+            "publication-harness",
+            str(private_temp),
+            str(publisher),
+            str(state),
+            str(destination),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    _wait_for(state / "ready")
+    os.kill(process.pid, signal.SIGTERM)
+    _stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 143, stderr
+    assert not destination.exists()
+    assert not private_temp.exists()
+
+
+def test_candidate_and_install_publication_are_atomic_no_replace(tmp_path):
+    publication = importlib.import_module("holoagent0_setup.strace_publication")
+    candidate = tmp_path / "candidate.json"
+    evidence = {"schema_version": "candidate.v1", "nested": {"value": 1}}
+    publication.publish_candidate_evidence(candidate, evidence)
+    assert json.loads(candidate.read_text()) == evidence
+    assert candidate.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(FileExistsError):
+        publication.publish_candidate_evidence(candidate, {"attacker": True})
+    assert json.loads(candidate.read_text()) == evidence
+
+    staged = tmp_path / ".install-staged"
+    staged.mkdir()
+    (staged / "strace").write_bytes(b"reviewed-elf")
+    staged_inode = staged.stat().st_ino
+    installed = tmp_path / "install"
+    publication.publish_install_directory(staged, installed)
+    assert installed.stat().st_ino == staged_inode
+    assert (installed / "strace").read_bytes() == b"reviewed-elf"
+
+
+def test_install_publication_rejects_empty_destination_race_and_cross_filesystem_shape(
+    tmp_path,
+):
+    publication = importlib.import_module("holoagent0_setup.strace_publication")
+    staged = tmp_path / ".install-staged"
+    staged.mkdir()
+    destination = tmp_path / "install"
+    destination.mkdir()
+    destination_inode = destination.stat().st_ino
+    with pytest.raises(FileExistsError):
+        publication.publish_install_directory(staged, destination)
+    assert destination.stat().st_ino == destination_inode
+    assert staged.is_dir()
+
+    other_parent = tmp_path / "other"
+    other_parent.mkdir()
+    with pytest.raises(publication.PublicationError, match="same parent"):
+        publication.publish_install_directory(staged, other_parent / "install")
 
 
 @pytest.mark.parametrize(
@@ -239,7 +489,9 @@ def test_candidate_measurement_is_separate_from_reviewed_install_and_never_edits
     assert "candidate-evidence" in source
     assert "CANDIDATE_MEASUREMENT" in source
     assert "runtime pins are required for reviewed install" in source
-    assert "os.replace" in source
+    assert "atomic_write_json_no_replace" in source
+    assert "/usr/bin/mv --" not in source
+    assert "run_owned_publication" in source
     assert (
         "policy_path.write" not in source
         and "POLICY_PATH"
@@ -266,8 +518,8 @@ def test_reviewed_commands_are_absolute_and_caller_path_cannot_replace_integrity
         "docker",
         "mkdir",
         "mktemp",
-        "mv",
         "rm",
+        "setsid",
         "sha256sum",
         "stat",
         "tar",
