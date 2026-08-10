@@ -397,6 +397,36 @@ def test_signal_survives_successful_publication_rollback(tmp_path):
         measurement.close()
 
 
+def test_explicit_interruption_survives_rollback_without_latch(tmp_path):
+    ns = _namespace()
+    staged, runner, pins, measurement = _elf_fixture(tmp_path, ns)
+    destination = tmp_path / "install"
+    quarantine = tmp_path / ".quarantine"
+
+    def interrupt_after_rename(_installed):
+        raise ns["ProvisioningInterrupted"](143)
+
+    try:
+        with pytest.raises(
+            ns["ProvisioningInterrupted"], match="ROLLED_BACK"
+        ) as captured:
+            ns["publish_install_directory"](
+                staged,
+                destination,
+                quarantine,
+                measurement,
+                pins,
+                runner,
+                deadline=0.5,
+                after_rename=interrupt_after_rename,
+            )
+        assert isinstance(captured.value, ns["PublicationError"])
+        assert captured.value.status == 143
+        assert captured.value.transition.state == "QUARANTINED"
+    finally:
+        measurement.close()
+
+
 def test_cli_cleanup_failure_overrides_archive_error_and_runs_later_finalizer(
     tmp_path, monkeypatch
 ):
