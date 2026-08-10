@@ -20,10 +20,13 @@ class Records:
         self.index = 0
 
     def make(self, pid, syscall, **fields):
+        event_index = self.index
         record = {
             "kind": "syscall",
             "pid": pid,
-            "record_index": self.index,
+            "record_index": event_index,
+            "entry_index": event_index,
+            "exit_index": event_index,
             "syscall": syscall,
             "result": {"value": fields.pop("result", 0)},
         }
@@ -455,6 +458,39 @@ def test_tcp_and_ipv6_are_rejected_even_inside_the_window(domain, protocol):
         "FAIL",
         "UNEXPECTED_NETWORK_ATTEMPT",
     )
+
+
+@pytest.mark.parametrize(
+    "domain,protocol",
+    [
+        ("AF_UNIX", 0),
+        ("AF_NETLINK", "NETLINK_ROUTE"),
+    ],
+)
+def test_non_ip_observer_sockets_are_neutral(domain, protocol):
+    policy = make_policy()
+    records = Records()
+    decision = policy.feed(
+        records.socket(COORDINATOR_PID, 7, domain=domain, protocol=protocol)
+    )
+    assert decision.status == "PASS"
+
+
+def test_missing_or_nonmonotonic_marker_indices_fail_closed():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    unindexed = records.socket(PARTICIPANT_PIDS[0], 7)
+    unindexed.pop("entry_index")
+    unindexed.pop("exit_index")
+    assert policy.feed(unindexed).reason == "UNEXPECTED_NETWORK_ATTEMPT"
+
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    invalid_end = records.marker("END")
+    invalid_end["entry_index"] = 0
+    assert policy.feed(invalid_end).reason == "INVALID_MARKER"
 
 
 def test_meta_and_data_port_sets_are_closed_and_disjoint():
