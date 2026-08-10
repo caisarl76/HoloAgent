@@ -64,7 +64,7 @@ def test_fixture_manifest_is_closed_canonical_digest_bound_and_complete():
     assert set(manifest) == {"$id", "schema_version", "cases", "additionalProperties"}
     assert manifest["additionalProperties"] is False
     names = [case["name"] for case in manifest["cases"]]
-    assert len(names) == len(set(names)) == 8
+    assert len(names) == len(set(names)) == 9
     declared = {"manifest-v1.json"}
     for case in manifest["cases"]:
         allowed = {

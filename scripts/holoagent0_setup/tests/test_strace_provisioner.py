@@ -165,6 +165,15 @@ def test_recipe_is_pinned_fail_closed_and_build_command_is_deterministic():
     assert row["runtime"]["review_state"] == "PENDING_REPRODUCIBLE_BUILD"
 
 
+def test_recipe_uses_fixed_reviewed_gcc_builder_repository_with_pending_digest():
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert '"docker.io/library/gcc@${pins[2]}"' in source
+    assert "docker.io/library/debian@" not in source
+    row = json.loads(POLICY.read_text(encoding="utf-8"))["rows"][0]
+    assert row["build"]["container_image_digest"] is None
+    assert row["build"]["review_state"] == "PENDING_REPRODUCIBLE_BUILD"
+
+
 def test_candidate_measurement_is_separate_from_reviewed_install_and_never_edits_policy():
     source = SCRIPT.read_text(encoding="utf-8")
     assert "candidate-evidence" in source
