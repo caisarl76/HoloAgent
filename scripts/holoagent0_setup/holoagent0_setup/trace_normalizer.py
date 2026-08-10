@@ -4,12 +4,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import errno as errno_module
+import ipaddress
 import json
 import os
 import re
 from typing import Iterable
 
 
+RAW_PAYLOAD_SYSCALL_ORDER = (
+    "read",
+    "readv",
+    "pread64",
+    "preadv",
+    "preadv2",
+    "write",
+    "writev",
+    "pwrite64",
+    "pwritev",
+    "pwritev2",
+    "sendfile",
+    "splice",
+    "vmsplice",
+    "tee",
+    "copy_file_range",
+)
 STRACE_ARGUMENTS = (
     "--kill-on-exit",
     "-f",
@@ -20,27 +38,10 @@ STRACE_ARGUMENTS = (
     "--string-limit=1048576",
     "--quiet=none",
     "--trace=all",
+    f"--raw={','.join(RAW_PAYLOAD_SYSCALL_ORDER)}",
 )
 STRACE_ENVIRONMENT = {"LC_ALL": "C", "TZ": "UTC"}
-RAW_PAYLOAD_SYSCALLS = frozenset(
-    {
-        "read",
-        "readv",
-        "pread64",
-        "preadv",
-        "preadv2",
-        "write",
-        "writev",
-        "pwrite64",
-        "pwritev",
-        "pwritev2",
-        "sendfile",
-        "splice",
-        "vmsplice",
-        "tee",
-        "copy_file_range",
-    }
-)
+RAW_PAYLOAD_SYSCALLS = frozenset(RAW_PAYLOAD_SYSCALL_ORDER)
 DECODED_ADDRESS_SYSCALLS = frozenset(
     {"sendto", "recvfrom", "sendmsg", "recvmsg", "sendmmsg", "recvmmsg"}
 )
@@ -52,8 +53,10 @@ _RESUMED = re.compile(r"^<\.\.\. ([A-Za-z_][A-Za-z0-9_]*) resumed>(.*)$")
 _SIGNAL = re.compile(r"^--- (SIG[A-Z0-9]+) \{.*\} ---$")
 _EXITED = re.compile(r"^\+\+\+ exited with ([0-9]+) \+\+\+$")
 _KILLED = re.compile(r"^\+\+\+ killed by (SIG[A-Z0-9]+)(?: \(core dumped\))? \+\+\+$")
-_FD = re.compile(r"^(-?[0-9]+)(?:<([^>]+)>)?$")
-_INTEGER = re.compile(r"^-?(?:0|[1-9][0-9]*|0x[0-9a-f]+)$")
+_NUMBER_TEXT = r"(?:0|[1-9][0-9]*|0x[0-9a-f]+)"
+_FD = re.compile(r"^([0-9]+)(?:<([^>]*)>)?$")
+_INTEGER = re.compile(rf"^-?{_NUMBER_TEXT}$")
+_RAW_INTEGER = re.compile(r"^(?:0|0x[0-9a-f]+)$")
 _ERRNO = re.compile(r"^(-1) ([A-Z][A-Z0-9_]*) \(([^\r\n()]*)\)$")
 
 
@@ -119,16 +122,34 @@ def _integer(value: str, code: str) -> int:
         raise _fail(code) from error
 
 
+def _raw_integer(value: str, code: str) -> int:
+    if _RAW_INTEGER.fullmatch(value) is None:
+        raise _fail(code)
+    return int(value, 0)
+
+
+def _provenance(value: str) -> dict[str, object]:
+    inode = re.fullmatch(r"(socket|pipe):\[([0-9]+)\]", value)
+    if inode is not None:
+        return {"kind": inode.group(1), "inode": int(inode.group(2))}
+    anon = re.fullmatch(r"anon_inode:\[([A-Za-z0-9_-]+)\]", value)
+    if anon is not None:
+        return {"kind": "anon_inode", "type": anon.group(1)}
+    if value.startswith("/"):
+        return {"kind": "path"}
+    raise _fail("unsupported-fd-provenance")
+
+
 def _fd(value: str, code: str) -> dict[str, object]:
     match = _FD.fullmatch(value)
     if match is None:
         raise _fail(code)
-    record: dict[str, object] = {"fd": int(match.group(1))}
+    record: dict[str, object] = {"fd": int(match.group(1), 0)}
     provenance = match.group(2)
     if provenance is not None:
         if len(provenance) > 4096 or any(ord(char) < 32 for char in provenance):
             raise _fail("invalid-fd-provenance")
-        record["provenance"] = provenance
+        record["provenance"] = _provenance(provenance)
     return record
 
 
@@ -150,13 +171,23 @@ def _result(value: str) -> dict[str, object]:
             "errno": errno.group(2),
             "errno_text": errno.group(3),
         }
-    # A returned descriptor may carry -yy provenance. Do not persist it as a result.
     descriptor = _FD.fullmatch(value)
     if descriptor is not None:
-        return {"value": int(descriptor.group(1))}
+        fd = _fd(value, "invalid-return-fd")
+        result: dict[str, object] = {"value": fd["fd"]}
+        if descriptor.group(2) is not None:
+            result["fd"] = fd
+        return result
     if not _INTEGER.fullmatch(value):
         raise _fail("unsupported-return")
     return {"value": int(value, 0)}
+
+
+def _raw_result(value: str) -> dict[str, object]:
+    errno = _ERRNO.fullmatch(value)
+    if errno is not None:
+        return _result(value)
+    return {"value": _raw_integer(value, "invalid-raw-return")}
 
 
 def _flags(value: str) -> list[str]:
@@ -168,160 +199,372 @@ def _flags(value: str) -> list[str]:
     return flags
 
 
-def _address(arguments_text: str) -> dict[str, object] | None:
-    family_match = re.search(r"sa_family=(AF_[A-Z0-9_]+)", arguments_text)
-    if family_match is None:
-        if "NULL" in arguments_text:
-            return None
-        raise _fail("missing-socket-family")
-    family = family_match.group(1)
-    result: dict[str, object] = {"family": family}
-    port = re.search(r"(?:sin6?_port)=htons\(([0-9]+)\)", arguments_text)
-    if port is not None:
-        value = int(port.group(1))
-        if value > 65535:
-            raise _fail("invalid-socket-port")
-        result["port"] = value
-    ipv4 = re.search(r'sin_addr=inet_addr\("([^"\\]+)"\)', arguments_text)
-    ipv6 = re.search(r'sin6_addr=inet_pton\(AF_INET6, "([^"\\]+)"\)', arguments_text)
-    if ipv4 is not None:
-        result["ip"] = ipv4.group(1)
-    elif ipv6 is not None:
-        result["ip"] = ipv6.group(1)
-    elif family == "AF_UNIX":
-        unix = re.search(r'sun_path="([^"\\]*)"', arguments_text)
-        if unix is not None:
-            result["path"] = unix.group(1)
+def _fields(value: str, code: str) -> dict[str, str]:
+    if not (value.startswith("{") and value.endswith("}")):
+        raise _fail(code)
+    inner = value[1:-1]
+    result: dict[str, str] = {}
+    for item in _split_arguments(inner):
+        key, separator, field_value = item.partition("=")
+        if (
+            separator != "="
+            or re.fullmatch(r"[a-z][a-z0-9_]*", key) is None
+            or key in result
+            or not field_value
+        ):
+            raise _fail(code)
+        result[key] = field_value
     return result
 
 
-def _scm_rights(arguments_text: str) -> list[dict[str, object]]:
-    match = re.search(r"cmsg_type=SCM_RIGHTS, cmsg_data=\[(.*?)\]\}", arguments_text)
-    if match is None:
-        return []
-    return [
-        _fd(value, "invalid-scm-rights-fd")
-        for value in _split_arguments(match.group(1))
-    ]
+def _vector(value: str, code: str) -> list[str]:
+    if not (value.startswith("[") and value.endswith("]")):
+        raise _fail(code)
+    inner = value[1:-1]
+    return [] if not inner else _split_arguments(inner)
 
 
-_RAW_FD_INDEXES = {
-    "read": (0,),
-    "write": (0,),
-    "pread64": (0,),
-    "pwrite64": (0,),
-    "readv": (0,),
-    "writev": (0,),
-    "preadv": (0,),
-    "pwritev": (0,),
-    "preadv2": (0,),
-    "pwritev2": (0,),
-    "sendfile": (0, 1),
-    "splice": (0, 2),
-    "vmsplice": (0,),
-    "tee": (0, 1),
-    "copy_file_range": (0, 2),
+def _address(value: str) -> dict[str, object] | None:
+    if value == "NULL":
+        return None
+    fields = _fields(value, "sockaddr-grammar")
+    family = fields.get("sa_family")
+    if family not in {"AF_INET", "AF_INET6", "AF_UNIX"}:
+        raise _fail("unsupported-socket-family")
+    result: dict[str, object] = {"family": family}
+    if family == "AF_INET":
+        if set(fields) != {"sa_family", "sin_port", "sin_addr"}:
+            raise _fail("sockaddr-inet-fields")
+        port = re.fullmatch(r"htons\(([0-9]+)\)", fields["sin_port"])
+        address = re.fullmatch(r'inet_addr\("([^"\\]+)"\)', fields["sin_addr"])
+        if port is None or address is None:
+            raise _fail("sockaddr-inet-values")
+        try:
+            ip = str(ipaddress.IPv4Address(address.group(1)))
+        except ipaddress.AddressValueError as error:
+            raise _fail("sockaddr-inet-address") from error
+    elif family == "AF_INET6":
+        if set(fields) != {"sa_family", "sin6_port", "sin6_addr"}:
+            raise _fail("sockaddr-inet6-fields")
+        port = re.fullmatch(r"htons\(([0-9]+)\)", fields["sin6_port"])
+        address = re.fullmatch(
+            r'inet_pton\(AF_INET6, "([^"\\]+)"\)', fields["sin6_addr"]
+        )
+        if port is None or address is None:
+            raise _fail("sockaddr-inet6-values")
+        try:
+            ip = str(ipaddress.IPv6Address(address.group(1)))
+        except ipaddress.AddressValueError as error:
+            raise _fail("sockaddr-inet6-address") from error
+    else:
+        if set(fields) != {"sa_family", "sun_path"}:
+            raise _fail("sockaddr-unix-fields")
+        if re.fullmatch(r'"(?:[^"\\]|\\.)*"', fields["sun_path"]) is None:
+            raise _fail("sockaddr-unix-path")
+        result["path"] = {"kind": "unix"}
+        return result
+    port_value = int(port.group(1))
+    if port_value > 65535:
+        raise _fail("invalid-socket-port")
+    result.update(port=port_value, ip=ip)
+    return result
+
+
+def _control(value: str) -> dict[str, object] | None:
+    if value == "NULL":
+        return None
+    groups: list[list[dict[str, object]]] = []
+    for item in _vector(value, "control-vector"):
+        fields = _fields(item, "control-message")
+        if fields.get("cmsg_type") != "SCM_RIGHTS":
+            continue
+        if fields.get("cmsg_level") != "SOL_SOCKET" or "cmsg_data" not in fields:
+            raise _fail("scm-rights-fields")
+        descriptors = [
+            _fd(fd, "invalid-scm-rights-fd")
+            for fd in _vector(fields["cmsg_data"], "scm-rights-vector")
+        ]
+        if not descriptors:
+            raise _fail("empty-scm-rights")
+        groups.append(descriptors)
+    return None if not groups else {"scm_rights": groups}
+
+
+def _message(value: str) -> dict[str, object]:
+    fields = _fields(value, "message-header")
+    required = {
+        "msg_name",
+        "msg_namelen",
+        "msg_iov",
+        "msg_iovlen",
+        "msg_control",
+        "msg_controllen",
+        "msg_flags",
+    }
+    if set(fields) != required:
+        raise _fail("message-header-fields")
+    iov_count = _integer(fields["msg_iovlen"], "invalid-message-iov-count")
+    if iov_count != len(_vector(fields["msg_iov"], "message-iov-vector")):
+        raise _fail("message-iov-count-mismatch")
+    result: dict[str, object] = {"lengths": {"iov_count": iov_count}}
+    address = _address(fields["msg_name"])
+    if address is not None:
+        result["address"] = address
+    control = _control(fields["msg_control"])
+    if control is not None:
+        result["control"] = control
+    return result
+
+
+_RAW_GRAMMAR = {
+    "read": (3, (0,), 2, None, "count"),
+    "readv": (3, (0,), 2, None, "iov_count"),
+    "pread64": (4, (0,), 2, None, "count"),
+    "preadv": (4, (0,), 2, None, "iov_count"),
+    "preadv2": (6, (0,), 2, 5, "iov_count"),
+    "write": (3, (0,), 2, None, "count"),
+    "writev": (3, (0,), 2, None, "iov_count"),
+    "pwrite64": (4, (0,), 2, None, "count"),
+    "pwritev": (4, (0,), 2, None, "iov_count"),
+    "pwritev2": (6, (0,), 2, 5, "iov_count"),
+    "sendfile": (4, (0, 1), 3, None, "count"),
+    "splice": (6, (0, 2), 4, 5, "count"),
+    "vmsplice": (4, (0,), 2, 3, "iov_count"),
+    "tee": (4, (0, 1), 2, 3, "count"),
+    "copy_file_range": (6, (0, 2), 4, 5, "count"),
 }
 
 
 def _raw_metadata(name: str, arguments: list[str]) -> dict[str, object]:
-    if len(arguments) < 3:
+    arity, fd_indexes, length_index, flag_index, length_key = _RAW_GRAMMAR[name]
+    if len(arguments) != arity:
         raise _fail("raw-syscall-arity")
-    indexes = _RAW_FD_INDEXES[name]
-    # Compact synthetic fixtures use the shared fd/buffer/count shape. Real shapes
-    # still use the reviewed positional descriptor indexes above.
-    if max(indexes) >= len(arguments) or any(
-        _FD.fullmatch(arguments[index]) is None for index in indexes
-    ):
-        indexes = (0,)
+    for index, argument in enumerate(arguments):
+        if index in fd_indexes:
+            _raw_integer(argument, "invalid-raw-fd")
+        else:
+            _raw_integer(argument, "invalid-raw-number")
     metadata: dict[str, object] = {
-        "fds": [_fd(arguments[index], "invalid-raw-fd") for index in indexes]
+        "fds": [
+            {"fd": _raw_integer(arguments[index], "invalid-raw-fd")}
+            for index in fd_indexes
+        ],
+        "lengths": {
+            length_key: _raw_integer(arguments[length_index], "invalid-raw-length")
+        },
     }
-    if name in {
-        "readv",
-        "writev",
-        "preadv",
-        "pwritev",
-        "preadv2",
-        "pwritev2",
-        "vmsplice",
-    }:
-        metadata["lengths"] = {"iov_count": _integer(arguments[2], "invalid-iov-count")}
-    else:
-        count_index = {"sendfile": 3, "splice": 4, "tee": 2, "copy_file_range": 4}.get(
-            name, 2
-        )
-        if count_index >= len(arguments) or not _INTEGER.fullmatch(
-            arguments[count_index]
-        ):
-            count_index = 2
-        metadata["lengths"] = {
-            "count": _integer(arguments[count_index], "invalid-count")
-        }
-    flag_index = {
-        "preadv2": 5,
-        "pwritev2": 5,
-        "splice": 5,
-        "vmsplice": 3,
-        "tee": 3,
-        "copy_file_range": 5,
-    }.get(name)
-    if flag_index is not None and flag_index < len(arguments):
-        metadata["flags"] = _flags(arguments[flag_index])
+    if flag_index is not None:
+        metadata["flags"] = _raw_integer(arguments[flag_index], "invalid-raw-flags")
     return metadata
 
 
-def _address_metadata(
-    name: str, arguments: list[str], arguments_text: str
-) -> dict[str, object]:
-    if not arguments:
+def _address_metadata(name: str, arguments: list[str]) -> dict[str, object]:
+    arity = {
+        "sendto": 6,
+        "recvfrom": 6,
+        "sendmsg": 3,
+        "recvmsg": 3,
+        "sendmmsg": 4,
+        "recvmmsg": 5,
+    }[name]
+    if len(arguments) != arity:
         raise _fail("address-syscall-arity")
     metadata: dict[str, object] = {"fds": [_fd(arguments[0], "invalid-socket-fd")]}
-    address = _address(arguments_text)
-    if address is not None:
-        metadata["address"] = address
-    rights = _scm_rights(arguments_text)
-    if rights:
-        metadata["control"] = {"scm_rights": rights}
     if name in {"sendto", "recvfrom"}:
-        if len(arguments) < 4:
-            raise _fail("address-syscall-arity")
         metadata["lengths"] = {"count": _integer(arguments[2], "invalid-count")}
         sockaddr_length = re.fullmatch(r"\[?([0-9]+)\]?", arguments[-1])
-        if sockaddr_length is not None:
-            metadata["lengths"]["sockaddr"] = int(sockaddr_length.group(1))
+        if sockaddr_length is None:
+            raise _fail("invalid-sockaddr-length")
+        metadata["lengths"]["sockaddr"] = int(sockaddr_length.group(1))
         metadata["flags"] = _flags(arguments[3])
-    elif name in {"sendmsg", "recvmsg"} and arguments[1].startswith("{"):
-        if len(arguments) < 3:
-            raise _fail("message-syscall-arity")
+        address = _address(arguments[4])
+        if address is not None:
+            metadata["address"] = address
+    elif name in {"sendmsg", "recvmsg"}:
+        message = _message(arguments[1])
+        metadata.update(message)
         metadata["flags"] = _flags(arguments[2])
-        iov_count = re.search(r"msg_iovlen=([0-9]+)", arguments_text)
-        iov_lengths = [
-            int(value) for value in re.findall(r"iov_len=([0-9]+)", arguments_text)
-        ]
-        lengths: dict[str, int] = {}
-        if iov_count is not None:
-            lengths["iov_count"] = int(iov_count.group(1))
-        if iov_lengths:
-            lengths["message"] = sum(iov_lengths)
-        if lengths:
-            metadata["lengths"] = lengths
-    elif name in {"sendmmsg", "recvmmsg"} and arguments[1].startswith("["):
-        # sendmmsg/recvmmsg expose vector count and flags after the transient vector.
-        if len(arguments) >= 4 and _INTEGER.fullmatch(arguments[2]):
-            metadata["lengths"] = {
-                "message_count": _integer(arguments[2], "invalid-message-count")
-            }
-            metadata["flags"] = _flags(arguments[3])
-        else:
-            metadata["flags"] = _flags(arguments[3]) if len(arguments) > 3 else []
     else:
-        # Shared address-form coverage still follows fd/payload/count/flags/address/len.
-        if len(arguments) < 4:
-            raise _fail("address-syscall-arity")
-        metadata["lengths"] = {"count": _integer(arguments[2], "invalid-count")}
+        messages = []
+        for item in _vector(arguments[1], "message-vector"):
+            fields = _fields(item, "message-vector-entry")
+            if set(fields) != {"msg_hdr", "msg_len"}:
+                raise _fail("message-vector-entry-fields")
+            messages.append(_message(fields["msg_hdr"]))
+        message_count = _integer(arguments[2], "invalid-message-count")
+        if len(messages) != message_count:
+            raise _fail("message-vector-count-mismatch")
+        metadata["messages"] = messages
+        metadata["lengths"] = {"message_count": message_count}
         metadata["flags"] = _flags(arguments[3])
     return metadata
+
+
+_TRANSITION_SYSCALLS = frozenset(
+    {
+        "socket",
+        "socketpair",
+        "accept",
+        "accept4",
+        "bind",
+        "connect",
+        "getsockname",
+        "dup",
+        "dup2",
+        "dup3",
+        "fcntl",
+        "fork",
+        "vfork",
+        "clone",
+        "execve",
+        "close",
+        "close_range",
+        "unshare",
+        "pidfd_getfd",
+    }
+)
+
+
+def _arity(arguments: list[str], expected: int, code: str) -> None:
+    if len(arguments) != expected:
+        raise _fail(code)
+
+
+def _returned_fd(result: dict[str, object], code: str) -> dict[str, object]:
+    descriptor = result.get("fd")
+    if not isinstance(descriptor, dict):
+        raise _fail(code)
+    return descriptor
+
+
+def _named_arguments(arguments: list[str], code: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for argument in arguments:
+        key, separator, value = argument.partition("=")
+        if (
+            separator != "="
+            or re.fullmatch(r"[a-z][a-z0-9_]*", key) is None
+            or key in result
+            or not value
+        ):
+            raise _fail(code)
+        result[key] = value
+    return result
+
+
+def _transition_metadata(
+    name: str, arguments: list[str], result: dict[str, object]
+) -> dict[str, object]:
+    transition: dict[str, object] = {"operation": name}
+    if name == "socket":
+        _arity(arguments, 3, "socket-arity")
+        transition.update(
+            domain=arguments[0],
+            socket_type=_flags(arguments[1]),
+            created_fd=_returned_fd(result, "socket-return-fd"),
+        )
+    elif name == "socketpair":
+        _arity(arguments, 4, "socketpair-arity")
+        descriptors = [
+            _fd(value, "socketpair-fd")
+            for value in _vector(arguments[3], "socketpair-vector")
+        ]
+        if len(descriptors) != 2:
+            raise _fail("socketpair-count")
+        transition.update(
+            domain=arguments[0],
+            socket_type=_flags(arguments[1]),
+            created_fds=descriptors,
+        )
+    elif name in {"accept", "accept4"}:
+        _arity(arguments, 3 if name == "accept" else 4, f"{name}-arity")
+        transition.update(
+            source_fd=_fd(arguments[0], f"{name}-source-fd"),
+            address=_address(arguments[1]),
+            created_fd=_returned_fd(result, f"{name}-return-fd"),
+        )
+        if name == "accept4":
+            transition["flags"] = _flags(arguments[3])
+    elif name in {"bind", "connect", "getsockname"}:
+        _arity(arguments, 3, f"{name}-arity")
+        transition.update(
+            fd=_fd(arguments[0], f"{name}-fd"),
+            address=_address(arguments[1]),
+        )
+    elif name == "dup":
+        _arity(arguments, 1, "dup-arity")
+        transition.update(
+            source_fd=_fd(arguments[0], "dup-source-fd"),
+            created_fd=_returned_fd(result, "dup-return-fd"),
+        )
+    elif name in {"dup2", "dup3"}:
+        _arity(arguments, 2 if name == "dup2" else 3, f"{name}-arity")
+        transition.update(
+            source_fd=_fd(arguments[0], f"{name}-source-fd"),
+            target_fd=_fd(arguments[1], f"{name}-target-fd"),
+            created_fd=_returned_fd(result, f"{name}-return-fd"),
+        )
+        if name == "dup3":
+            transition["flags"] = _flags(arguments[2])
+    elif name == "fcntl":
+        _arity(arguments, 3, "fcntl-arity")
+        if arguments[1] not in {"F_DUPFD", "F_DUPFD_CLOEXEC"}:
+            raise _fail("unreviewed-fcntl-command")
+        transition.update(
+            operation="fcntl_dup",
+            source_fd=_fd(arguments[0], "fcntl-source-fd"),
+            minimum_fd=_integer(arguments[2], "fcntl-minimum-fd"),
+            cloexec=arguments[1] == "F_DUPFD_CLOEXEC",
+            created_fd=_returned_fd(result, "fcntl-return-fd"),
+        )
+    elif name in {"fork", "vfork"}:
+        _arity(arguments, 0, f"{name}-arity")
+        transition.update(
+            child_pid=result["value"],
+            fd_table="copied" if name == "fork" else "shared-until-exec",
+        )
+    elif name == "clone":
+        fields = _named_arguments(arguments, "clone-arguments")
+        flags = fields.get("flags")
+        if flags is None:
+            raise _fail("clone-flags")
+        flag_names = _flags(flags)
+        transition.update(
+            child_pid=result["value"],
+            flags=flag_names,
+            fd_table="shared" if "CLONE_FILES" in flag_names else "copied",
+        )
+    elif name == "execve":
+        _arity(arguments, 3, "execve-arity")
+        if result.get("value") != 0:
+            raise _fail("execve-not-successful")
+        transition.update(operation="exec", cloexec_fds="closed")
+    elif name == "close":
+        _arity(arguments, 1, "close-arity")
+        transition["closed_fd"] = _fd(arguments[0], "close-fd")
+    elif name == "close_range":
+        _arity(arguments, 3, "close-range-arity")
+        transition.update(
+            first_fd=_integer(arguments[0], "close-range-first"),
+            last_fd=_integer(arguments[1], "close-range-last"),
+            flags=_flags(arguments[2]),
+        )
+    elif name == "unshare":
+        _arity(arguments, 1, "unshare-arity")
+        flags = _flags(arguments[0])
+        if "CLONE_FILES" not in flags:
+            raise _fail("unreviewed-unshare")
+        transition.update(operation="unshare_files", flags=flags)
+    elif name == "pidfd_getfd":
+        _arity(arguments, 3, "pidfd-getfd-arity")
+        if _integer(arguments[2], "pidfd-getfd-flags") != 0:
+            raise _fail("pidfd-getfd-nonzero-flags")
+        transition.update(
+            pidfd=_fd(arguments[0], "pidfd-getfd-pidfd"),
+            target_fd=_integer(arguments[1], "pidfd-getfd-target"),
+            created_fd=_returned_fd(result, "pidfd-getfd-return-fd"),
+        )
+    return transition
 
 
 class TraceNormalizer:
@@ -505,14 +748,17 @@ class TraceNormalizer:
         if name in RAW_PAYLOAD_SYSCALLS:
             record.update(_raw_metadata(name, arguments))
         elif name in DECODED_ADDRESS_SYSCALLS:
-            record.update(_address_metadata(name, arguments, arguments_text))
-        elif name == "close":
-            if len(arguments) != 1:
-                raise _fail("close-arity")
-            record["fds"] = [_fd(arguments[0], "invalid-close-fd")]
+            record.update(_address_metadata(name, arguments))
         # Generic syscalls retain no arguments: the reviewed safe structural subset
         # is identity, timing, and native return metadata only.
-        record["result"] = _result(result_text)
+        result = (
+            _raw_result(result_text)
+            if name in RAW_PAYLOAD_SYSCALLS
+            else _result(result_text)
+        )
+        record["result"] = result
+        if name in _TRANSITION_SYSCALLS:
+            record["transition"] = _transition_metadata(name, arguments, result)
         return self._emit(record)
 
     def _emit(self, record: dict[str, object]) -> dict[str, object]:

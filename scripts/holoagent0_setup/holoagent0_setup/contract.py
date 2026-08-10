@@ -55,6 +55,7 @@ _TRACE_OPTIONS = (
     "--string-limit=1048576",
     "--quiet=none",
     "--trace=all",
+    "--raw=read,readv,pread64,preadv,preadv2,write,writev,pwrite64,pwritev,pwritev2,sendfile,splice,vmsplice,tee,copy_file_range",
 )
 _TRACE_RAW_SYSCALLS = (
     "read",

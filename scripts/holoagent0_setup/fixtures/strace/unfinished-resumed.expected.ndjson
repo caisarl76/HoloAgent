@@ -1,2 +1,2 @@
 {"duration":"0.000001","entry_index":1,"exit_index":0,"kind":"syscall","pid":102,"record_index":0,"result":{"value":102},"syscall":"getpid","timestamp":"1700000001.000002"}
-{"duration":"0.000010","entry_index":0,"exit_index":1,"fds":[{"fd":5,"provenance":"socket:[99]"}],"kind":"syscall","lengths":{"count":17},"pid":101,"record_index":1,"result":{"value":17},"syscall":"read","timestamp":"1700000001.000001"}
+{"duration":"0.000010","entry_index":0,"exit_index":1,"fds":[{"fd":5}],"kind":"syscall","lengths":{"count":17},"pid":101,"record_index":1,"result":{"value":17},"syscall":"read","timestamp":"1700000001.000001"}

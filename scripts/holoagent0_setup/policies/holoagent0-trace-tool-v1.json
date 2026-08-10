@@ -30,7 +30,7 @@
       },
       "parser": {
         "path": "scripts/holoagent0_setup/holoagent0_setup/trace_normalizer.py",
-        "sha256": "a34851683c13066d79f3ab83bb34ecb36114c08588e78b319e0e8641af30c992",
+        "sha256": "fede7ab981f2755695e6ab297d54cd8d5835550bfd93ef0bf8d9d4cfbd2e0557",
         "digest_algorithm": "sha256",
         "review_state": "REVIEWED"
       },
@@ -44,7 +44,8 @@
           "--no-abbrev",
           "--string-limit=1048576",
           "--quiet=none",
-          "--trace=all"
+          "--trace=all",
+          "--raw=read,readv,pread64,preadv,preadv2,write,writev,pwrite64,pwritev,pwritev2,sendfile,splice,vmsplice,tee,copy_file_range"
         ],
         "raw_syscalls": [
           "read",
@@ -75,13 +76,13 @@
           "LC_ALL": "C",
           "TZ": "UTC"
         },
-        "canonical_sha256": "c0f9ef1f4680ab2d8b660b4c38ff666c01ae5da5c9391efba4b9a89fd423c9cc",
+        "canonical_sha256": "94e391a5d4e93a41212eed4120236e658b3cac1ad5ff07bc7b1878814f89a595",
         "digest_algorithm": "sha256",
         "review_state": "REVIEWED"
       },
       "fixtures": {
         "manifest_path": "scripts/holoagent0_setup/fixtures/strace/manifest-v1.json",
-        "manifest_sha256": "016c0437c7ec04b70fdfbf581f835d9d0b41b1c8efcf8e1a37218167fd278f8b",
+        "manifest_sha256": "d1f4e0bd14c7bd894ac3fee79b9cd117c05a086c52c1eb605bbfdf44e3cf39eb",
         "digest_algorithm": "sha256",
         "review_state": "REVIEWED"
       }

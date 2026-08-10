@@ -1,0 +1,19 @@
+400 1700000006.000001 socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC, IPPROTO_TCP) = 3<socket:[33]> <0.000001>
+400 1700000006.000002 socketpair(AF_UNIX, SOCK_STREAM, 0, [4<socket:[44]>, 5<socket:[55]>]) = 0 <0.000001>
+400 1700000006.000003 accept(3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr("192.0.2.3")}, [16]) = 6<socket:[66]> <0.000001>
+400 1700000006.000004 accept4(3<socket:[33]>, {sa_family=AF_INET6, sin6_port=htons(443), sin6_addr=inet_pton(AF_INET6, "2001:db8::3")}, [28], SOCK_CLOEXEC) = 7<socket:[77]> <0.000001>
+400 1700000006.000005 bind(3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}, 16) = 0 <0.000001>
+400 1700000006.000006 connect(3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("192.0.2.53")}, 16) = 0 <0.000001>
+400 1700000006.000007 getsockname(3<socket:[33]>, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}, [16]) = 0 <0.000001>
+400 1700000006.000008 dup(3</private/FD_PATH_SECRET>) = 8</private/FD_PATH_SECRET> <0.000001>
+400 1700000006.000009 dup2(3</private/FD_PATH_SECRET>, 9) = 9</private/FD_PATH_SECRET> <0.000001>
+400 1700000006.000010 dup3(3</private/FD_PATH_SECRET>, 10, O_CLOEXEC) = 10</private/FD_PATH_SECRET> <0.000001>
+400 1700000006.000011 fcntl(3</private/FD_PATH_SECRET>, F_DUPFD_CLOEXEC, 11) = 11</private/FD_PATH_SECRET> <0.000001>
+400 1700000006.000012 fork() = 500 <0.000001>
+400 1700000006.000013 vfork() = 501 <0.000001>
+400 1700000006.000014 clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|SIGCHLD) = 502 <0.000001>
+400 1700000006.000015 execve("/private/EXEC_PATH_SECRET", ["EXEC_ARG_SECRET"], 0x7fff0000) = 0 <0.000001>
+400 1700000006.000016 close(8</private/FD_PATH_SECRET>) = 0 <0.000001>
+400 1700000006.000017 close_range(3, 4294967295, CLOSE_RANGE_CLOEXEC) = 0 <0.000001>
+400 1700000006.000018 unshare(CLONE_FILES) = 0 <0.000001>
+400 1700000006.000019 pidfd_getfd(11<anon_inode:[pidfd]>, 3, 0) = 12</private/FD_PATH_SECRET> <0.000001>

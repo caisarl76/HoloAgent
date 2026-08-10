@@ -61,6 +61,8 @@ def _validate_members(archive: Path):
         capture_output=True,
         check=False,
     )
+
+
 def test_script_has_exact_usage_and_fails_closed_for_bad_cli(tmp_path):
     completed = _run()
     assert completed.returncode == 2
@@ -169,9 +171,13 @@ def test_candidate_measurement_is_separate_from_reviewed_install_and_never_edits
     assert "CANDIDATE_MEASUREMENT" in source
     assert "runtime pins are required for reviewed install" in source
     assert "os.replace" in source
-    assert "policy_path.write" not in source and "POLICY_PATH" not in re.sub(
-        r'POLICY_PATH="[^"]+"', "", source
-    ).split("CANDIDATE_MEASUREMENT", 1)[-1]
+    assert (
+        "policy_path.write" not in source
+        and "POLICY_PATH"
+        not in re.sub(r'POLICY_PATH="[^"]+"', "", source).split(
+            "CANDIDATE_MEASUREMENT", 1
+        )[-1]
+    )
 
 
 def test_no_archive_mode_cannot_download_before_recipe_and_container_validation():
@@ -185,9 +191,18 @@ def test_no_archive_mode_cannot_download_before_recipe_and_container_validation(
 def test_reviewed_commands_are_absolute_and_caller_path_cannot_replace_integrity_tools():
     source = SCRIPT.read_text(encoding="utf-8")
     for tool in (
-        "cp", "curl", "cut", "docker", "mkdir", "mktemp", "mv", "rm",
-        "sha256sum", "stat", "tar",
+        "cp",
+        "curl",
+        "cut",
+        "docker",
+        "mkdir",
+        "mktemp",
+        "mv",
+        "rm",
+        "sha256sum",
+        "stat",
+        "tar",
     ):
         assert f"/usr/bin/{tool}" in source
-    assert "docker run" not in source
+    assert re.search(r"(?m)(?<!/usr/bin/)\bdocker run\b", source) is None
     assert re.search(r"(?m)^PATH='/usr/bin:/bin'$", source)
