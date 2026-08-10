@@ -268,8 +268,10 @@ def test_build_argv_is_deterministic_offline_and_uses_fixed_gcc_repository(tmp_p
     assert "--network=none" in argv
     assert "docker.io/library/gcc@sha256:" + "a" * 64 in argv
     assert not any("debian" in item for item in argv)
-    assert argv[-2:] == [
+    assert argv[-4:] == [
         "/bin/sh",
+        "-eu",
+        "-c",
         "cd /build && /src/configure --prefix=/out --disable-gcc-Werror "
         "&& make -j1 && make install",
     ]
