@@ -29,9 +29,7 @@ def _line(
 @pytest.mark.parametrize(("phase", "prefix"), [("BEGIN", "H0B"), ("END", "H0E")])
 def test_pinned_pr_set_name_marker_ellipsis_preserves_phase_and_token(phase, prefix):
     token = "0123456789ab"
-    record = normalize_bytes(
-        _line(f'prctl(PR_SET_NAME, "{prefix}{token}"...)')
-    )[0]
+    record = normalize_bytes(_line(f'prctl(PR_SET_NAME, "{prefix}{token}"...)'))[0]
     assert record["marker"] == {"phase": phase, "token": token}
     assert record["pid"] == 84
     assert record["entry_index"] == record["exit_index"] == 0
@@ -50,9 +48,7 @@ def test_failed_pinned_marker_ellipsis_remains_visible_with_failure_result():
 
 
 def test_no_ellipsis_fifteen_byte_name_cannot_gain_pinned_marker_authority():
-    record = normalize_bytes(
-        _line('prctl(PR_SET_NAME, "H0B0123456789ab")')
-    )[0]
+    record = normalize_bytes(_line('prctl(PR_SET_NAME, "H0B0123456789ab")'))[0]
     assert "marker" not in record
 
 
@@ -89,7 +85,7 @@ def test_packet_zero_halen_omits_address_and_accepts_numeric_or_named_ifindex():
         "sll_pkttype=PACKET_HOST, sll_halen=0}, 20)",
         "-1 EBADF (Bad file descriptor)",
     ) + _line(
-        'connect(-1, {sa_family=AF_PACKET, sll_protocol=htons(ETH_P_ALL), '
+        "connect(-1, {sa_family=AF_PACKET, sll_protocol=htons(ETH_P_ALL), "
         'sll_ifindex=if_nametoindex("INTERFACE_PAYLOAD_SECRET"), '
         "sll_hatype=ARPHRD_ETHER, sll_pkttype=PACKET_HOST, sll_halen=0}, 20)",
         "-1 EBADF (Bad file descriptor)",
@@ -120,7 +116,7 @@ def test_packet_zero_halen_omits_address_and_accepts_numeric_or_named_ifindex():
         "{sa_family=AF_PACKET, sll_protocol=htons(ETH_P_ALL), sll_ifindex=-1, "
         "sll_hatype=ARPHRD_ETHER, sll_pkttype=PACKET_HOST, sll_halen=0}",
         "{sa_family=AF_PACKET, sll_protocol=htons(ETH_P_ALL), "
-        "sll_ifindex=if_nametoindex(\"bad\")|1, sll_hatype=ARPHRD_ETHER, "
+        'sll_ifindex=if_nametoindex("bad")|1, sll_hatype=ARPHRD_ETHER, '
         "sll_pkttype=PACKET_HOST, sll_halen=0}",
     ],
 )
@@ -136,20 +132,18 @@ def test_packet_zero_halen_keeps_full_structural_validation(address):
 
 def test_structurally_translated_socket_options_retain_identity_and_redact_values():
     source = (
-        _line(
-            "getsockopt(6<TCP:[127.0.0.1:7400]>, SOL_TCP, TCP_MAXSEG, [536], [4])"
-        )
+        _line("getsockopt(6<TCP:[127.0.0.1:7400]>, SOL_TCP, TCP_MAXSEG, [536], [4])")
         + _line(
             "getsockopt(7<UNIX-STREAM:[707]>, SOL_SOCKET, SO_ACCEPTCONN, [1], [4])",
             timestamp="1700000053.000002",
         )
         + _line(
-            'setsockopt(7<UNIX-STREAM:[707]>, SOL_SOCKET, SO_PASSCRED, '
+            "setsockopt(7<UNIX-STREAM:[707]>, SOL_SOCKET, SO_PASSCRED, "
             '"SOCKET_OPTION_PAYLOAD_SECRET", 4)',
             timestamp="1700000053.000003",
         )
         + _line(
-            'setsockopt(8<PACKET:[808]>, SOL_XDP, XDP_UMEM_REG, '
+            "setsockopt(8<PACKET:[808]>, SOL_XDP, XDP_UMEM_REG, "
             '"SOCKET_OPTION_PAYLOAD_SECRET", 16)',
             timestamp="1700000053.000004",
         )
@@ -182,9 +176,7 @@ def test_structurally_translated_socket_options_retain_identity_and_redact_value
 )
 def test_socket_option_tokens_reject_nontranslated_or_malformed_grammar(level, option):
     with pytest.raises(TraceDecodeError):
-        normalize_bytes(
-            _line(f"setsockopt(6<TCP:[606]>, {level}, {option}, [1], 4)")
-        )
+        normalize_bytes(_line(f"setsockopt(6<TCP:[606]>, {level}, {option}, [1], 4)"))
 
 
 def test_pinned_test_manifest_includes_revision5_suite():

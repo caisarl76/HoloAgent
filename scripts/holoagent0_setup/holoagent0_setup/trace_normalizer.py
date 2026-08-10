@@ -290,75 +290,8 @@ _RESTART_TEXT = {
     "ERESTARTNOHAND": "To be restarted if no handler",
     "ERESTART_RESTARTBLOCK": "Interrupted by signal",
 }
-_SOCKET_OPTIONS = {
-    "SOL_IP": frozenset(
-        {
-            "IP_ADD_MEMBERSHIP",
-            "IP_DROP_MEMBERSHIP",
-            "IP_FREEBIND",
-            "IP_MULTICAST_IF",
-            "IP_MULTICAST_LOOP",
-            "IP_MULTICAST_TTL",
-            "IP_PKTINFO",
-            "IP_RECVERR",
-            "IP_RECVTTL",
-            "IP_TOS",
-            "IP_TTL",
-        }
-    ),
-    "SOL_IPV6": frozenset(
-        {
-            "IPV6_ADD_MEMBERSHIP",
-            "IPV6_DROP_MEMBERSHIP",
-            "IPV6_MULTICAST_HOPS",
-            "IPV6_MULTICAST_IF",
-            "IPV6_MULTICAST_LOOP",
-            "IPV6_RECVERR",
-            "IPV6_RECVHOPLIMIT",
-            "IPV6_RECVPKTINFO",
-            "IPV6_UNICAST_HOPS",
-            "IPV6_V6ONLY",
-        }
-    ),
-    "SOL_TCP": frozenset(
-        {
-            "TCP_CORK",
-            "TCP_DEFER_ACCEPT",
-            "TCP_FASTOPEN",
-            "TCP_KEEPCNT",
-            "TCP_KEEPIDLE",
-            "TCP_KEEPINTVL",
-            "TCP_NODELAY",
-            "TCP_QUICKACK",
-            "TCP_SYNCNT",
-            "TCP_USER_TIMEOUT",
-        }
-    ),
-    "SOL_UDP": frozenset({"UDP_CORK", "UDP_SEGMENT"}),
-    "SOL_UDPLITE": frozenset({"UDPLITE_RECV_CSCOV", "UDPLITE_SEND_CSCOV"}),
-    "SOL_SOCKET": frozenset(
-        {
-            "SO_BROADCAST",
-            "SO_DONTROUTE",
-            "SO_ERROR",
-            "SO_KEEPALIVE",
-            "SO_LINGER",
-            "SO_MARK",
-            "SO_OOBINLINE",
-            "SO_RCVBUF",
-            "SO_RCVLOWAT",
-            "SO_RCVTIMEO",
-            "SO_REUSEADDR",
-            "SO_REUSEPORT",
-            "SO_SNDBUF",
-            "SO_SNDLOWAT",
-            "SO_SNDTIMEO",
-            "SO_TIMESTAMP",
-            "SO_TIMESTAMPNS",
-            "SO_TYPE",
-        }
-    ),
-}
+_SOCKET_OPTION_LEVEL = re.compile(r"SOL_[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*")
+_SOCKET_OPTION_NAME = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
 _FCNTL_STATUS_FLAGS = frozenset(
     {
         "O_APPEND",
@@ -779,21 +712,38 @@ def _address(value: str) -> dict[str, object] | None:
             "groups": int(fields["nl_groups"], 16),
         }
     elif family == "AF_PACKET":
-        expected = {
+        base_fields = {
             "sa_family",
             "sll_protocol",
             "sll_ifindex",
             "sll_hatype",
             "sll_pkttype",
             "sll_halen",
-            "sll_addr",
         }
-        if set(fields) != expected:
+        if frozenset(fields) not in {
+            frozenset(base_fields),
+            frozenset(base_fields | {"sll_addr"}),
+        }:
             raise _fail("sockaddr-packet-fields")
         protocol = re.fullmatch(r"htons\((ETH_P_[A-Z0-9_]+)\)", fields["sll_protocol"])
         if protocol is None or protocol.group(1) not in _PACKET_PROTOCOLS:
             raise _fail("sockaddr-packet-protocol")
-        _integer(fields["sll_ifindex"], "sockaddr-packet-ifindex")
+        numeric_ifindex = re.fullmatch(r"[0-9]+", fields["sll_ifindex"])
+        named_ifindex = re.fullmatch(
+            r'if_nametoindex\("(?:[^"\\]|\\.)+"\)', fields["sll_ifindex"]
+        )
+        if numeric_ifindex is not None:
+            ifindex_value = int(numeric_ifindex.group(0))
+            if ifindex_value > 0xFFFFFFFF:
+                raise _fail("sockaddr-packet-ifindex")
+            ifindex: dict[str, object] = {
+                "kind": "numeric",
+                "value": ifindex_value,
+            }
+        elif named_ifindex is not None:
+            ifindex = {"kind": "name"}
+        else:
+            raise _fail("sockaddr-packet-ifindex")
         if fields["sll_hatype"] not in {"ARPHRD_ETHER", "ARPHRD_LOOPBACK"}:
             raise _fail("sockaddr-packet-hatype")
         if fields["sll_pkttype"] not in {
@@ -809,9 +759,20 @@ def _address(value: str) -> dict[str, object] | None:
         }:
             raise _fail("sockaddr-packet-type")
         address_length = _integer(fields["sll_halen"], "sockaddr-packet-length")
+        if address_length == 0:
+            if "sll_addr" in fields:
+                raise _fail("sockaddr-packet-fields")
+            return {
+                "family": family,
+                "protocol": protocol.group(1),
+                "ifindex": ifindex,
+            }
+        if "sll_addr" not in fields:
+            raise _fail("sockaddr-packet-fields")
         address_bytes = _vector(fields["sll_addr"], "sockaddr-packet-address")
         if (
-            address_length > 8
+            address_length < 0
+            or address_length > 8
             or len(address_bytes) != address_length
             or any(
                 re.fullmatch(r"0x[0-9a-f]{2}", byte) is None for byte in address_bytes
@@ -1190,7 +1151,10 @@ def _transition_metadata(
         _arity(arguments, 5, f"{name}-arity")
         level = arguments[1]
         option = arguments[2]
-        if level not in _SOCKET_OPTIONS or option not in _SOCKET_OPTIONS[level]:
+        if (
+            _SOCKET_OPTION_LEVEL.fullmatch(level) is None
+            or _SOCKET_OPTION_NAME.fullmatch(option) is None
+        ):
             raise _fail(f"unsupported-{name}-option")
         transition.update(
             fd=_fd(arguments[0], f"{name}-fd"),
@@ -1357,7 +1321,7 @@ def _transition_metadata(
 def _marker_metadata(arguments: list[str]) -> dict[str, str] | None:
     if len(arguments) != 2 or arguments[0] != "PR_SET_NAME":
         return None
-    marker = re.fullmatch(r'"H0([BE])([0-9a-f]{12})"', arguments[1])
+    marker = re.fullmatch(r'"H0([BE])([0-9a-f]{12})"\.\.\.', arguments[1])
     if marker is None:
         return None
     return {
@@ -1578,8 +1542,6 @@ class TraceNormalizer:
         prefix_columns: int,
         alignment_close_column: int | None = None,
     ) -> dict[str, object]:
-        if "..." in body:
-            raise _fail("abbreviated-field")
         call = _CALL.fullmatch(body)
         if call is None:
             raise _fail("syscall-grammar")
@@ -1594,6 +1556,11 @@ class TraceNormalizer:
         if re.fullmatch(r"syscall_0x[0-9a-f]+", name) is not None:
             raise _fail("unsupported-native-syscall")
         arguments = _split_arguments(arguments_text)
+        marker = _marker_metadata(arguments) if name == "prctl" else None
+        if "..." in body and (
+            body.count("...") != 1 or arguments_text.count("...") != 1 or marker is None
+        ):
+            raise _fail("abbreviated-field")
         timeout_left: dict[str, int] | None = None
         left = re.fullmatch(
             r"(.+) \(left \{tv_sec=([0-9]+), tv_nsec=([0-9]+)\}\)", result_text
@@ -1618,10 +1585,8 @@ class TraceNormalizer:
             "exit_index": exit_index,
             "syscall": name,
         }
-        if name == "prctl":
-            marker = _marker_metadata(arguments)
-            if marker is not None:
-                record["marker"] = marker
+        if marker is not None:
+            record["marker"] = marker
         if name in RAW_PAYLOAD_SYSCALLS:
             result = _raw_result(result_text)
         elif name == "fcntl" and len(arguments) >= 2:
