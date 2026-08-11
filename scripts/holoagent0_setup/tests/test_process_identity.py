@@ -103,6 +103,47 @@ def test_matches_proc_compares_every_field_and_fails_closed(tmp_path):
     assert not identity.matches_proc(proc_root / "missing")
 
 
+@pytest.mark.parametrize("mutation", ["start_time", "pgid", "executable"])
+def test_matches_proc_rejects_pid_reuse_and_identity_mutations(mutation, tmp_path):
+    first = tmp_path / "first"
+    first.write_bytes(b"first")
+    first.chmod(0o700)
+    second = tmp_path / "second"
+    second.write_bytes(b"second")
+    second.chmod(0o700)
+    proc_root = tmp_path / "proc"
+    pid_dir = _write_proc_fixture(proc_root, first)
+    expected = read_process_identity(proc_root, 321)
+
+    if mutation == "executable":
+        (pid_dir / "exe").unlink()
+        (pid_dir / "exe").symlink_to(second)
+    else:
+        raw = (pid_dir / "stat").read_text(encoding="ascii")
+        if mutation == "start_time":
+            raw = raw.replace("987654", "987655")
+        else:
+            raw = raw.replace(" S 1 300 300 ", " S 1 301 300 ", 1)
+        (pid_dir / "stat").write_text(raw, encoding="ascii")
+
+    assert not expected.matches_proc(proc_root)
+
+
+def test_rejects_executable_path_with_symlinked_parent(tmp_path):
+    real_directory = tmp_path / "real"
+    real_directory.mkdir()
+    executable = real_directory / "coordinator"
+    executable.write_bytes(b"stable")
+    executable.chmod(0o700)
+    alias_directory = tmp_path / "alias"
+    alias_directory.symlink_to(real_directory, target_is_directory=True)
+    proc_root = tmp_path / "proc"
+    _write_proc_fixture(proc_root, alias_directory / "coordinator")
+
+    with pytest.raises(ProcessIdentityError, match="canonical"):
+        read_process_identity(proc_root, 321)
+
+
 @pytest.mark.parametrize("malformation", ["missing_close", "short", "bad_number"])
 def test_malformed_proc_stat_is_normalized(malformation, tmp_path):
     executable = tmp_path / "coordinator"

@@ -250,6 +250,8 @@ def _closed_executable_path(link_value: str) -> str:
     normalized = os.path.normpath(link_value)
     if normalized != link_value:
         raise ProcessIdentityError("proc executable path is not normalized")
+    if os.path.realpath(normalized) != normalized:
+        raise ProcessIdentityError("proc executable path is not canonical")
     return normalized
 
 
