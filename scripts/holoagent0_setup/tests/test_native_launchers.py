@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import errno
+import fcntl
 import json
 import os
 from pathlib import Path
 import platform
+import resource
 import signal
 import socket
 import subprocess
@@ -38,7 +41,7 @@ def _run_launcher(
     *,
     executable: Path = FINALIZER_ONLY,
     pass_fds: tuple[int, ...] = (),
-    mappings: tuple[tuple[int, int], ...] = (),
+    mappings: tuple[tuple[int, int, str], ...] = (),
     stdio_override: tuple[int, object] | None = None,
 ) -> tuple[subprocess.CompletedProcess[bytes], dict[str, object] | None]:
     report_read, report_write = os.pipe2(os.O_CLOEXEC)
@@ -47,8 +50,8 @@ def _run_launcher(
         "--report-fd",
         str(report_write),
     ]
-    for source, target in mappings:
-        command.extend(("--pass-fd", f"{source}:{target}"))
+    for source, target, direction in mappings:
+        command.extend(("--pass-fd", f"{source}:{target}:{direction}"))
     command.extend(("--", str(executable), *finalizer_args))
 
     stdio: dict[str, object] = {
@@ -86,6 +89,21 @@ def _stdout_json(completed: subprocess.CompletedProcess[bytes]) -> dict[str, obj
     return json.loads(completed.stdout)
 
 
+@contextmanager
+def _fd_limit_supporting(minimum_fd: int):
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard_limit != resource.RLIM_INFINITY and hard_limit <= minimum_fd:
+        pytest.skip("RLIMIT_NOFILE cannot represent the reviewed high-FD case")
+    raised_limit = soft_limit <= minimum_fd
+    if raised_limit:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (minimum_fd + 1, hard_limit))
+    try:
+        yield
+    finally:
+        if raised_limit:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
+
+
 def test_native_makefile_builds_pie_executables():
     for executable in (TRACEE_LAUNCHER, FINALIZER_ONLY, NATIVE_TEST_PROBE):
         assert executable.is_file()
@@ -104,6 +122,92 @@ def test_tracee_launcher_rejects_passed_inherited_socket():
 
     assert completed.returncode == 30
     assert report == {"reason": "INHERITED_SOCKET_FD"}
+
+
+def test_tracee_launcher_rejects_unmapped_inherited_pipe():
+    read_end, write_end = os.pipe2(os.O_CLOEXEC)
+    try:
+        completed, report = _run_launcher(pass_fds=(read_end,))
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+
+    assert completed.returncode == 30
+    assert report == {"reason": "INHERITED_SOCKET_FD"}
+
+
+def test_tracee_launcher_rejects_inherited_socket_above_reviewed_target_limit():
+    minimum_fd = 70_000
+    high_fd = -1
+    with _fd_limit_supporting(minimum_fd):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as inherited:
+                high_fd = fcntl.fcntl(
+                    inherited.fileno(), fcntl.F_DUPFD_CLOEXEC, minimum_fd
+                )
+                assert high_fd >= minimum_fd
+                completed, report = _run_launcher(pass_fds=(high_fd,))
+        finally:
+            if high_fd >= 0:
+                os.close(high_fd)
+
+    assert completed.returncode == 30
+    assert report == {"reason": "INHERITED_SOCKET_FD"}
+
+
+def test_tracee_launcher_accepts_high_source_fd_for_reviewed_pipe_target():
+    minimum_fd = 70_000
+    high_fd = -1
+    with _fd_limit_supporting(minimum_fd):
+        read_end, write_end = os.pipe2(os.O_CLOEXEC)
+        try:
+            high_fd = fcntl.fcntl(read_end, fcntl.F_DUPFD_CLOEXEC, minimum_fd)
+            completed, report = _run_launcher(
+                pass_fds=(high_fd,), mappings=((high_fd, 9, "read"),)
+            )
+        finally:
+            if high_fd >= 0:
+                os.close(high_fd)
+            os.close(read_end)
+            os.close(write_end)
+
+    assert completed.returncode == 0, completed.stderr
+    assert report is None
+    assert _stdout_json(completed)["fds"] == [0, 1, 2, 9]
+
+
+def test_tracee_launcher_accepts_high_write_only_report_fd():
+    minimum_fd = 70_000
+    high_fd = -1
+    with _fd_limit_supporting(minimum_fd):
+        report_read, report_write = os.pipe2(os.O_CLOEXEC)
+        try:
+            high_fd = fcntl.fcntl(report_write, fcntl.F_DUPFD_CLOEXEC, minimum_fd)
+            completed = subprocess.run(
+                [
+                    str(TRACEE_LAUNCHER),
+                    "--report-fd",
+                    str(high_fd),
+                    "--",
+                    str(FINALIZER_ONLY),
+                    "--inspect",
+                ],
+                check=False,
+                pass_fds=(high_fd,),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+        finally:
+            if high_fd >= 0:
+                os.close(high_fd)
+            os.close(report_write)
+            with os.fdopen(report_read, "rb") as report:
+                report_payload = report.read()
+
+    assert completed.returncode == 0, completed.stderr
+    assert report_payload == b""
 
 
 @pytest.mark.parametrize("descriptor", [0, 1, 2])
@@ -139,7 +243,7 @@ def test_tracee_launcher_rejects_character_device_output(descriptor):
 
 
 def _assert_rejected_pass_fd(fd: int) -> None:
-    completed, report = _run_launcher(pass_fds=(fd,), mappings=((fd, 9),))
+    completed, report = _run_launcher(pass_fds=(fd,), mappings=((fd, 9, "read"),))
     assert completed.returncode == 30
     assert report == {"reason": "INHERITED_SOCKET_FD"}
 
@@ -180,7 +284,7 @@ def test_tracee_launcher_relocates_only_the_explicit_pipe_manifest():
     source, writer = os.pipe2(os.O_CLOEXEC)
     try:
         completed, report = _run_launcher(
-            ("--inspect",), pass_fds=(source,), mappings=((source, 9),)
+            ("--inspect",), pass_fds=(source,), mappings=((source, 9, "read"),)
         )
     finally:
         os.close(source)
@@ -199,6 +303,146 @@ def test_tracee_launcher_relocates_only_the_explicit_pipe_manifest():
     assert inspection["pid"] == inspection["pgid"] == inspection["sid"]
     assert inspection["no_new_privs"] == 1
     assert inspection["parent_death_signal"] == signal.SIGKILL
+
+
+def test_tracee_launcher_requires_exact_readable_devnull_stdin():
+    wrong_mode = os.open("/dev/null", os.O_WRONLY | os.O_CLOEXEC)
+    try:
+        completed, report = _run_launcher(stdio_override=(0, wrong_mode))
+    finally:
+        os.close(wrong_mode)
+
+    assert completed.returncode == 30
+    assert report == {"reason": "INHERITED_SOCKET_FD"}
+
+
+@pytest.mark.parametrize("descriptor", [1, 2])
+def test_tracee_launcher_rejects_read_only_regular_output(descriptor, tmp_path):
+    output_path = tmp_path / "output"
+    output_path.write_bytes(b"")
+    wrong_mode = os.open(output_path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        completed, report = _run_launcher(stdio_override=(descriptor, wrong_mode))
+    finally:
+        os.close(wrong_mode)
+
+    assert completed.returncode == 30
+    assert report == {"reason": "INHERITED_SOCKET_FD"}
+
+
+@pytest.mark.parametrize(
+    ("declared_direction", "use_write_end"),
+    [("read", True), ("write", False)],
+)
+def test_tracee_launcher_rejects_broker_pipe_end_with_wrong_declared_direction(
+    declared_direction, use_write_end
+):
+    read_end, write_end = os.pipe2(os.O_CLOEXEC)
+    source = write_end if use_write_end else read_end
+    try:
+        completed, report = _run_launcher(
+            pass_fds=(source,), mappings=((source, 9, declared_direction),)
+        )
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+
+    assert completed.returncode == 30
+    assert report == {"reason": "INHERITED_SOCKET_FD"}
+
+
+@pytest.mark.parametrize(
+    ("declared_direction", "use_write_end"),
+    [("read", False), ("write", True)],
+)
+def test_tracee_launcher_accepts_broker_pipe_end_with_declared_direction(
+    declared_direction, use_write_end
+):
+    read_end, write_end = os.pipe2(os.O_CLOEXEC)
+    source = write_end if use_write_end else read_end
+    try:
+        completed, report = _run_launcher(
+            pass_fds=(source,), mappings=((source, 9, declared_direction),)
+        )
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+
+    assert completed.returncode == 0, completed.stderr
+    assert report is None
+    assert _stdout_json(completed)["fds"] == [0, 1, 2, 9]
+
+
+@pytest.mark.parametrize("mapping", ["{source}:9", "{source}:9:sideways"])
+def test_tracee_launcher_rejects_pass_fd_without_closed_direction_role(mapping):
+    read_end, write_end = os.pipe2(os.O_CLOEXEC)
+    report_read, report_write = os.pipe2(os.O_CLOEXEC)
+    try:
+        completed = subprocess.run(
+            [
+                str(TRACEE_LAUNCHER),
+                "--report-fd",
+                str(report_write),
+                "--pass-fd",
+                mapping.format(source=read_end),
+                "--",
+                str(FINALIZER_ONLY),
+                "--inspect",
+            ],
+            check=False,
+            pass_fds=(read_end, report_write),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+        os.close(report_read)
+        os.close(report_write)
+
+    assert completed.returncode == 64
+
+
+def test_tracee_launcher_retains_reviewed_mapping_target_ceiling():
+    read_end, write_end = os.pipe2(os.O_CLOEXEC)
+    try:
+        completed, report = _run_launcher(
+            pass_fds=(read_end,), mappings=((read_end, 70_000, "read"),)
+        )
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+
+    assert completed.returncode == 64
+    assert report is None
+
+
+def test_tracee_launcher_requires_write_only_report_pipe():
+    report_read, report_write = os.pipe2(os.O_CLOEXEC)
+    try:
+        completed = subprocess.run(
+            [
+                str(TRACEE_LAUNCHER),
+                "--report-fd",
+                str(report_read),
+                "--",
+                str(FINALIZER_ONLY),
+                "--inspect",
+            ],
+            check=False,
+            pass_fds=(report_read,),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+    finally:
+        os.close(report_read)
+        os.close(report_write)
+
+    assert completed.returncode == 30
 
 
 @pytest.mark.parametrize(

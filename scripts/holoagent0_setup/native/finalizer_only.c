@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/sched.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -71,8 +72,14 @@ static int inspect_boundary(void) {
         char *end = NULL;
         errno = 0;
         long value = strtol(entry->d_name, &end, 10);
-        if (errno != 0 || end == entry->d_name || *end != '\0' || value < 0 ||
-            value > 65535 || value == directory_fd) {
+        if (end == entry->d_name) {
+            continue;
+        }
+        if (errno != 0 || *end != '\0' || value < 0 || value > INT_MAX) {
+            (void)closedir(directory);
+            return 70;
+        }
+        if (value == directory_fd) {
             continue;
         }
         if (count == MAX_INSPECTED_FDS) {

@@ -33,10 +33,22 @@ enum fd_class {
     FD_OBSERVATION_ERROR,
 };
 
+enum fd_direction {
+    FD_READ,
+    FD_WRITE,
+};
+
+enum proc_fd_parse {
+    PROC_FD_NOT_NUMERIC,
+    PROC_FD_VALID,
+    PROC_FD_INVALID,
+};
+
 struct fd_mapping {
     int source;
     int target;
     int temporary;
+    enum fd_direction direction;
     bool observed;
     bool safe_rebound;
 };
@@ -74,6 +86,21 @@ static enum fd_class classify_fd(int fd) {
     return FD_UNKNOWN;
 }
 
+static bool has_access_mode(int fd, int expected_mode) {
+    int flags = fcntl(fd, F_GETFL);
+    return flags >= 0 && (flags & O_ACCMODE) == expected_mode;
+}
+
+static bool has_read_access(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    return flags >= 0 && (flags & O_ACCMODE) != O_WRONLY;
+}
+
+static bool has_write_access(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    return flags >= 0 && (flags & O_ACCMODE) != O_RDONLY;
+}
+
 static bool is_dev_null(int fd) {
     struct stat descriptor_stat;
     struct stat dev_null_stat;
@@ -84,7 +111,7 @@ static bool is_dev_null(int fd) {
            descriptor_stat.st_rdev == dev_null_stat.st_rdev;
 }
 
-static bool is_anonymous_pipe(int fd) {
+static bool is_anonymous_pipe(int fd, enum fd_direction direction) {
     struct stat descriptor_stat;
     if (fstat(fd, &descriptor_stat) < 0 || !S_ISFIFO(descriptor_stat.st_mode)) {
         return false;
@@ -95,20 +122,23 @@ static bool is_anonymous_pipe(int fd) {
     if (path_length <= 0 || (size_t)path_length >= sizeof(proc_path)) {
         return false;
     }
-    char target[64];
-    ssize_t target_length = readlink(proc_path, target, sizeof(target) - 1U);
-    if (target_length <= 7 || (size_t)target_length >= sizeof(target)) {
+    char target[PATH_MAX + 1];
+    ssize_t target_length = readlink(proc_path, target, PATH_MAX);
+    if (target_length <= 7 || target_length == PATH_MAX) {
         return false;
     }
     target[target_length] = '\0';
-    return strncmp(target, "pipe:[", 6) == 0 && target[target_length - 1] == ']';
+    int expected_mode = direction == FD_READ ? O_RDONLY : O_WRONLY;
+    return strncmp(target, "pipe:[", 6) == 0 && target[target_length - 1] == ']' &&
+           has_access_mode(fd, expected_mode);
 }
 
 static bool is_output_fd(int fd) {
     struct stat descriptor_stat;
     return fstat(fd, &descriptor_stat) == 0 &&
            (S_ISREG(descriptor_stat.st_mode) ||
-            S_ISFIFO(descriptor_stat.st_mode));
+            S_ISFIFO(descriptor_stat.st_mode)) &&
+           has_write_access(fd);
 }
 
 static bool write_all(int fd, const char *payload, size_t length) {
@@ -144,41 +174,55 @@ static void emit_failure(const char *reason) {
     }
 }
 
-static int parse_fd(const char *value, const char **end) {
+static int parse_fd(const char *value, int maximum, const char **end) {
     char *parsed_end = NULL;
     errno = 0;
     long parsed = strtol(value, &parsed_end, 10);
     if (errno != 0 || parsed_end == value || parsed < 0 ||
-        parsed > MAX_REVIEWED_FD) {
+        parsed > maximum) {
         return -1;
     }
     *end = parsed_end;
     return (int)parsed;
 }
 
+static enum proc_fd_parse parse_proc_fd(const char *value, int *fd) {
+    if (value[0] < '0' || value[0] > '9') {
+        return PROC_FD_NOT_NUMERIC;
+    }
+    const char *end = NULL;
+    int parsed = parse_fd(value, INT_MAX, &end);
+    if (parsed < 0 || *end != '\0') {
+        return PROC_FD_INVALID;
+    }
+    *fd = parsed;
+    return PROC_FD_VALID;
+}
+
 static bool parse_mapping(const char *value, struct fd_mapping *mapping) {
     const char *end = NULL;
-    int source = parse_fd(value, &end);
-    if (source < 0) {
+    int source = parse_fd(value, INT_MAX, &end);
+    if (source < 0 || *end != ':') {
         return false;
     }
-    int target = source;
-    if (*end == ':') {
-        const char *target_end = NULL;
-        target = parse_fd(end + 1, &target_end);
-        if (target < 0 || *target_end != '\0') {
-            return false;
-        }
-    } else if (*end != '\0') {
+    const char *target_end = NULL;
+    int target = parse_fd(end + 1, MAX_REVIEWED_FD, &target_end);
+    if (target < 3 || *target_end != ':') {
         return false;
     }
-    if (target < 3) {
+    enum fd_direction direction;
+    if (strcmp(target_end + 1, "read") == 0) {
+        direction = FD_READ;
+    } else if (strcmp(target_end + 1, "write") == 0) {
+        direction = FD_WRITE;
+    } else {
         return false;
     }
     *mapping = (struct fd_mapping){
         .source = source,
         .target = target,
         .temporary = -1,
+        .direction = direction,
         .observed = false,
         .safe_rebound = false,
     };
@@ -200,28 +244,23 @@ static bool target_is_allowed(const struct fd_mapping *mappings, size_t count,
     return false;
 }
 
-static bool source_is_requested(const struct fd_mapping *mappings, size_t count,
-                                int fd) {
-    for (size_t index = 0; index < count; ++index) {
-        if (mappings[index].source == fd) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static bool inherited_role_is_allowed(const struct fd_mapping *mappings,
                                       size_t count, int fd) {
     if (fd == STDIN_FILENO) {
-        return is_dev_null(fd);
+        return is_dev_null(fd) && has_read_access(fd);
     }
     if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
         return is_output_fd(fd);
     }
-    if (fd == report_fd || source_is_requested(mappings, count, fd)) {
-        return is_anonymous_pipe(fd);
+    if (fd == report_fd) {
+        return is_anonymous_pipe(fd, FD_WRITE);
     }
-    return true;
+    for (size_t index = 0; index < count; ++index) {
+        if (mappings[index].source == fd) {
+            return is_anonymous_pipe(fd, mappings[index].direction);
+        }
+    }
+    return false;
 }
 
 static int observe_inherited_fds(struct fd_mapping *mappings, size_t count) {
@@ -231,8 +270,8 @@ static int observe_inherited_fds(struct fd_mapping *mappings, size_t count) {
     }
     int directory_fd = dirfd(directory);
     int outcome = 0;
-    errno = 0;
     for (;;) {
+        errno = 0;
         struct dirent *entry = readdir(directory);
         if (entry == NULL) {
             if (errno != 0) {
@@ -240,9 +279,13 @@ static int observe_inherited_fds(struct fd_mapping *mappings, size_t count) {
             }
             break;
         }
-        const char *end = NULL;
-        int fd = parse_fd(entry->d_name, &end);
-        if (fd < 0 || *end != '\0' || fd == directory_fd) {
+        int fd = -1;
+        enum proc_fd_parse parsed = parse_proc_fd(entry->d_name, &fd);
+        if (parsed == PROC_FD_INVALID) {
+            outcome = EXIT_BOUNDARY_FAILURE;
+            break;
+        }
+        if (parsed == PROC_FD_NOT_NUMERIC || fd == directory_fd) {
             continue;
         }
         enum fd_class descriptor_class = classify_fd(fd);
@@ -289,6 +332,7 @@ static int add_standard_fds(struct fd_mapping *mappings, size_t *count) {
             .source = source,
             .target = target,
             .temporary = -1,
+            .direction = target == STDIN_FILENO ? FD_READ : FD_WRITE,
             .observed = true,
             .safe_rebound = safe_rebound,
         };
@@ -299,13 +343,13 @@ static int add_standard_fds(struct fd_mapping *mappings, size_t *count) {
 
 static bool target_role_is_allowed(const struct fd_mapping *mapping) {
     if (mapping->target == STDIN_FILENO) {
-        return is_dev_null(mapping->target);
+        return is_dev_null(mapping->target) && has_read_access(mapping->target);
     }
     if (mapping->target == STDOUT_FILENO || mapping->target == STDERR_FILENO) {
         return is_output_fd(mapping->target) ||
                (mapping->safe_rebound && is_dev_null(mapping->target));
     }
-    return is_anonymous_pipe(mapping->target);
+    return is_anonymous_pipe(mapping->target, mapping->direction);
 }
 
 static int sanitize_fds(struct fd_mapping *mappings, size_t count) {
@@ -366,8 +410,8 @@ static int sanitize_fds(struct fd_mapping *mappings, size_t count) {
     }
     int directory_fd = dirfd(directory);
     bool valid = true;
-    errno = 0;
     for (;;) {
+        errno = 0;
         struct dirent *entry = readdir(directory);
         if (entry == NULL) {
             if (errno != 0) {
@@ -375,9 +419,13 @@ static int sanitize_fds(struct fd_mapping *mappings, size_t count) {
             }
             break;
         }
-        const char *end = NULL;
-        int fd = parse_fd(entry->d_name, &end);
-        if (fd < 0 || *end != '\0' || fd == directory_fd) {
+        int fd = -1;
+        enum proc_fd_parse parsed = parse_proc_fd(entry->d_name, &fd);
+        if (parsed == PROC_FD_INVALID) {
+            valid = false;
+            break;
+        }
+        if (parsed == PROC_FD_NOT_NUMERIC || fd == directory_fd) {
             continue;
         }
         if (!target_is_allowed(mappings, count, fd) ||
@@ -409,7 +457,7 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[index], "--report-fd") == 0 && index + 1 < argc) {
             const char *end = NULL;
-            report_fd = parse_fd(argv[++index], &end);
+            report_fd = parse_fd(argv[++index], INT_MAX, &end);
             if (report_fd < 3 || *end != '\0') {
                 return EXIT_USAGE;
             }
