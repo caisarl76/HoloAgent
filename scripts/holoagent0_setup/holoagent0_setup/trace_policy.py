@@ -1367,7 +1367,11 @@ class TracePolicy:
                     registration.poisoned = True
                 return "UNEXPECTED_NETWORK_ATTEMPT"
             if not _succeeded(record):
-                if fd == registration.original_fd and exact_reviewed:
+                if (
+                    registration.endpoint is None
+                    and fd == registration.original_fd
+                    and exact_reviewed
+                ):
                     return None
                 registration.poisoned = True
                 return "UNEXPECTED_NETWORK_ATTEMPT"

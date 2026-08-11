@@ -925,6 +925,37 @@ def test_runtime_contract_failed_future_reviewed_option_is_neutral_and_no_advanc
 
 
 @pytest.mark.parametrize(
+    ("option", "value", "length"),
+    TX_SETUP_OPTIONS,
+    ids=TX_STAGE_NAMES,
+)
+def test_failed_reviewed_option_after_registration_is_violation(option, value, length):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, fd, _ = registered_tx(policy, records, 0)
+
+    rejected = policy.feed(
+        records.tx_socket_option(
+            pid,
+            fd,
+            option,
+            value,
+            length,
+            result=-1,
+        )
+    )
+    outbound = policy.feed(
+        records.io(pid, "sendto", fd, address=("239.255.0.1", 26650))
+    )
+
+    assert outcome(rejected) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert policy.journal.first_violation.record_index == rejected.violation_index
+    assert outcome(outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert policy.finalize(trace_integrity_ok=True) == rejected
+
+
+@pytest.mark.parametrize(
     "operation",
     ["unreviewed-option", "endpoint", "socket-io"],
 )
