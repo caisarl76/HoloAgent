@@ -252,6 +252,27 @@ def observe_tx_registration(policy, records, participant, *, fd=17, port=None):
     return pid, fd, dynamic_port, decisions
 
 
+def clone_worker(policy, records, parent_pid, worker_tid):
+    return policy.feed(
+        records.make(
+            parent_pid,
+            "clone",
+            result=worker_tid,
+            transition={
+                "operation": "clone",
+                "child_pid": worker_tid,
+                "fd_table": "shared",
+                "flags": [
+                    "CLONE_VM",
+                    "CLONE_FILES",
+                    "CLONE_SIGHAND",
+                    "CLONE_THREAD",
+                ],
+            },
+        )
+    )
+
+
 def connected_udp(policy, records, participant=0, *, fd=7):
     pid, fd, _ = registered_tx(policy, records, participant, fd=fd)
     decision = policy.feed(
@@ -812,6 +833,252 @@ def test_runtime_contract_nonthread_descendant_thread_cannot_regain_authority(
     assert outcome(thread) == ("PASS", "OK")
     assert outcome(outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
     assert outcome(inbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+def test_runtime_contract_authority_propagates_across_transitive_worker_threads():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid, tx_fd, _, local_registration = observe_tx_registration(
+        policy,
+        records,
+        0,
+        fd=17,
+    )
+    _, _, remote_source, remote_registration = observe_tx_registration(
+        policy,
+        records,
+        1,
+        fd=18,
+    )
+    _, receive_bind = bound_udp(
+        policy,
+        records,
+        0,
+        ("0.0.0.0", META_PORTS[0]),
+        fd=7,
+    )
+    worker_a = 200
+    worker_b = 201
+    edge_a = clone_worker(policy, records, root_pid, worker_a)
+    edge_b = clone_worker(policy, records, worker_a, worker_b)
+    outbound = policy.feed(
+        records.io(
+            worker_b,
+            "sendto",
+            tx_fd,
+            address=("127.0.0.1", META_PORTS[1]),
+        )
+    )
+    inbound = policy.feed(
+        records.io(
+            worker_b,
+            "recvfrom",
+            7,
+            address=("127.0.0.1", remote_source),
+        )
+    )
+
+    assert outcome(edge_a) == ("PASS", "OK")
+    assert outcome(edge_b) == ("PASS", "OK")
+    assert outcome(outbound) == ("PASS", "OK")
+    assert outcome(inbound) == ("PASS", "OK")
+    assert [outcome(decision) for decision in local_registration] == [
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+    ]
+    assert [outcome(decision) for decision in remote_registration] == [
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+    ]
+    assert outcome(receive_bind) == ("PASS", "OK")
+
+
+def test_runtime_contract_exited_worker_tid_has_no_stale_or_transitive_authority():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid, tx_fd, _, local_registration = observe_tx_registration(
+        policy,
+        records,
+        0,
+        fd=17,
+    )
+    _, _, remote_source, remote_registration = observe_tx_registration(
+        policy,
+        records,
+        1,
+        fd=18,
+    )
+    _, receive_bind = bound_udp(
+        policy,
+        records,
+        0,
+        ("0.0.0.0", META_PORTS[0]),
+        fd=7,
+    )
+    worker_tid = 200
+    initial_edge = clone_worker(policy, records, root_pid, worker_tid)
+    initial_outbound = policy.feed(
+        records.io(
+            worker_tid,
+            "sendto",
+            tx_fd,
+            address=("127.0.0.1", META_PORTS[1]),
+        )
+    )
+    initial_inbound = policy.feed(
+        records.io(
+            worker_tid,
+            "recvfrom",
+            7,
+            address=("127.0.0.1", remote_source),
+        )
+    )
+    worker_exit = policy.feed(records.exit(worker_tid))
+    stale_outbound = policy.feed(
+        records.io(
+            worker_tid,
+            "sendto",
+            tx_fd,
+            address=("127.0.0.1", META_PORTS[1]),
+        )
+    )
+    stale_inbound = policy.feed(
+        records.io(
+            worker_tid,
+            "recvfrom",
+            7,
+            address=("127.0.0.1", remote_source),
+        )
+    )
+    nonthread_pid = 300
+    nonthread_edge = policy.feed(
+        records.make(
+            root_pid,
+            "fork",
+            result=nonthread_pid,
+            transition={
+                "operation": "fork",
+                "child_pid": nonthread_pid,
+                "fd_table": "copied",
+            },
+        )
+    )
+    invalid_reuse_edge = clone_worker(policy, records, nonthread_pid, worker_tid)
+    reused_outbound = policy.feed(
+        records.io(
+            worker_tid,
+            "sendto",
+            tx_fd,
+            address=("127.0.0.1", META_PORTS[1]),
+        )
+    )
+    reused_inbound = policy.feed(
+        records.io(
+            worker_tid,
+            "recvfrom",
+            7,
+            address=("127.0.0.1", remote_source),
+        )
+    )
+    final = policy.finalize(trace_integrity_ok=True)
+
+    assert outcome(worker_exit) == ("PASS", "OK")
+    assert outcome(stale_outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(stale_inbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(nonthread_edge) == ("PASS", "OK")
+    assert outcome(invalid_reuse_edge) == ("PASS", "OK")
+    assert outcome(reused_outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(reused_inbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(initial_edge) == ("PASS", "OK")
+    assert outcome(initial_outbound) == ("PASS", "OK")
+    assert outcome(initial_inbound) == ("PASS", "OK")
+    assert [outcome(decision) for decision in local_registration] == [
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+    ]
+    assert [outcome(decision) for decision in remote_registration] == [
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+    ]
+    assert outcome(receive_bind) == ("PASS", "OK")
+    assert final == stale_outbound
+
+
+def test_runtime_contract_fresh_root_edge_reauthorizes_reused_worker_tid():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid, tx_fd, _, local_registration = observe_tx_registration(
+        policy,
+        records,
+        0,
+        fd=17,
+    )
+    _, _, remote_source, remote_registration = observe_tx_registration(
+        policy,
+        records,
+        1,
+        fd=18,
+    )
+    _, receive_bind = bound_udp(
+        policy,
+        records,
+        0,
+        ("0.0.0.0", META_PORTS[0]),
+        fd=7,
+    )
+    worker_tid = 200
+    first_edge = clone_worker(policy, records, root_pid, worker_tid)
+    first_outbound = policy.feed(
+        records.io(
+            worker_tid,
+            "sendto",
+            tx_fd,
+            address=("127.0.0.1", META_PORTS[1]),
+        )
+    )
+    worker_exit = policy.feed(records.exit(worker_tid))
+    fresh_edge = clone_worker(policy, records, root_pid, worker_tid)
+    fresh_outbound = policy.feed(
+        records.io(
+            worker_tid,
+            "sendto",
+            tx_fd,
+            address=("127.0.0.1", META_PORTS[1]),
+        )
+    )
+    fresh_inbound = policy.feed(
+        records.io(
+            worker_tid,
+            "recvfrom",
+            7,
+            address=("127.0.0.1", remote_source),
+        )
+    )
+
+    assert outcome(first_edge) == ("PASS", "OK")
+    assert outcome(first_outbound) == ("PASS", "OK")
+    assert outcome(worker_exit) == ("PASS", "OK")
+    assert outcome(fresh_edge) == ("PASS", "OK")
+    assert outcome(fresh_outbound) == ("PASS", "OK")
+    assert outcome(fresh_inbound) == ("PASS", "OK")
+    assert [outcome(decision) for decision in local_registration] == [
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+    ]
+    assert [outcome(decision) for decision in remote_registration] == [
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+    ]
+    assert outcome(receive_bind) == ("PASS", "OK")
 
 
 def test_runtime_contract_conflicting_getsockname_preserves_ei_and_poisons_tx():

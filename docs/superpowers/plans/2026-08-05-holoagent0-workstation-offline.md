@@ -592,8 +592,12 @@ the same four classes: a registered `E_j` passes and an unknown source fails,
 including explicit bind, membership, and source validation on `26651`. Exercise
 actual inbound and outbound DDS I/O from `fork`, `vfork`, and incomplete-clone
 descendants, then from their `CLONE_THREAD|CLONE_FILES` threads, and prove that
-no transitive lifecycle edge re-grants participant authority. Finally, pin
-`E_i` to its registered open-socket provenance. A same-value repeated
+no transitive lifecycle edge from an unauthorized descendant re-grants
+participant authority. Conversely, valid both-flag edges propagate authority
+transitively from a currently authorized root or worker; exit erases that
+incarnation's authority, and the same numeric TID remains unauthorized until a
+fresh valid edge. Finally, pin `E_i` to its registered open-socket provenance.
+A same-value repeated
 `getsockname` through the original FD or a proven `dup` alias preserves the
 registration without creating a second TX socket. A conflicting repetition
 fails without replacing `E_i`, poisons that TX provenance and the run, and
