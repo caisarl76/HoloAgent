@@ -329,6 +329,9 @@ An exact successful `open`/`openat` result carrying the normalizer's closed
 redacted `path` provenance establishes that numeric FD in the table before any
 later raw I/O. Pinned raw-I/O records contain numeric FD operands only and must
 resolve through that table; they do not supply a second provenance source.
+An otherwise successful `open`/`openat` record with a nonnegative numeric result
+but no exact `result.fd` annotation is an unknown-provenance trace-integrity
+failure; success cannot silently omit the created descriptor.
 Internet-family
 socket provenance, connected peer, local bind, protocol, and socket type follow
 every alias and descendant until the last close. Any FD-producing syscall that
@@ -493,11 +496,14 @@ neutral/`PASS` for network policy and does not advance registration; the next
 successful setup operation must still be the current expected stage, and a
 successful retry followed by the remaining exact sequence may register. A
 failed unreviewed option, endpoint, or socket-I/O operation remains a policy
-violation. A repeated bind, descriptor duplication/control operation, or close
-before registration likewise poisons the registration. Interposition examines
-every affected pre-apply open-file-description: `dup2`/`dup3` include both the
-source and implicitly closed target, and every selected `close_range` FD is
-examined even for `CLOSE_RANGE_CLOEXEC`. CLOEXEC marking does not count as a
+violation. A repeated bind or any attempted descriptor duplication/control or
+close before registration likewise poisons the registration, regardless of the
+descriptor syscall's success. Interposition examines every affected pre-apply
+open-file-description: failed `close` uses its input `fd`; `dup2`/`dup3` include
+both the source and implicitly closed target even on failure; and every selected
+`close_range` FD is examined on success or failure, including
+`CLOSE_RANGE_CLOEXEC`. Only successful non-CLOEXEC close operations mutate
+lifecycle closure; a failed operation or CLOEXEC marking does not count as a
 lifecycle close. An incomplete registration cannot finalize as a pass. The successful `getsockname` must
 establish one unique, nonzero
 dynamic endpoint `E_i` and permanently bind it to that socket's FD provenance
@@ -541,10 +547,19 @@ already authorized TID creating another thread with both flags. `fork`,
 `vfork`, a `clone` without either required flag, and every non-thread
 descendant retain FD provenance as Linux requires but inherit no participant
 role or DDS network authority. The participant mapping is already bound to the
-externally validated ownership journal and config digest before replay; an
-observed spawn or successful exec of that exact configured root does not erase
-its root role before exit. Root exit permanently terminates that configured
-incarnation for the run: later numeric PID reuse cannot restore its role. A
+externally validated ownership journal and config digest before replay. An
+observed spawn of that exact configured root immediately makes the participant
+lifecycle-active, even before socket creation. Its first successful root exec may
+preserve the root role only before any participant/DDS-authority activity; the
+exec itself also makes the participant lifecycle-active. Ordinary post-fork,
+pre-exec housekeeping such as signal-mask setup, non-socket descriptor close,
+or process setup does not consume that allowance. Participant socket activation
+or authorized worker creation does. A second successful root exec, or a root
+exec after prior participant/DDS activity, is identity replacement: revoke root
+authority and fail trace integrity, so later DDS is denied and finalization
+cannot pass. A pinned runtime with no root exec remains compatible. Root exit
+permanently terminates that configured incarnation for the run: later numeric
+PID reuse cannot restore its role. A
 worker/non-root exec or worker-side `unshare(CLONE_FILES)`/
 `close_range(..., CLOSE_RANGE_UNSHARE)` revokes only that worker's DDS role. A
 root-side FD-table split revokes every live worker for that participant while

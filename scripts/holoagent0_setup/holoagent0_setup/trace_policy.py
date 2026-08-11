@@ -277,12 +277,15 @@ class FDProvenance:
             return
         result = record.get("result")
         descriptor = result.get("fd") if isinstance(result, Mapping) else None
+        reviewed_creation = record.get("syscall") in _REVIEWED_GENERIC_FD_SYSCALLS
         if descriptor is None:
+            if reviewed_creation:
+                self._latch_integrity("UNKNOWN_FD_PROVENANCE")
             return
         fd = _fd_number(descriptor)
         result_value = _exact_int(result.get("value"))
         if (
-            record.get("syscall") not in _REVIEWED_GENERIC_FD_SYSCALLS
+            not reviewed_creation
             or not isinstance(descriptor, Mapping)
             or set(descriptor) != {"fd", "provenance"}
             or fd is None
@@ -713,6 +716,8 @@ class TracePolicy:
         }
         self._active_participants: set[int] = set()
         self._exited_roots: set[int] = set()
+        self._accepted_root_execs: set[int] = set()
+        self._root_activity: set[int] = set()
         self._live_workers: dict[int, int] = {}
         self._socket_owners: dict[int, int] = {}
         self._tracked_sockets: dict[int, _OpenDescription] = {}
@@ -856,8 +861,6 @@ class TracePolicy:
             return ()
         operation = transition.get("operation")
         if operation == "close_range":
-            if not _succeeded(record):
-                return ()
             first_fd = _exact_int(transition.get("first_fd"))
             last_fd = _exact_int(transition.get("last_fd"))
             if first_fd is None or last_fd is None:
@@ -865,7 +868,7 @@ class TracePolicy:
             return self.provenance.descriptions_in_range(pid, first_fd, last_fd)
         keys: tuple[str, ...]
         if operation in {"dup2", "dup3"}:
-            keys = ("source_fd", "target_fd") if _succeeded(record) else ("source_fd",)
+            keys = ("source_fd", "target_fd")
         elif operation in {
             "dup",
             "fcntl_dup",
@@ -876,7 +879,7 @@ class TracePolicy:
         }:
             keys = ("source_fd",)
         elif operation == "close":
-            keys = ("closed_fd",)
+            keys = ("closed_fd", "fd")
         else:
             return ()
         descriptions: dict[int, _OpenDescription] = {}
@@ -922,6 +925,7 @@ class TracePolicy:
                 return
             self._task_roles[child] = configured_root_role
             self._live_workers.pop(child, None)
+            self._active_participants.add(configured_root_role)
             return
         self._task_roles.pop(child, None)
         self._live_workers.pop(child, None)
@@ -937,6 +941,8 @@ class TracePolicy:
         self._task_roles[child] = parent_role
         self._live_workers[child] = parent_role
         self._active_participants.add(parent_role)
+        if self._configured_root_roles.get(pid) == parent_role:
+            self._root_activity.add(parent_role)
 
     def _handle_close(
         self,
@@ -1014,6 +1020,7 @@ class TracePolicy:
         operation = (
             transition.get("operation") if isinstance(transition, Mapping) else None
         )
+        pid = _exact_int(record.get("pid"))
         if syscall in _IO_URING_SYSCALLS:
             return "PROHIBITED_IO_URING"
         if syscall == "ptrace":
@@ -1027,7 +1034,6 @@ class TracePolicy:
         if _contains_scm_rights(record):
             return "PROHIBITED_FD_TRANSFER"
 
-        pid = _exact_int(record.get("pid"))
         if pid is None:
             return None
         interposition = self._classify_tx_interposition(
@@ -1037,7 +1043,8 @@ class TracePolicy:
             return interposition
         if _succeeded(record):
             if operation == "exec":
-                self._revoke_worker_authority(pid)
+                if not self._apply_root_exec_authority(pid):
+                    self._revoke_worker_authority(pid)
             elif operation == "unshare_files":
                 self._revoke_split_authority(pid)
             elif operation == "close_range" and isinstance(transition, Mapping):
@@ -1072,6 +1079,23 @@ class TracePolicy:
         }:
             return self._classify_raw_io(pid, str(syscall), record)
         return None
+
+    def _apply_root_exec_authority(self, pid: int) -> bool:
+        participant = self._configured_root_roles.get(pid)
+        if participant is None:
+            return False
+        self._active_participants.add(participant)
+        if (
+            participant in self._accepted_root_execs
+            or participant in self._root_activity
+            or participant in self._exited_roots
+            or self._task_roles.get(pid) != participant
+        ):
+            self._task_roles.pop(pid, None)
+            self._latch_integrity("CONFIGURED_ROOT_IDENTITY_REPLACED")
+            return True
+        self._accepted_root_execs.add(participant)
+        return True
 
     def _revoke_worker_authority(self, pid: int) -> None:
         if pid in self._live_workers:
@@ -1475,9 +1499,11 @@ class TracePolicy:
         )
 
     def _network_context_valid(self, pid: int, record: CanonicalRecord) -> bool:
-        return (
-            self.markers.authorizes(record) and self._participant_index(pid) is not None
-        )
+        participant = self._participant_index(pid)
+        valid = self.markers.authorizes(record) and participant is not None
+        if valid and self._configured_root_roles.get(pid) == participant:
+            self._root_activity.add(participant)
+        return valid
 
     def _receive_bind_allowed(self, participant: int, endpoint: Endpoint) -> bool:
         address, port = endpoint

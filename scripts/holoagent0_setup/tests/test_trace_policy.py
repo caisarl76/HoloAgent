@@ -2610,6 +2610,18 @@ def test_generic_fd_creation_with_unreviewed_provenance_fails_integrity(provenan
     assert policy.trace_integrity_error == "UNKNOWN_FD_PROVENANCE"
 
 
+@pytest.mark.parametrize("syscall", ["open", "openat"])
+def test_successful_reviewed_generic_fd_creation_requires_result_fd(syscall):
+    policy = make_policy()
+    records = Records()
+
+    decision = policy.feed(records.make(COORDINATOR_PID, syscall, result=77))
+
+    assert outcome(decision) == ("PASS", "OK")
+    assert policy.trace_integrity_error == "UNKNOWN_FD_PROVENANCE"
+    assert policy.finalize(trace_integrity_ok=True).status != "PASS"
+
+
 @pytest.mark.parametrize(
     ("syscall", "transition"),
     [
@@ -2915,6 +2927,66 @@ def test_dup_target_interposition_poisons_implicitly_closed_incomplete_tx(operat
     assert outcome(duplicate) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
 
 
+@pytest.mark.parametrize(
+    ("operation", "transition"),
+    [
+        ("close", {"operation": "close", "fd": {"fd": 17}}),
+        (
+            "close_range",
+            {
+                "operation": "close_range",
+                "first_fd": 17,
+                "last_fd": 17,
+                "flags": [],
+            },
+        ),
+        (
+            "dup2",
+            {
+                "operation": "dup2",
+                "source_fd": {"fd": 18},
+                "target_fd": {"fd": 17},
+            },
+        ),
+        (
+            "dup3",
+            {
+                "operation": "dup3",
+                "source_fd": {"fd": 18},
+                "target_fd": {"fd": 17},
+                "flags": [],
+            },
+        ),
+    ],
+    ids=["failed-close", "failed-close-range", "failed-dup2", "failed-dup3"],
+)
+def test_failed_descriptor_attempt_poisons_incomplete_tx_without_closing_it(
+    operation, transition
+):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid = PARTICIPANT_PIDS[0]
+    if operation in {"dup2", "dup3"}:
+        assert policy.feed(records.socket(pid, 18, domain="AF_UNIX")).status == "PASS"
+    pid, socket_decision, bind_decision = _start_tx_registration(policy, records)
+
+    attempt = policy.feed(
+        records.make(pid, operation, result=-1, transition=transition)
+    )
+    later = _feed_tx_options(policy, records, pid, TX_SETUP_OPTIONS)
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(bind_decision) == ("PASS", "OK")
+    assert outcome(attempt) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert policy.journal.first_violation.record_index == attempt.violation_index
+    assert policy.provenance.describe(pid, 17)["kind"] == "socket"
+    assert all(
+        outcome(decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+        for decision in later
+    )
+
+
 def test_incomplete_tx_registration_cannot_finalize_as_pass():
     policy = make_policy()
     records = Records()
@@ -2946,6 +3018,55 @@ def _spawn_configured_root(policy, records, participant, *, parent_pid=COORDINAT
     )
 
 
+def _exec_configured_root(policy, records, participant=0):
+    return policy.feed(
+        records.make(
+            PARTICIPANT_PIDS[participant],
+            "execve",
+            transition={"operation": "exec", "cloexec_fds": "closed"},
+        )
+    )
+
+
+@pytest.mark.parametrize("observation", ["spawn", "exec"])
+def test_observed_configured_root_requires_exit_before_end(observation):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+
+    if observation == "spawn":
+        observed = _spawn_configured_root(policy, records, 0)
+    else:
+        observed = _exec_configured_root(policy, records)
+    end = policy.feed(records.marker("END"))
+    final = policy.finalize(trace_integrity_ok=True)
+
+    assert outcome(observed) == ("PASS", "OK")
+    assert outcome(end) == ("PASS", "OK")
+    assert policy.trace_integrity_error == "INCOMPLETE_PARTICIPANT_LIFECYCLE"
+    assert final.status != "PASS"
+
+
+@pytest.mark.parametrize("observation", ["spawn", "exec"])
+def test_observed_configured_root_exit_closes_lifecycle(observation):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+
+    if observation == "spawn":
+        observed = _spawn_configured_root(policy, records, 0)
+    else:
+        observed = _exec_configured_root(policy, records)
+    root_exit = policy.feed(records.exit(PARTICIPANT_PIDS[0]))
+    end = policy.feed(records.marker("END"))
+    final = policy.finalize(trace_integrity_ok=True)
+
+    assert outcome(observed) == ("PASS", "OK")
+    assert outcome(root_exit) == ("PASS", "OK")
+    assert outcome(end) == ("PASS", "OK")
+    assert outcome(final) == ("PASS", "OK")
+
+
 @pytest.mark.parametrize(
     "parent_pid",
     [COORDINATOR_PID, 999],
@@ -2971,6 +3092,118 @@ def test_configured_root_survives_observed_spawn_and_validated_exec_lifecycle(
     assert outcome(spawn) == ("PASS", "OK")
     assert outcome(exec_decision) == ("PASS", "OK")
     assert outcome(socket_decision) == ("PASS", "OK")
+
+
+@pytest.mark.parametrize(
+    "housekeeping",
+    ["rt_sigprocmask", "close", "prctl"],
+)
+def test_configured_root_benign_housekeeping_does_not_consume_first_exec(
+    housekeeping,
+):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid = PARTICIPANT_PIDS[0]
+
+    spawn = _spawn_configured_root(policy, records, 0)
+    if housekeeping == "close":
+        housekeeping_decision = policy.feed(records.close(root_pid, 4))
+    else:
+        housekeeping_decision = policy.feed(records.make(root_pid, housekeeping))
+    first_exec = _exec_configured_root(policy, records)
+    socket_decision = policy.feed(records.socket(root_pid, 7))
+    socket_close = policy.feed(records.close(root_pid, 7))
+    root_exit = policy.feed(records.exit(root_pid))
+    end = policy.feed(records.marker("END"))
+    final = policy.finalize(trace_integrity_ok=True)
+
+    assert outcome(spawn) == ("PASS", "OK")
+    assert outcome(housekeeping_decision) == ("PASS", "OK")
+    assert outcome(first_exec) == ("PASS", "OK")
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(socket_close) == ("PASS", "OK")
+    assert outcome(root_exit) == ("PASS", "OK")
+    assert outcome(end) == ("PASS", "OK")
+    assert policy.trace_integrity_error is None
+    assert outcome(final) == ("PASS", "OK")
+
+
+def test_second_configured_root_exec_revokes_root_authority_and_latches_integrity():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid = PARTICIPANT_PIDS[0]
+
+    spawn = _spawn_configured_root(policy, records, 0)
+    first_exec = _exec_configured_root(policy, records)
+    second_exec = _exec_configured_root(policy, records)
+    later_socket = policy.feed(records.socket(root_pid, 7))
+    root_exit = policy.feed(records.exit(root_pid))
+    end = policy.feed(records.marker("END"))
+    final = policy.finalize(trace_integrity_ok=True)
+
+    assert outcome(spawn) == ("PASS", "OK")
+    assert outcome(first_exec) == ("PASS", "OK")
+    assert outcome(second_exec) == ("PASS", "OK")
+    assert policy.trace_integrity_error == "CONFIGURED_ROOT_IDENTITY_REPLACED"
+    assert outcome(later_socket) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(root_exit) == ("PASS", "OK")
+    assert outcome(end) == ("PASS", "OK")
+    assert final.status != "PASS"
+
+
+def test_configured_root_exec_after_activity_revokes_root_authority():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid = PARTICIPANT_PIDS[0]
+
+    spawn = _spawn_configured_root(policy, records, 0)
+    initial_socket = policy.feed(records.socket(root_pid, 7))
+    initial_close = policy.feed(records.close(root_pid, 7))
+    replacement_exec = _exec_configured_root(policy, records)
+    later_socket = policy.feed(records.socket(root_pid, 8))
+    root_exit = policy.feed(records.exit(root_pid))
+    end = policy.feed(records.marker("END"))
+    final = policy.finalize(trace_integrity_ok=True)
+
+    assert outcome(spawn) == ("PASS", "OK")
+    assert outcome(initial_socket) == ("PASS", "OK")
+    assert outcome(initial_close) == ("PASS", "OK")
+    assert outcome(replacement_exec) == ("PASS", "OK")
+    assert policy.trace_integrity_error == "CONFIGURED_ROOT_IDENTITY_REPLACED"
+    assert outcome(later_socket) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(root_exit) == ("PASS", "OK")
+    assert outcome(end) == ("PASS", "OK")
+    assert final.status != "PASS"
+
+
+def test_configured_root_exec_after_worker_creation_revokes_root_authority():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid = PARTICIPANT_PIDS[0]
+    worker_tid = 1100
+
+    spawn = _spawn_configured_root(policy, records, 0)
+    worker = clone_worker(policy, records, root_pid, worker_tid)
+    replacement_exec = _exec_configured_root(policy, records)
+    later_socket = policy.feed(records.socket(root_pid, 8))
+    worker_exit = policy.feed(records.exit(worker_tid))
+    root_exit = policy.feed(records.exit(root_pid))
+    end = policy.feed(records.marker("END"))
+    final = policy.finalize(trace_integrity_ok=True)
+
+    assert outcome(spawn) == ("PASS", "OK")
+    assert outcome(worker) == ("PASS", "OK")
+    assert outcome(replacement_exec) == ("PASS", "OK")
+    assert policy.trace_integrity_error == "CONFIGURED_ROOT_IDENTITY_REPLACED"
+    assert outcome(later_socket) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(worker_exit) == ("PASS", "OK")
+    assert outcome(root_exit) == ("PASS", "OK")
+    assert outcome(end) == ("PASS", "OK")
+    assert final.status != "PASS"
 
 
 @pytest.mark.parametrize(

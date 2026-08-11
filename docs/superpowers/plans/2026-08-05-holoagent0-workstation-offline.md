@@ -685,9 +685,10 @@ with closed redacted `path` provenance, then resolve the pinned raw-I/O grammar'
 numeric FD operand through that table. Known non-socket I/O is neutral. The
 canonical policy may defensively accept only exact closed `path`,
 nonnegative-inode `pipe`, and nonnegative-inode `character_device` annotations,
-but pinned raw records do not carry them. Unannotated, malformed, or unknown FD
-provenance fails trace integrity and an unknown annotated socket also fails
-network policy.
+but pinned raw records do not carry them. A successful `open`/`openat` with a
+nonnegative result but no exact `result.fd` annotation, and any other
+unannotated, malformed, or unknown FD provenance, fails trace integrity; an
+unknown annotated socket also fails network policy.
 Classify TCP/DNS, host-namespace IP, non-loopback routes, any `pidfd_getfd`
 acquisition attempt, any decoded `SCM_RIGHTS` transfer, and any UDP operation
 outside the exact four identity/config-digest participant roots, their
@@ -725,11 +726,15 @@ destination outside the table. A wildcard receive bind is permitted only after
 the preflight artifact proves the private namespace has exactly `lo` and no
 non-loopback interface or route.
 
-Before applying TX interposition, inspect every affected open-file-description.
-For `dup2`/`dup3`, this includes both the source and the implicitly closed target;
-for `close_range`, it includes the entire selected range even when
-`CLOSE_RANGE_CLOEXEC` is present. Poison and journal any incomplete registration
-found. CLOEXEC-only ranges remain open for lifecycle accounting.
+Before applying TX interposition, inspect every affected open-file-description
+for successful and failed descriptor attempts. Failed `close` uses its input
+`fd`; `dup2`/`dup3` include both the source and the implicitly closed target even
+on failure; and `close_range` includes the entire selected range on success or
+failure, including `CLOSE_RANGE_CLOEXEC`. Poison and journal any incomplete
+registration found. Apply descriptor-table and lifecycle closure only for
+successful non-CLOEXEC closes; failed operations and CLOEXEC-only ranges remain
+open for lifecycle accounting. The only failed TX-setup operations that remain
+neutral are the three exact reviewed multicast options described above.
 
 Participant authority is not inherited merely because a descendant has an FD.
 A successful lifecycle edge from an authorized task grants authority only when
@@ -737,9 +742,17 @@ the clone flags prove both the same thread group and the same FD table through
 `CLONE_THREAD|CLONE_FILES`. `fork`, `vfork`, and any `clone` missing
 either flag retain only their ordinary FD-provenance semantics; they receive no
 participant role. Exit removes the task/TID authority without granting it to a
-later PID reuse. The externally journal-validated configured root remains the
-root across its first observed spawn/exec lifecycle, but its exit permanently
-closes that incarnation and later numeric PID reuse cannot reauthorize it. A
+later PID reuse. Observing the externally journal-validated configured root
+spawn immediately activates its lifecycle. Its first successful exec preserves
+the root role only before participant/DDS-authority activity and also activates
+lifecycle accounting. Ordinary post-fork, pre-exec housekeeping—such as signal
+masking, non-socket descriptor close, or process setup—does not consume that
+allowance; participant socket activation or authorized worker creation does. A
+second successful exec, or an exec after prior participant/DDS activity,
+replaces the journal-bound identity: revoke root authority, latch trace
+integrity failure, deny later DDS, and prevent a passing final result. A pinned
+no-exec lifecycle remains valid. Root exit permanently closes that incarnation
+and later numeric PID reuse cannot reauthorize it. A
 worker exec or worker-side successful `unshare(CLONE_FILES)`/
 `close_range(..., CLOSE_RANGE_UNSHARE)` revokes only that worker's network
 authority. A root-side split revokes every live worker for the participant while
