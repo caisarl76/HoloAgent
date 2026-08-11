@@ -58,14 +58,17 @@ def test_four_configs_are_closed_byte_pinned_and_differ_only_by_index():
 def test_exact_cyclone_semantics_and_ports_are_pinned():
     contract = load_pinned_cyclone_configs(CONFIG_DIR, repository_root=REPOSITORY_ROOT)
     for config in contract.configs:
-        assert config.path.read_bytes().count(b'allow_multicast="spdp"') == 1
+        payload = config.path.read_bytes()
+        assert b"allow_multicast=" not in payload
+        assert b"AddLocalhost=" not in payload
+        assert payload.count(b"<AllowMulticast>spdp</AllowMulticast>") == 1
+        assert payload.count(b"<Peers/>") == 1
     assert contract.domain_id == 77
     assert contract.interface == {
         "name": "lo",
         "autodetermine": False,
         "presence_required": True,
         "multicast": True,
-        "allow_multicast": "spdp",
     }
     assert contract.transport == "udp"
     assert contract.allow_multicast == "spdp"
@@ -73,7 +76,6 @@ def test_exact_cyclone_semantics_and_ports_are_pinned():
     assert contract.multicast_ttl == 1
     assert contract.spdp_multicast_address == "239.255.0.1"
     assert contract.default_multicast_address == "239.255.0.1"
-    assert contract.add_localhost is False
     assert contract.peers == ()
     assert contract.many_sockets_mode is False
     assert contract.monitor_port == -1
@@ -88,7 +90,7 @@ def test_exact_cyclone_semantics_and_ports_are_pinned():
         "unicast_data_offset": 11,
     }
     assert contract.spdp_port == 26650
-    assert contract.prohibited_data_multicast_port == 26651
+    assert contract.data_multicast_receive_port == 26651
     assert contract.unicast_ports == {
         0: (26660, 26661),
         1: (26662, 26663),

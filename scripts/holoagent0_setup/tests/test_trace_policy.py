@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import inspect
 import itertools
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +18,8 @@ PARTICIPANT_PIDS = {index: 100 + index for index in range(4)}
 CONFIG_DIGESTS = EXPECTED_CONFIG_SHA256
 META_PORTS = {0: 26660, 1: 26662, 2: 26664, 3: 26666}
 DATA_PORTS = {0: 26661, 1: 26663, 2: 26665, 3: 26667}
+EPHEMERAL_PORTS = {0: 40000, 1: 40001, 2: 40002, 3: 40003}
+FIXTURES = Path(__file__).parents[1] / "fixtures/strace"
 
 
 def _launcher_manifest():
@@ -99,6 +102,34 @@ class Records:
                 "operation": "bind",
                 "fd": {"fd": fd},
                 "address": {"family": "AF_INET", "ip": address, "port": port},
+            },
+        )
+
+    def getsockname(self, pid, fd, address, port):
+        return self.make(
+            pid,
+            "getsockname",
+            transition={
+                "operation": "getsockname",
+                "fd": {"fd": fd},
+                "address": {"family": "AF_INET", "ip": address, "port": port},
+            },
+        )
+
+    def membership(self, pid, fd, *, option="IP_ADD_MEMBERSHIP"):
+        return self.make(
+            pid,
+            "setsockopt",
+            transition={
+                "operation": "setsockopt",
+                "fd": {"fd": fd},
+                "level": "SOL_IP",
+                "option": option,
+                "length": 8,
+                "membership": {
+                    "group": "239.255.0.1",
+                    "interface": "127.0.0.1",
+                },
             },
         )
 
@@ -185,11 +216,23 @@ def bound_udp(policy, records, participant, local, *, fd=7):
     return pid, policy.feed(records.bind(pid, fd, *local))
 
 
-def connected_udp(policy, records, participant=0, *, fd=7):
+def registered_tx(policy, records, participant, *, fd=17, port=None):
+    dynamic_port = EPHEMERAL_PORTS[participant] if port is None else port
     pid, decision = bound_udp(
-        policy, records, participant, ("127.0.0.1", META_PORTS[participant]), fd=fd
+        policy,
+        records,
+        participant,
+        ("127.0.0.1", 0),
+        fd=fd,
     )
     assert decision.status == "PASS"
+    decision = policy.feed(records.getsockname(pid, fd, "127.0.0.1", dynamic_port))
+    assert decision.status == "PASS"
+    return pid, fd, dynamic_port
+
+
+def connected_udp(policy, records, participant=0, *, fd=7):
+    pid, fd, _ = registered_tx(policy, records, participant, fd=fd)
     decision = policy.feed(
         records.make(
             pid,
@@ -214,8 +257,7 @@ def test_connected_udp_alias_after_end_is_safety_failure(syscall):
     policy = make_policy()
     records = Records()
     open_window(policy, records)
-    pid, decision = bound_udp(policy, records, 0, ("127.0.0.1", META_PORTS[0]))
-    assert decision.status == "PASS"
+    pid, fd, _ = registered_tx(policy, records, 0, fd=7)
     assert (
         policy.feed(
             records.make(
@@ -223,7 +265,7 @@ def test_connected_udp_alias_after_end_is_safety_failure(syscall):
                 "connect",
                 transition={
                     "operation": "connect",
-                    "fd": {"fd": 7},
+                    "fd": {"fd": fd},
                     "address": {
                         "family": "AF_INET",
                         "ip": "127.0.0.1",
@@ -242,7 +284,7 @@ def test_connected_udp_alias_after_end_is_safety_failure(syscall):
                 result=11,
                 transition={
                     "operation": "dup",
-                    "source_fd": {"fd": 7},
+                    "source_fd": {"fd": fd},
                     "created_fd": {"fd": 11},
                 },
             )
@@ -300,6 +342,7 @@ def test_fd_tables_copy_for_fork_share_for_clone_and_track_close():
     "participant,local_port",
     [
         *((index, 26650) for index in range(4)),
+        *((index, 26651) for index in range(4)),
         *((index, port) for index, port in META_PORTS.items()),
         *((index, port) for index, port in DATA_PORTS.items()),
     ],
@@ -312,13 +355,129 @@ def test_exact_dds_local_bind_matrix_passes(local_address, participant, local_po
     assert decision.status == "PASS"
 
 
+def test_runtime_contract_registers_one_dynamic_tx_endpoint_per_participant():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+
+    pid, fd, port = registered_tx(policy, records, 0)
+    assert policy.provenance.describe(pid, fd)["local"] == ("127.0.0.1", port)
+
+    assert policy.feed(records.socket(pid, 18)).status == "PASS"
+    second = policy.feed(records.bind(pid, 18, "127.0.0.1", 0))
+    assert (second.status, second.reason) == (
+        "FAIL",
+        "UNEXPECTED_NETWORK_ATTEMPT",
+    )
+
+
+def test_runtime_contract_dynamic_tx_endpoints_are_globally_unique():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    registered_tx(policy, records, 0)
+
+    pid, decision = bound_udp(policy, records, 1, ("127.0.0.1", 0), fd=18)
+    assert decision.status == "PASS"
+    duplicate = policy.feed(
+        records.getsockname(pid, 18, "127.0.0.1", EPHEMERAL_PORTS[0])
+    )
+    assert (duplicate.status, duplicate.reason) == (
+        "FAIL",
+        "UNEXPECTED_NETWORK_ATTEMPT",
+    )
+
+
+def test_runtime_contract_one_tx_fd_carries_spdp_sedp_and_user_data():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, fd, _ = registered_tx(policy, records, 0)
+
+    destinations = [("239.255.0.1", 26650)] + [
+        ("127.0.0.1", port) for port in range(26660, 26668)
+    ]
+    for destination in destinations:
+        assert (
+            policy.feed(records.io(pid, "sendto", fd, address=destination)).status
+            == "PASS"
+        )
+
+
+def test_runtime_contract_inbound_accepts_only_registered_dynamic_source():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    _, _, remote_port = registered_tx(policy, records, 1)
+    pid, decision = bound_udp(policy, records, 0, ("0.0.0.0", META_PORTS[0]))
+    assert decision.status == "PASS"
+
+    assert (
+        policy.feed(
+            records.io(pid, "recvfrom", 7, address=("127.0.0.1", remote_port))
+        ).status
+        == "PASS"
+    )
+    unknown = policy.feed(records.io(pid, "recvfrom", 7, address=("127.0.0.1", 40999)))
+    assert (unknown.status, unknown.reason) == (
+        "FAIL",
+        "UNEXPECTED_NETWORK_ATTEMPT",
+    )
+
+
+def test_runtime_contract_26651_is_receive_join_only():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, decision = bound_udp(policy, records, 0, ("0.0.0.0", 26651))
+    assert decision.status == "PASS"
+    assert policy.feed(records.membership(pid, 7)).status == "PASS"
+
+    outbound = policy.feed(
+        records.io(pid, "sendto", 7, address=("127.0.0.1", META_PORTS[1]))
+    )
+    assert (outbound.status, outbound.reason) == (
+        "FAIL",
+        "UNEXPECTED_NETWORK_ATTEMPT",
+    )
+
+
+def test_runtime_contract_unregistered_ephemeral_tx_cannot_send():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, decision = bound_udp(policy, records, 0, ("127.0.0.1", 0), fd=17)
+    assert decision.status == "PASS"
+
+    decision = policy.feed(
+        records.io(pid, "sendto", 17, address=("239.255.0.1", 26650))
+    )
+    assert (decision.status, decision.reason) == (
+        "FAIL",
+        "UNEXPECTED_NETWORK_ATTEMPT",
+    )
+
+
+def test_runtime_contract_golden_replays_as_one_authorized_dds_window():
+    source = (FIXTURES / "cyclonedds-0.10.5-runtime-representative.input").read_bytes()
+    policy = make_policy()
+
+    failures = [
+        (record["record_index"], record.get("syscall"), decision)
+        for record in normalize_bytes(source)
+        if (decision := policy.feed(record)).status != "PASS"
+    ]
+
+    assert failures == []
+    assert policy.finalize(trace_integrity_ok=True).status == "PASS"
+
+
 @pytest.mark.parametrize(
     "local_address,participant,local_port",
     [
         ("192.0.2.10", 0, 26650),
         ("::1", 0, 26650),
         ("239.255.0.1", 0, 26650),
-        ("0.0.0.0", 0, 26651),
         ("127.0.0.1", 0, META_PORTS[1]),
         ("0.0.0.0", 0, 0),
     ],
@@ -341,11 +500,10 @@ def test_outbound_spdp_matrix_passes(participant):
     policy = make_policy()
     records = Records()
     open_window(policy, records)
-    pid, decision = bound_udp(
-        policy, records, participant, ("127.0.0.1", META_PORTS[participant])
+    pid, fd, _ = registered_tx(policy, records, participant)
+    decision = policy.feed(
+        records.io(pid, "sendto", fd, address=("239.255.0.1", 26650))
     )
-    assert decision.status == "PASS"
-    decision = policy.feed(records.io(pid, "sendto", 7, address=("239.255.0.1", 26650)))
     assert decision.status == "PASS"
 
 
@@ -365,15 +523,12 @@ def test_outbound_unicast_matrix_passes(
     policy = make_policy()
     records = Records()
     open_window(policy, records)
-    pid, decision = bound_udp(
-        policy, records, participant, ("127.0.0.1", local_ports[participant])
-    )
-    assert decision.status == "PASS"
+    pid, fd, _ = registered_tx(policy, records, participant)
     decision = policy.feed(
         records.io(
             pid,
             "sendto",
-            7,
+            fd,
             address=("127.0.0.1", local_ports[remote_index]),
         )
     )
@@ -383,14 +538,17 @@ def test_outbound_unicast_matrix_passes(
 @pytest.mark.parametrize("remote_index", range(4))
 @pytest.mark.parametrize("participant", range(4))
 def test_inbound_spdp_and_unicast_sources_pass(participant, remote_index):
-    for local_port, remote_port in (
-        (26650, META_PORTS[remote_index]),
-        (META_PORTS[participant], META_PORTS[remote_index]),
-        (DATA_PORTS[participant], DATA_PORTS[remote_index]),
+    for local_port in (
+        26650,
+        META_PORTS[participant],
+        DATA_PORTS[participant],
     ):
         policy = make_policy()
         records = Records()
         open_window(policy, records)
+        _, _, remote_port = registered_tx(
+            policy, records, remote_index, fd=17 + remote_index
+        )
         pid, decision = bound_udp(policy, records, participant, ("0.0.0.0", local_port))
         assert decision.status == "PASS"
         assert (
@@ -407,55 +565,59 @@ def test_inbound_spdp_and_unicast_sources_pass(participant, remote_index):
 
 
 @pytest.mark.parametrize(
-    "local,remote",
+    "remote",
     [
-        (("0.0.0.0", META_PORTS[0]), ("239.255.0.1", 26650)),
-        (("127.0.0.1", META_PORTS[0]), ("127.0.0.1", DATA_PORTS[1])),
-        (("127.0.0.1", DATA_PORTS[0]), ("127.0.0.1", META_PORTS[1])),
-        (("127.0.0.1", META_PORTS[0]), ("192.0.2.10", META_PORTS[1])),
-        (("127.0.0.1", META_PORTS[0]), ("127.0.0.1", 26651)),
+        ("239.255.0.2", 26650),
+        ("239.255.0.1", 26651),
+        ("127.0.0.1", 26650),
+        ("127.0.0.1", 26651),
+        ("127.0.0.1", 26668),
+        ("192.0.2.10", META_PORTS[1]),
     ],
 )
-def test_nonmatrix_dds_destination_is_rejected(local, remote):
-    policy = make_policy(loopback_only=False if local[0] == "0.0.0.0" else True)
+def test_nonmatrix_dds_destination_is_rejected(remote):
+    policy = make_policy()
     records = Records()
     open_window(policy, records)
-    pid, decision = bound_udp(policy, records, 0, local)
-    if decision.status == "FAIL":
-        assert decision.reason == "UNEXPECTED_NETWORK_ATTEMPT"
-        return
-    decision = policy.feed(records.io(pid, "sendto", 7, address=remote))
+    pid, fd, _ = registered_tx(policy, records, 0)
+    decision = policy.feed(records.io(pid, "sendto", fd, address=remote))
     assert (decision.status, decision.reason) == (
         "FAIL",
         "UNEXPECTED_NETWORK_ATTEMPT",
     )
 
 
-def test_wildcard_outbound_requires_loopback_only_namespace_proof():
-    for loopback_only, expected in ((True, "PASS"), (False, "FAIL")):
-        policy = make_policy(loopback_only=loopback_only)
+def test_ephemeral_tx_requires_loopback_bind_and_nonzero_getsockname():
+    for bind_address, observed_address, observed_port in (
+        ("0.0.0.0", "127.0.0.1", EPHEMERAL_PORTS[0]),
+        ("127.0.0.1", "0.0.0.0", EPHEMERAL_PORTS[0]),
+        ("127.0.0.1", "127.0.0.1", 0),
+    ):
+        policy = make_policy()
         records = Records()
         open_window(policy, records)
-        pid, decision = bound_udp(policy, records, 0, ("0.0.0.0", META_PORTS[0]))
-        assert decision.status == "PASS"
-        decision = policy.feed(
-            records.io(pid, "sendto", 7, address=("127.0.0.1", META_PORTS[1]))
+        pid, decision = bound_udp(policy, records, 0, (bind_address, 0), fd=17)
+        if decision.status == "PASS":
+            decision = policy.feed(
+                records.getsockname(pid, 17, observed_address, observed_port)
+            )
+        assert (decision.status, decision.reason) == (
+            "FAIL",
+            "UNEXPECTED_NETWORK_ATTEMPT",
         )
-        assert decision.status == expected
 
 
 def test_ordinary_dds_message_passes_but_scm_rights_is_journaled():
     policy = make_policy()
     records = Records()
     open_window(policy, records)
-    pid, decision = bound_udp(policy, records, 0, ("127.0.0.1", META_PORTS[0]))
-    assert decision.status == "PASS"
+    pid, fd, _ = registered_tx(policy, records, 0)
     assert (
         policy.feed(
             records.io(
                 pid,
                 "sendmsg",
-                7,
+                fd,
                 address=("239.255.0.1", 26650),
                 control={},
             )
@@ -466,7 +628,7 @@ def test_ordinary_dds_message_passes_but_scm_rights_is_journaled():
         records.io(
             pid,
             "sendmsg",
-            7,
+            fd,
             control={"scm_rights": [[{"fd": 12}]]},
         )
     )
@@ -698,12 +860,15 @@ def test_exec_unshares_clone_files_table_before_closing_cloexec_entries():
         ("239.255.0.1", "192.0.2.10", "FAIL"),
     ],
 )
+@pytest.mark.parametrize("local_port", [26650, 26651])
 @pytest.mark.parametrize("option", ["IP_ADD_MEMBERSHIP", "IP_DROP_MEMBERSHIP"])
-def test_multicast_membership_option_is_value_bound(option, group, interface, expected):
+def test_multicast_membership_option_is_value_bound(
+    option, local_port, group, interface, expected
+):
     policy = make_policy()
     records = Records()
     open_window(policy, records)
-    pid, decision = bound_udp(policy, records, 0, ("0.0.0.0", 26650))
+    pid, decision = bound_udp(policy, records, 0, ("0.0.0.0", local_port))
     assert decision.status == "PASS"
     decision = policy.feed(
         records.make(
@@ -722,10 +887,13 @@ def test_multicast_membership_option_is_value_bound(option, group, interface, ex
     assert decision.status == expected
 
 
+@pytest.mark.parametrize("local_port", [26650, 26651])
 @pytest.mark.parametrize("option", ["IP_ADD_MEMBERSHIP", "IP_DROP_MEMBERSHIP"])
-def test_normalizer_retains_only_structural_multicast_membership_values(option):
+def test_normalizer_retains_only_structural_multicast_membership_values(
+    option, local_port
+):
     source = _trace_line(
-        f"setsockopt(7<UDP:[127.0.0.1:26650]>, SOL_IP, {option}, "
+        f"setsockopt(7<UDP:[127.0.0.1:{local_port}]>, SOL_IP, {option}, "
         '{imr_multiaddr=inet_addr("239.255.0.1"), '
         'imr_interface=inet_addr("127.0.0.1")}, 8)'
     )
@@ -924,11 +1092,12 @@ def test_dup_from_unknown_source_evicts_stale_target_and_fails_integrity(
     assert policy.trace_integrity_error is not None
 
 
-def test_clone_thread_inherits_participant_role_and_socket_authority():
+def test_runtime_contract_clone_thread_inherits_participant_role_and_fd_authority():
     policy = make_policy()
     records = Records()
     open_window(policy, records)
-    pid = connected_udp(policy, records)
+    pid, decision = bound_udp(policy, records, 0, ("0.0.0.0", 26650))
+    assert decision.status == "PASS"
     thread_pid = 200
     assert (
         policy.feed(
@@ -952,7 +1121,7 @@ def test_clone_thread_inherits_participant_role_and_socket_authority():
         == "PASS"
     )
 
-    assert policy.feed(records.io(thread_pid, "write", 7)).status == "PASS"
+    assert policy.feed(records.membership(thread_pid, 7)).status == "PASS"
 
 
 @pytest.mark.parametrize(
@@ -971,16 +1140,26 @@ def test_clone_thread_inherits_participant_role_and_socket_authority():
                 "flags": ["CLONE_VM", "CLONE_FILES", "SIGCHLD"],
             },
         ),
+        (
+            "clone",
+            {
+                "operation": "clone",
+                "child_pid": 200,
+                "fd_table": "copied",
+                "flags": ["CLONE_VM", "CLONE_SIGHAND", "CLONE_THREAD"],
+            },
+        ),
     ],
 )
 def test_nonthread_descendants_do_not_inherit_participant_role(syscall, transition):
     policy = make_policy()
     records = Records()
     open_window(policy, records)
-    pid = connected_udp(policy, records)
+    pid, bind_decision = bound_udp(policy, records, 0, ("0.0.0.0", 26650))
+    assert bind_decision.status == "PASS"
     assert policy.feed(records.make(pid, syscall, result=200, transition=transition))
 
-    decision = policy.feed(records.io(200, "write", 7))
+    decision = policy.feed(records.membership(200, 7))
 
     assert (decision.status, decision.reason) == (
         "FAIL",

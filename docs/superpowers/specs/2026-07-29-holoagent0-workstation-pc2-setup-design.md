@@ -432,16 +432,22 @@ mandatory. Four tracked Cyclone DDS files are the only allowed
 
 Each URI is an absolute `file:` URI to the corresponding tracked file. The
 four XML files differ only in fixed `Discovery/ParticipantIndex` value `0`,
-`1`, `2`, or `3`. Each explicitly pins domain `77`; interface `lo` with
-autodetection disabled, presence required, `multicast=true`, and
-`allow_multicast=spdp`; `General/Transport=udp`; global
-`AllowMulticast=spdp`; multicast loopback enabled; multicast TTL `1`;
+`1`, `2`, or `3`. Under the approved pinned Cyclone DDS 0.10.5 configuration,
+each explicitly pins domain `77`; `General/Interfaces/NetworkInterface` to
+`name="lo"`, `autodetermine="false"`, `presence_required="true"`, and
+`multicast="true"`; `General/Transport=udp`; global
+`General/AllowMulticast=spdp`; multicast loopback enabled; multicast TTL `1`;
 redundant networking disabled; numeric SPDP/default multicast address
-`239.255.0.1`; `Peers/AddLocalhost=false` with no static peers;
+`239.255.0.1`; an empty `Discovery/Peers` element with no static peer;
 `Compatibility/ManySocketsMode=false`; `Internal/MonitorPort=-1`; and DDSI
 port constants base `7400`, domain gain `250`, participant gain `2`, and
-offsets `0`, `1`, `10`, and `11`. No TCP, raw-Ethernet, IPv6, automatic
-participant index, or per-domain-participant socket mode is permitted.
+offsets `0`, `1`, `10`, and `11`. The 0.10.5 grammar has neither a per-
+interface `allow_multicast` attribute nor a `Peers/AddLocalhost` attribute;
+the global `General/AllowMulticast` element and an empty `Discovery/Peers`
+element express this policy. No TCP, raw-Ethernet, IPv6, automatic participant
+index, or per-domain-participant socket mode is permitted. The authoritative
+grammar is the pinned
+[0.10.5 XSD](https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/0.10.5/etc/cyclonedds.xsd).
 `source.repository` verifies all four file blobs. The gate policy pins a
 reviewed digest of the ordered repository-relative path/digest/role/index set.
 Each result records that set plus each resolved absolute URI. Every URI must
@@ -449,16 +455,77 @@ resolve back to its tracked file without a symlink/content mismatch. Any unset,
 inline, alternate, mutable, or digest-
 mismatched `CYCLONEDDS_URI` fails before a ROS import.
 
-With those fixed settings, the only permitted internet-family operations are
-UDP4 DDS operations during the trace-visible `semantic.fixture_query` window,
-issued by those four participant PIDs. The only multicast destination is SPDP
-at 239.255.0.1:26650; port 26651 is computed by the pinned DDSI constants but
-is not authorized because ASM/SSM data multicast is disabled. The allowed
-unicast pairs are 26660/26661, 26662/26663, 26664/26665, and 26666/26667.
-`ManySocketsMode=false` prohibits the additional kernel-selected per-domain-
-participant ports. Loopback/wildcard binds and the configured DDS multicast
-destination are allowed only because the namespace has no non-loopback
-interface or route.
+Under that approved pinned configuration, the only permitted internet-family
+operations are UDP4 DDS operations during the trace-visible
+`semantic.fixture_query` window. Cyclone creates the receive sockets on
+`26650`, `26651`, and the participant's fixed unicast meta/data pair:
+`26660/26661`, `26662/26663`, `26664/26665`, or `26666/26667`. It joins
+`239.255.0.1` on both multicast receive sockets. Port `26651` is therefore an
+authorized receive bind and membership FD, but no send may use that FD or have
+destination port `26651`.
+
+Cyclone also creates exactly one transmit socket for the selected `lo`
+interface by binding `127.0.0.1:0`. A successful bind does not yet authorize
+traffic: the subsequent successful `getsockname` must establish one unique,
+nonzero dynamic endpoint `E_i` and permanently bind it to that socket's FD
+provenance for participant identity `i`. That same FD and source `E_i` carry
+multicast SPDP and ordinary unicast endpoint-discovery and user-data traffic.
+The only outbound endpoint pairs are `E_i -> 239.255.0.1:26650` and
+`E_i -> 127.0.0.1:{26660..26667}`. A corresponding inbound operation must use
+one of the authorized receive FDs and a loopback source `E_j` previously
+registered by another or the same approved participant. A second transmit
+socket for an identity, an absent/conflicting/post-hoc `getsockname`, a zero or
+duplicate `E_i`, an unknown inbound `E_j`, a fixed receive FD used to send,
+destination `26651`, IPv6, a non-loopback endpoint, or another multicast group
+fails closed.
+
+This socket shape follows CycloneDDS 0.10.5's creation of a port-zero transmit
+connection for each selected interface and its reuse of that connection for
+both multicast and unicast address sets and writes; receive setup separately
+adds both multicast receive sockets and the transmit connection to the receive
+waitset. See
+[`q_init.c` transmit creation](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_init.c#L1715-L1741),
+[`q_addrset.c` connection selection](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_addrset.c#L313-L355),
+[`q_xmsg.c` connection write](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_xmsg.c#L1178-L1201),
+[`q_receive.c` receive waitset](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_receive.c#L3570-L3630),
+and
+[`q_init.c` multicast receive creation/join](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_init.c#L650-L738).
+`General/AllowMulticast=spdp` makes "no outbound user-data multicast" an
+endpoint/configuration invariant under this approved configuration. A
+payload-free syscall trace cannot identify an RTPS payload kind and must not
+claim to distinguish SPDP, SEDP, or user data from packet bytes.
+
+Participant authority is thread-scoped, not descendant-scoped. The recorded
+identity/config digest authorizes its root task and only TIDs whose successful
+trace lifecycle proves the same participant thread group and shared FD table
+through both `CLONE_THREAD` and `CLONE_FILES`. This proof may extend through an
+already authorized TID creating another thread with both flags. `fork`,
+`vfork`, a `clone` without either required flag, and every non-thread
+descendant retain FD provenance as Linux requires but inherit no participant
+role or DDS network authority.
+
+The committed
+`cyclonedds-0.10.5-runtime-representative.{input,expected.ndjson}` golden is a
+sanitized, payload-free, deterministic reconstruction of the syscall structure
+observed in the live pinned 0.10.5 run; it is not byte-for-byte raw strace. It
+covers both multicast receive binds and memberships, fixed receive binds,
+port-zero bind plus `getsockname`, registered `E_i`/`E_j`, SPDP and unicast
+destinations, and worker TIDs. Its input SHA-256 is
+`ad5516e742888d64541029cb9512ef4f01ee127000abf1e6e983357f9eaeebe0` and
+expected-NDJSON SHA-256 is
+`735efcd4f299e99f491891a41895ce205bf4ba4b894867705175dd124512f251`.
+At this RED contract checkpoint the repository's current config identity is
+set SHA-256
+`647ba0ee9b63e912ee7b0be0589a1729a16678901f2a3bbc380d73708f6e5ef7`,
+with p0/p1/p2/p3 member SHA-256 values
+`907977aeca2783f26816eafe3c822ba8930180b4855272fec75fac8370708f8b`,
+`48c53063ee9925b00768f9f022e2183290ba1fd0c26297c0a30f500af563228d`,
+`b2bdf5cc73d29ec28a61cf668517904b399a6c88fd8773678a7ce6836f3a3d19`,
+and `1fa8c8f12ebf3652e95fd2bbf24acaacc46ce95153a0bdfa0443f35223c145a9`.
+Those values identify the checked-in fixture inputs; they do not bless XML
+outside the 0.10.5 grammar. Task 6 implementation must correct the tracked XML
+and explicitly review and repin the resulting member/set digests rather than
+learning them during a run.
 
 The supervisor gives the coordinator a 64-hex run nonce in the initialized
 ledger. After the action child reports namespace/config validation and
@@ -473,8 +540,9 @@ or FD-provenance-derived socket-I/O syscall appear in the same canonical
 serialized trace. The parser accepts markers only
 from the recorded coordinator PID and only when their token matches the full
 ledger nonce. A permitted syscall's entry and completion must both lie between
-the matching marker records and belong to one of the four recorded participant
-PIDs. The marker protocol is conditional: no BEGIN marker is valid only when
+the matching marker records and belong to a recorded participant root or a TID
+authorized by the `CLONE_THREAD|CLONE_FILES` lifecycle rule above. The marker
+protocol is conditional: no BEGIN marker is valid only when
 the last accepted ledger generation has `semantic_dds_window: NOT_ENTERED` and
 the trace contains no fixture-participant lifecycle. A fully decoded IP event
 in that branch is an `offline.network_policy` violation, not by itself a trace-
@@ -487,9 +555,9 @@ integrity. Because an invalid marker sequence supplies no authorization, any
 fully decoded IP operation associated with it also fails network policy.
 
 TCP, DNS, any host-namespace IP operation, any explicit or generic socket I/O
-outside the marked semantic-fixture interval or participant/FD-provenance set,
-a UDP endpoint outside that DDS port policy, or any non-loopback route or
-interface fails
+outside the marked semantic-fixture interval or participant-thread/FD-
+provenance set, a UDP endpoint outside that DDS endpoint policy, or any non-
+loopback route or interface fails
 `offline.network_policy` with
 `UNEXPECTED_NETWORK_ATTEMPT`. Every allowed DDS syscall is retained in evidence
 with PID, serialized entry/exit indices, FD provenance, lengths/flags,
@@ -997,8 +1065,9 @@ nonce-bearing BEGIN/END `prctl` records and journals the four ROS process
 identities plus their role-specific Cyclone configuration digests. Its DDS
 window includes only the query publisher, result subscriber, fixture node, and
 bounded graph inspector. All must exit, be reaped, and close their DDS sockets
-before the END marker. Their UDP activity must satisfy the namespace, PID,
-marker-order, configuration, and fixed-port allowance in
+before the END marker. Their UDP activity must satisfy the namespace,
+participant-thread lifecycle, marker order, configuration, dynamic TX
+registration, and receive/destination endpoint allowance in
 `offline.network_policy`; diagnostic monotonic start/end timestamps remain in
 the result but are not the authorization clock. Passing the semantic result
 alone cannot bless additional traffic.
@@ -1913,10 +1982,14 @@ Implementation follows test-driven development.
   `ManySocketsMode=false`, trace-visible marker parsing, semantic-fixture
   never-entered/entered marker branches, PID/record-order scoping, host/private
   namespace-interface/route validation, supervisor audit/seccomp enforcement,
-  inherited-FD classification and close-range sanitization, per-process FD
-  provenance across socket creation/accept, `dup*`, `fcntl`, inheritance,
-  `CLONE_FILES` sharing/splitting, exec, and close transitions, generic
-  socket-I/O classification,
+  receive binds and `239.255.0.1` membership on both `26650` and `26651`, one
+  identity/digest-bound port-zero TX FD registered by a unique nonzero
+  `getsockname` endpoint, `E_i` outbound and registered-`E_j` inbound source
+  enforcement, inherited-FD classification and close-range sanitization, per-
+  process FD provenance across socket creation/accept, `dup*`, `fcntl`,
+  inheritance, `CLONE_FILES` sharing/splitting, exact
+  `CLONE_THREAD|CLONE_FILES` participant-role inheritance, denial to non-thread
+  descendants, exec, and close transitions, generic socket-I/O classification,
   `SCM_RIGHTS`/`pidfd_getfd` acquisition denial, io_uring/ptrace/
   `CLONE_UNTRACED` denial, postflight-before-trace ordering, tracer/runner
   process-group separation, tracer pidfd liveness and `PTRACE_O_EXITKILL`,
@@ -1924,9 +1997,10 @@ Implementation follows test-driven development.
   supervisor signal/exit precedence.
 - Closed trace-tool-policy schema and one-row allowlist; exact 6.6 archive
   size/digest, build recipe/image, runtime ELF/version, parser blob, canonical
-  argv, and fixture-manifest matching; raw generic-I/O normalization without
-  persisted payload; complete canonical record formation from paired
-  unfinished/resumed input; and rejection of every abbreviation, unknown ABI,
+  argv, and fixture-manifest matching; exact normalization of the sanitized,
+  payload-free CycloneDDS 0.10.5 runtime-representative golden; raw generic-I/O
+  normalization without persisted payload; complete canonical record formation
+  from paired unfinished/resumed input; and rejection of every abbreviation, unknown ABI,
   unknown grammar, ellipsis, or undecodable policy field.
 - Every supervisor bootstrap-table row, including immutable generation-0
   creation, supervisor-authored early successors, finalizer-only trace,
@@ -2014,8 +2088,9 @@ Implementation follows test-driven development.
   absence of a gateway process/service/listener.
 - Run the structured HMSG fixture and assert graph, object, room, pose, frame,
   and ROS endpoint counts, then match every resulting DDS syscall to the exact
-  participant PID, BEGIN/END marker order, configuration digest, and fixed
-  domain-77 port allowance.
+  participant root/authorized worker TID, BEGIN/END marker order, configuration
+  digest, `E_i` registration, registered inbound `E_j`, and domain-77 receive/
+  destination endpoint allowance under the approved pinned configuration.
 - Re-run the tracked MuJoCo test manifest and require every selected test to
   exist, at least one test to be collected, and zero failures. No test-count
   equality is used.
@@ -2051,10 +2126,15 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
   `INSTALLED_PAYLOAD_MISMATCH`.
 - From a descendant outside the semantic gate, attempt TCP, UDP/DNS, and
   loopback traffic and require `offline.network_policy: FAIL`. During the gate,
-  vary PID, marker position, protocol, destination, Cyclone config digest,
-  participant index, socket mode, and DDS port independently and require
-  failure; the exact namespace-confined DDS trace must pass. Attempt any host-
-  namespace IP operation from either observer and require failure. Truncate the
+  vary participant thread-group proof, marker position, protocol, destination,
+  Cyclone config digest, participant index, socket mode, dynamic endpoint, and
+  DDS receive/destination port independently and require failure; the exact
+  namespace-confined DDS trace must pass. Create a second TX socket, omit or
+  conflict `getsockname`, reuse an `E_i`, present an unknown inbound `E_j`, send
+  from the `26651` receive FD, or send to destination `26651`; each must fail.
+  Prove that only `CLONE_THREAD|CLONE_FILES` worker TIDs inherit participant
+  authority and that forked or other non-thread descendants do not. Attempt any
+  host-namespace IP operation from either observer and require failure. Truncate the
   trace, remove/duplicate/reorder a marker, split a syscall across a marker, or
   simulate an unclosed PID with no complete prohibited operation and require
   `offline.trace_integrity: FAIL`, `offline.network_policy: SKIPPED`, and
@@ -2077,7 +2157,7 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
   including an SQPOLL case, and attempt `CLONE_UNTRACED` and `ptrace`; require
   the inherited seccomp policy to deny each operation, trace the attempt,
   journal it, and select the corresponding network-policy safety reason.
-- During the permitted DDS interval, connect an allowed UDP socket, duplicate
+- During the permitted DDS interval, connect the registered TX UDP socket, duplicate
   it independently through `dup`, `dup2`, `dup3`, `fcntl(F_DUPFD)`, and a
   traced descendant using both copied and `CLONE_FILES`-shared tables, then
   retain each alias past END. Attempt `write`,

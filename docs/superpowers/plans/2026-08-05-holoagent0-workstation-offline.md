@@ -470,203 +470,132 @@ git commit -m "feat: pin strace parser and provisioning recipe"
 - Create: `scripts/holoagent0_setup/config/cyclonedds-offline-p1.xml`
 - Create: `scripts/holoagent0_setup/config/cyclonedds-offline-p2.xml`
 - Create: `scripts/holoagent0_setup/config/cyclonedds-offline-p3.xml`
+- Create: `scripts/holoagent0_setup/fixtures/strace/cyclonedds-0.10.5-runtime-representative.input`
+- Create: `scripts/holoagent0_setup/fixtures/strace/cyclonedds-0.10.5-runtime-representative.expected.ndjson`
+- Modify: `scripts/holoagent0_setup/fixtures/strace/manifest-v1.json`
 - Test: `scripts/holoagent0_setup/tests/test_trace_policy.py`
+- Test: `scripts/holoagent0_setup/tests/test_trace_normalizer.py`
 - Test: `scripts/holoagent0_setup/tests/test_cyclone_policy.py`
 
-- [ ] **Step 1: Write adversarial provenance and exact DDS port-matrix tests**
+- [ ] **Step 1: Write runtime-derived endpoint, provenance, and thread-authority tests**
 
 ```python
-@pytest.mark.parametrize("op", ["write", "writev", "sendfile", "splice"])
-def test_connected_udp_alias_after_end_is_safety_failure(policy, op):
-    policy.feed(socket_udp(fd=7, peer=("127.0.0.1", 26661)))
-    policy.feed(dup_fd(old=7, new=11))
-    policy.feed(marker("BEGIN", token="m"))
-    policy.feed(marker("END", token="m"))
-    decision = policy.feed(generic_io(op, fd=11, length=8))
-    assert decision.reason == "UNEXPECTED_NETWORK_ATTEMPT"
+RECEIVE_PORTS = {
+    0: (26650, 26651, 26660, 26661),
+    1: (26650, 26651, 26662, 26663),
+    2: (26650, 26651, 26664, 26665),
+    3: (26650, 26651, 26666, 26667),
+}
 
 
-@pytest.mark.parametrize("local_address", ["0.0.0.0", "127.0.0.1"])
-@pytest.mark.parametrize("participant,channel,local_port", [
-    (0, "spdp_multicast", 26650),
-    (1, "spdp_multicast", 26650),
-    (2, "spdp_multicast", 26650),
-    (3, "spdp_multicast", 26650),
-    (0, "unicast_meta", 26660),
-    (0, "unicast_data", 26661),
-    (1, "unicast_meta", 26662),
-    (1, "unicast_data", 26663),
-    (2, "unicast_meta", 26664),
-    (2, "unicast_data", 26665),
-    (3, "unicast_meta", 26666),
-    (3, "unicast_data", 26667),
-])
-def test_exact_dds_local_bind_matrix_passes(
-    dds_window_policy, local_address, participant, channel, local_port
-):
-    decision = dds_window_policy.feed(dds_bind(
-        issuer=dds_window_policy.issuer(participant),
-        local_address=local_address, local_port=local_port, channel=channel,
-    ))
+def register_tx(policy, records, participant, fd, dynamic_port):
+    pid, decision = bind_udp(
+        policy, records, participant, fd=fd, local=("127.0.0.1", 0)
+    )
     assert decision.status == "PASS"
-
-
-@pytest.mark.parametrize("local_address,participant,channel,local_port", [
-    ("192.0.2.10", 0, "spdp_multicast", 26650),
-    ("::1", 0, "spdp_multicast", 26650),
-    ("239.255.0.1", 0, "spdp_multicast", 26650),
-    ("0.0.0.0", 0, "data_multicast", 26651),
-    ("127.0.0.1", 0, "unicast_meta", 26662),
-    ("0.0.0.0", 0, "unicast_data", 0),
-])
-def test_invalid_dds_bind_interface_or_port_is_rejected(
-    dds_window_policy, local_address, participant, channel, local_port
-):
-    decision = dds_window_policy.feed(dds_bind(
-        issuer=dds_window_policy.issuer(participant),
-        local_address=local_address, local_port=local_port, channel=channel,
-    ))
-    assert decision.reason == "UNEXPECTED_NETWORK_ATTEMPT"
-
-
-@pytest.mark.parametrize("destination_index,kind,address,port", [
-    (None, "spdp_multicast", "239.255.0.1", 26650),
-    (0, "unicast_meta", "127.0.0.1", 26660),
-    (0, "unicast_data", "127.0.0.1", 26661),
-    (1, "unicast_meta", "127.0.0.1", 26662),
-    (1, "unicast_data", "127.0.0.1", 26663),
-    (2, "unicast_meta", "127.0.0.1", 26664),
-    (2, "unicast_data", "127.0.0.1", 26665),
-    (3, "unicast_meta", "127.0.0.1", 26666),
-    (3, "unicast_data", "127.0.0.1", 26667),
-])
-def test_exact_dds_destination_matrix_passes(
-    dds_window_policy, destination_index, kind, address, port
-):
-    decision = dds_window_policy.feed(dds_udp(
-        issuer=dds_window_policy.allowed_issuer,
-        destination_index=destination_index,
-        kind=kind, address=address, port=port,
-    ))
+    decision = policy.feed(
+        getsockname(pid, fd, local=("127.0.0.1", dynamic_port))
+    )
     assert decision.status == "PASS"
+    return pid, fd, dynamic_port
 
 
-@pytest.mark.parametrize("destination_index,kind,address,port", [
-    (None, "data_multicast", "239.255.0.1", 26651),
-    (None, "spdp_multicast", "127.0.0.1", 26650),
-    (0, "unicast_meta", "239.255.0.1", 26660),
-    (0, "unicast_data", "127.0.0.1", 26663),
-    (3, "unicast_data", "127.0.0.1", 26668),
-    (0, "unicast_data", "127.0.0.1", 26659),
+@pytest.mark.parametrize("participant", range(4))
+def test_runtime_receive_bind_matrix_includes_both_multicast_ports(participant):
+    policy, records = open_dds_window()
+    for port in RECEIVE_PORTS[participant]:
+        pid, decision = bind_udp(
+            policy, records, participant, fd=port, local=("0.0.0.0", port)
+        )
+        assert decision.status == "PASS"
+        if port in {26650, 26651}:
+            assert policy.feed(
+                add_membership(pid, port, "239.255.0.1", "127.0.0.1")
+            ).status == "PASS"
+
+
+def test_one_tx_fd_carries_spdp_sedp_and_user_data():
+    policy, records = open_dds_window()
+    pid, fd, _ = register_tx(
+        policy, records, participant=0, fd=17, dynamic_port=40000
+    )
+    destinations = [("239.255.0.1", 26650)] + [
+        ("127.0.0.1", port) for port in range(26660, 26668)
+    ]
+    for destination in destinations:
+        assert policy.feed(sendto(pid, fd, destination)).status == "PASS"
+
+
+def test_inbound_requires_registered_dynamic_source():
+    policy, records = open_dds_window()
+    _, _, e_j = register_tx(
+        policy, records, participant=1, fd=18, dynamic_port=40001
+    )
+    pid, decision = bind_udp(
+        policy, records, participant=0, fd=7, local=("0.0.0.0", 26660)
+    )
+    assert decision.status == "PASS"
+    assert policy.feed(recvfrom(pid, 7, ("127.0.0.1", e_j))).status == "PASS"
+    assert policy.feed(
+        recvfrom(pid, 7, ("127.0.0.1", 40999))
+    ).reason == "UNEXPECTED_NETWORK_ATTEMPT"
+
+
+def test_worker_tid_requires_clone_thread_and_clone_files():
+    policy, records = open_dds_window()
+    pid, decision = bind_udp(
+        policy, records, participant=0, fd=7, local=("0.0.0.0", 26650)
+    )
+    assert decision.status == "PASS"
+    assert policy.feed(clone(
+        pid, child_tid=200, flags=("CLONE_THREAD", "CLONE_FILES")
+    )).status == "PASS"
+    assert policy.feed(
+        add_membership(200, 7, "239.255.0.1", "127.0.0.1")
+    ).status == "PASS"
+
+
+@pytest.mark.parametrize("lifecycle", [
+    fork(child_pid=200),
+    clone(child_tid=200, flags=("CLONE_FILES",)),
+    clone(child_tid=200, flags=("CLONE_THREAD",)),
 ])
-def test_every_nonmatrix_dds_destination_is_rejected(
-    dds_window_policy, destination_index, kind, address, port
-):
-    decision = dds_window_policy.feed(dds_udp(
-        issuer=dds_window_policy.allowed_issuer,
-        destination_index=destination_index,
-        kind=kind, address=address, port=port,
-    ))
-    assert decision.reason == "UNEXPECTED_NETWORK_ATTEMPT"
-
-
-META_PORTS = {0: 26660, 1: 26662, 2: 26664, 3: 26666}
-DATA_PORTS = {0: 26661, 1: 26663, 2: 26665, 3: 26667}
-
-
-def exact_dds_flows(policy):
-    flows = []
-    for local_index in range(4):
-        issuer = policy.participant(local_index)
-        flows.append(dds_packet(
-            direction="outbound", issuer=issuer, channel="spdp_multicast",
-            local=("127.0.0.1", META_PORTS[local_index]),
-            remote=("239.255.0.1", 26650),
-        ))
-        for remote_index in range(4):
-            flows.extend((
-                dds_packet(
-                    direction="inbound", issuer=issuer, channel="spdp_multicast",
-                    local=("0.0.0.0", 26650),
-                    remote=("127.0.0.1", META_PORTS[remote_index]),
-                ),
-                dds_packet(
-                    direction="outbound", issuer=issuer, channel="unicast_meta",
-                    local=("127.0.0.1", META_PORTS[local_index]),
-                    remote=("127.0.0.1", META_PORTS[remote_index]),
-                ),
-                dds_packet(
-                    direction="inbound", issuer=issuer, channel="unicast_meta",
-                    local=("0.0.0.0", META_PORTS[local_index]),
-                    remote=("127.0.0.1", META_PORTS[remote_index]),
-                ),
-                dds_packet(
-                    direction="outbound", issuer=issuer, channel="unicast_data",
-                    local=("127.0.0.1", DATA_PORTS[local_index]),
-                    remote=("127.0.0.1", DATA_PORTS[remote_index]),
-                ),
-                dds_packet(
-                    direction="inbound", issuer=issuer, channel="unicast_data",
-                    local=("0.0.0.0", DATA_PORTS[local_index]),
-                    remote=("127.0.0.1", DATA_PORTS[remote_index]),
-                ),
-            ))
-    return tuple(flows)
-
-
-def test_directional_sources_and_destinations(dds_window_policy):
-    for flow in exact_dds_flows(dds_window_policy):
-        assert dds_window_policy.feed(flow).status == "PASS"
-
-    for flow in (
-        dds_packet(
-            direction="outbound", issuer=dds_window_policy.participant(0),
-            channel="spdp_multicast", local=("0.0.0.0", 26660),
-            remote=("239.255.0.1", 26650),
-        ),
-        dds_packet(
-            direction="inbound", issuer=dds_window_policy.participant(0),
-            channel="spdp_multicast", local=("0.0.0.0", 26650),
-            remote=("192.0.2.10", 26660),
-        ),
-        dds_packet(
-            direction="outbound", issuer=dds_window_policy.participant(0),
-            channel="unicast_meta", local=("127.0.0.1", 26661),
-            remote=("127.0.0.1", 26662),
-        ),
-        dds_packet(
-            direction="inbound", issuer=dds_window_policy.participant(0),
-            channel="unicast_meta", local=("127.0.0.1", 26660),
-            remote=("127.0.0.1", 26663),
-        ),
-    ):
-        assert dds_window_policy.feed(flow).reason == "UNEXPECTED_NETWORK_ATTEMPT"
-
-
-def test_ordinary_dds_message_passes_but_scm_rights_is_journaled(dds_window_policy):
-    ordinary = dds_window_policy.feed(sendmsg_udp(
-        issuer=dds_window_policy.participant(0),
-        source=("127.0.0.1", 26660),
-        destination=("239.255.0.1", 26650),
-        control_messages=(),
-    ))
-    assert ordinary.status == "PASS"
-
-    transfer = dds_window_policy.feed(sendmsg_unix(
-        issuer=dds_window_policy.participant(0),
-        control_messages=(scm_rights(fd=7),),
-    ))
-    assert transfer.reason == "PROHIBITED_FD_TRANSFER"
-    assert dds_window_policy.journal.first_violation.reason == "PROHIBITED_FD_TRANSFER"
+def test_nonthread_or_nonsharing_descendant_has_no_participant_authority(lifecycle):
+    policy, records = open_dds_window()
+    # FD inheritance still follows Linux, but role authority does not.
+    policy.feed(lifecycle)
+    assert policy.feed(dds_io_from(200)).reason == "UNEXPECTED_NETWORK_ATTEMPT"
 ```
 
-- [ ] **Step 2: Run and verify the policy tests fail**
+Add the closed manifest case
+`cyclonedds-0.10.5-runtime-representative.{input,expected.ndjson}`. Its input
+is a sanitized, payload-free, deterministic reconstruction of the syscall
+structure observed in the live pinned CycloneDDS 0.10.5 run, not byte-for-byte
+raw strace. The normalizer test must reproduce the expected NDJSON exactly and
+assert both multicast binds/memberships, the fixed receive pair, port-zero bind
+plus nonzero `getsockname`, worker TIDs, SPDP destination, unicast
+destinations, and registered inbound source. The policy replay must accept the
+entire marker-bounded golden once Task 6 production implements this amendment.
 
-Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_trace_policy.py scripts/holoagent0_setup/tests/test_cyclone_policy.py`
+Also cover rejection of a second TX socket for one identity, a duplicate/zero
+or unknown `E_i`, an unknown inbound `E_j`, IPv6, non-loopback endpoints,
+alternate multicast groups, sends from the `26651` FD, destination `26651`,
+and role inheritance through `fork`, `vfork`, or a `clone` missing either
+`CLONE_THREAD` or `CLONE_FILES`. Revise every former blanket rejection of
+port zero or `26651`; those are now respectively a conditional TX bind and a
+receive-bind/membership endpoint.
 
-Expected: FAIL because provenance and pinned Cyclone configuration checks are missing.
+- [ ] **Step 2: Run and verify the amended policy contract is RED**
 
-- [ ] **Step 3: Implement provenance and exact DDS allowance**
+Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_trace_policy.py scripts/holoagent0_setup/tests/test_trace_normalizer.py scripts/holoagent0_setup/tests/test_cyclone_policy.py`
+
+Expected at the contract-amendment checkpoint: FAIL because production still
+implements the disproven fixed-source-port matrix, lacks dynamic TX endpoint
+registration and thread-scoped role authority, and still pins the pre-golden
+fixture-manifest digest. This checkpoint commits tests/docs/fixtures only and
+does not advance to Task 7.
+
+- [ ] **Step 3: Implement provenance and the exact pinned DDS allowance**
 
 ```python
 @dataclass(frozen=True)
@@ -694,35 +623,103 @@ class TracePolicy:
         return PolicyDecision("SKIPPED", "DEPENDENCY_NOT_AVAILABLE", None)
 ```
 
-Track socket creation, local binds, connected and message peers, `dup*`, `fcntl(F_DUPFD*)`, fork/clone table semantics, exec, close, decoded `SCM_RIGHTS`, and `pidfd_getfd`. Classify TCP/DNS, host-namespace IP, non-loopback routes, any `pidfd_getfd` acquisition attempt, any decoded `SCM_RIGHTS` transfer, and any UDP operation outside the exact four participant identities, marker interval, configuration digests, and direction-specific domain-77 endpoint matrix. Preserve violation-journal failures even when trace integrity later fails.
+Track socket creation, local binds, `getsockname`, connected and message
+peers, `dup*`, `fcntl(F_DUPFD*)`, fork/clone table semantics, thread-group
+semantics, exec, exit, close, decoded `SCM_RIGHTS`, and `pidfd_getfd`.
+Classify TCP/DNS, host-namespace IP, non-loopback routes, any `pidfd_getfd`
+acquisition attempt, any decoded `SCM_RIGHTS` transfer, and any UDP operation
+outside the exact four identity/config-digest participant roots, their
+trace-proven authorized TIDs, marker interval, and direction-specific domain-77
+endpoint/provenance matrix. Preserve violation-journal failures even when trace
+integrity later fails.
 
-The closed UDP4 allowance is:
+Under the approved pinned CycloneDDS 0.10.5 configuration, the closed UDP4
+allowance is:
 
-| Operation | Local bind/source | Peer/source/destination | Additional restriction |
+| Operation | Local FD/bind/source | Peer/source/destination | Additional restriction |
 |---|---|---|---|
-| Bind SPDP receive socket | `0.0.0.0:26650` or `127.0.0.1:26650` | none | Any of the four exact participant identities; reuse options do not widen the endpoint |
-| Bind unicast meta/data socket | `0.0.0.0` or `127.0.0.1` at that participant's exact pair | none | p0 `26660/26661`; p1 `26662/26663`; p2 `26664/26665`; p3 `26666/26667` |
-| Outbound SPDP | `127.0.0.1` at the issuing participant's meta port | destination `239.255.0.1:26650` | Meta channel only |
-| Inbound SPDP | bound wildcard/loopback `:26650` | source `127.0.0.1` at any exact participant meta port | Source address may never be wildcard or multicast |
-| Outbound unicast meta/data | `127.0.0.1` at the issuer's matching meta/data port | destination `127.0.0.1` at any exact participant port of the same channel | Meta-to-meta or data-to-data only |
-| Inbound unicast meta/data | bound wildcard/loopback at the receiver's matching meta/data port | source `127.0.0.1` at any exact participant port of the same channel | Meta-to-meta or data-to-data only |
+| Bind multicast receive sockets | wildcard/loopback `:26650` and `:26651` | none | Both binds are required; join `239.255.0.1` on both FDs through loopback |
+| Bind fixed unicast receive sockets | wildcard/loopback at that participant's pair | none | p0 `26660/26661`; p1 `26662/26663`; p2 `26664/26665`; p3 `26666/26667` |
+| Register transmit socket | exactly one FD bound `127.0.0.1:0` | subsequent `getsockname -> 127.0.0.1:E_i` | `E_i` must be unique and nonzero and remains bound to that FD provenance |
+| Outbound DDS | registered TX FD/source `E_i` | `239.255.0.1:26650` or loopback `26660..26667` | The same TX FD carries SPDP and ordinary unicast SEDP/user data |
+| Inbound DDS | an approved multicast/fixed receive FD | loopback source at a previously registered `E_j` | Unknown source ports never inherit permission from destination validity |
+| Worker-TID DDS operation | FD from the participant's shared table | same endpoint rules | TID role requires lifecycle proof containing both `CLONE_THREAD` and `CLONE_FILES` |
 
-Derive the local endpoint from the FD's trace-visible bind/connect/`getsockname` provenance and the remote endpoint from connect state or the decoded message address. A wildcard-bound outbound socket may normalize to effective source `127.0.0.1` only after the preflight artifact proves the private namespace has exactly `lo` and no non-loopback interface or route; without that proof, its source is unknown and the operation fails. An inbound message requires a decoded loopback source. Unknown, conflicting, or post-hoc endpoint provenance never inherits permission from a valid port number alone.
+The `26651` socket is receive/join-only: reject sends from that FD and every
+destination `:26651`. Fixed receive sockets likewise do not become TX FDs.
+Reject a second port-zero TX socket for an identity, conflicting or post-hoc
+`getsockname`, zero/duplicate/unknown `E_i`, unknown inbound `E_j`, IPv6,
+non-loopback endpoints, alternate multicast groups, and every destination
+outside the table. A wildcard receive bind is permitted only after the
+preflight artifact proves the private namespace has exactly `lo` and no
+non-loopback interface or route.
 
-Wildcard `0.0.0.0` is permitted only as a local bind address, never as a packet source or destination. IPv6, non-loopback interfaces/sources/destinations, multicast binds, alternate multicast groups, port `26651`, port zero/ephemeral binds, cross-channel pairs, and ports outside `26650` plus `26660`–`26667` are rejected. Every permitted operation still requires the exact PID/config role and BEGIN/END nonce; socket reuse flags, connection state, or a previously valid bind cannot widen the matrix.
+Participant authority is not inherited merely because a descendant has an FD.
+A successful lifecycle edge from an authorized task grants authority only when
+the clone flags prove both the same thread group and the same FD table through
+`CLONE_THREAD|CLONE_FILES`. `fork`, `vfork`, and any `clone` missing
+either flag retain only their ordinary FD-provenance semantics; they receive no
+participant role. Exit removes the task/TID authority without granting it to a
+later PID reuse.
 
-The four XML files are byte-pinned and differ only in `Discovery/ParticipantIndex`. Each pins domain `77`; required `lo` with autodetection disabled and `multicast=true`; `General/Transport=udp`; interface and global `AllowMulticast=spdp`; multicast loopback enabled; TTL `1`; numeric SPDP/default multicast address `239.255.0.1`; no static peers and `Peers/AddLocalhost=false`; `ManySocketsMode=false`; monitor port `-1`; redundant networking disabled; and DDSI port constants base `7400`, domain gain `250`, participant gain `2`, offsets `0`, `1`, `10`, and `11`. Tests must reject disabled/all multicast, automatic participant selection, alternate transport/interface/address/port constants, inline or symlinked `CYCLONEDDS_URI`, and any digest mismatch before a ROS import.
+This behavior is specific to the approved pinned configuration. CycloneDDS
+0.10.5 creates one port-zero transmit connection per selected interface, uses
+that connection for multicast and unicast address sets/writes, creates separate
+receive sockets on both multicast ports, joins SPDP on both, and adds the TX
+connection to its receive waitset. The source anchors are
+[`q_init.c` transmit creation](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_init.c#L1715-L1741),
+[`q_addrset.c` connection selection](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_addrset.c#L313-L355),
+[`q_xmsg.c` connection write](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_xmsg.c#L1178-L1201),
+[`q_receive.c` receive waitset](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_receive.c#L3570-L3630),
+and
+[`q_init.c` receive creation/join](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_init.c#L650-L738).
+State `no outbound user-data multicast` only as an endpoint/configuration
+invariant. The payload-free syscall trace cannot determine RTPS payload kind.
 
-- [ ] **Step 4: Run provenance, marker, and DDS matrix tests**
+The four XML files are byte-pinned by role/index, but the approved 0.10.5
+grammar uses
+`<NetworkInterface name="lo" autodetermine="false" presence_required="true" multicast="true"/>`,
+global `<AllowMulticast>spdp</AllowMulticast>`, and an empty `<Peers/>`.
+It does not support per-interface `allow_multicast` or `Peers/AddLocalhost`;
+see the pinned
+[0.10.5 XSD](https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/0.10.5/etc/cyclonedds.xsd).
+Keep domain `77`, `Transport=udp`, multicast loopback, TTL `1`, numeric
+SPDP/default multicast address `239.255.0.1`, `ManySocketsMode=false`,
+monitor port `-1`, redundant networking disabled, fixed participant indexes,
+and DDSI constants base `7400`, gains `250`/`2`, offsets
+`0`/`1`/`10`/`11`. Tests reject automatic participant selection,
+alternate transport/interface/address/port constants, inline or symlinked
+`CYCLONEDDS_URI`, and any digest mismatch before a ROS import.
 
-Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_trace_policy.py scripts/holoagent0_setup/tests/test_cyclone_policy.py`
+The runtime-representative golden is identity-bound to CycloneDDS `0.10.5`.
+Its input/expected SHA-256 values are
+`ad5516e742888d64541029cb9512ef4f01ee127000abf1e6e983357f9eaeebe0` and
+`735efcd4f299e99f491891a41895ce205bf4ba4b894867705175dd124512f251`.
+At this RED checkpoint the checked-in p0/p1/p2/p3 config hashes are
+`907977aeca2783f26816eafe3c822ba8930180b4855272fec75fac8370708f8b`,
+`48c53063ee9925b00768f9f022e2183290ba1fd0c26297c0a30f500af563228d`,
+`b2bdf5cc73d29ec28a61cf668517904b399a6c88fd8773678a7ce6836f3a3d19`,
+and `1fa8c8f12ebf3652e95fd2bbf24acaacc46ce95153a0bdfa0443f35223c145a9`;
+the set hash is
+`647ba0ee9b63e912ee7b0be0589a1729a16678901f2a3bbc380d73708f6e5ef7`.
+They identify current fixture inputs, not approval of unsupported XML. Task 6
+implementation must correct the tracked XML, review and repin resulting member/
+set digests, and update the closed trace-fixture-manifest digest explicitly. No
+run learns or amends any digest.
 
-Expected: PASS for the one exact semantic DDS window and FAIL for every other IP path.
+- [ ] **Step 4: Run provenance, marker, endpoint, and thread-authority tests**
+
+Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_trace_policy.py scripts/holoagent0_setup/tests/test_trace_normalizer.py scripts/holoagent0_setup/tests/test_cyclone_policy.py`
+
+Expected after Task 6 production implementation: PASS for the one exact
+semantic DDS window under the approved pinned configuration and policy
+rejection for every other IP path. Until that implementation lands, the
+contract-amendment commit intentionally remains RED as specified in Step 2.
 
 - [ ] **Step 5: Commit network policy**
 
 ```bash
-git add scripts/holoagent0_setup/holoagent0_setup/trace_policy.py scripts/holoagent0_setup/holoagent0_setup/cyclone_policy.py scripts/holoagent0_setup/config scripts/holoagent0_setup/tests
+git add scripts/holoagent0_setup/holoagent0_setup/trace_policy.py scripts/holoagent0_setup/holoagent0_setup/cyclone_policy.py scripts/holoagent0_setup/config scripts/holoagent0_setup/fixtures/strace scripts/holoagent0_setup/tests
 git commit -m "feat: enforce offline trace network policy"
 ```
 
@@ -1059,7 +1056,7 @@ Expected: FAIL because the 74-blob verifier, asset lock, and fixture node are ab
 
 Populate `semantic-source-manifest-v1.json` with the exact 74 sorted paths approved in Component 1 of `docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md`; the test must compare the tracked manifest path set to that table with no extras or omissions. Verify every path against commit `f164095abb0045a69c0b8eb23683063be3deaa38`, reject a reappeared conflicting path, and never expand the manifest by scanning the old snapshot tree. Record graph/dataset/checkpoint root digests from the approved design. Run the structured query through the real HMSG retrieval/transform code, bypassing only the external LLM parser. Enforce exact publisher/subscriber counts, frame, object, pose, and the four pinned Cyclone participant configurations; bracket DDS with nonce-bearing BEGIN/END markers.
 
-The pinned semantic digests are graph root `6e8e27504598c0fe28836b2148ec77732be00ca9cf6d5640f7193332da98e050`, dataset root `a28fea956a4520330a76d90f75a60f7781602bfd19cd13e510b2574d39b4a913`, and checkpoint file `5ddb47339f44e4fd9cace3d3960d38af1b51a25857440cfae90afc44706d7e2b`. The four Cyclone configurations use loopback UDP4, SPDP-only multicast at `239.255.0.1:26650`, `ManySocketsMode=false`, domain 77, and fixed participant indices 0–3 for fixture, query publisher, result subscriber, and graph inspector. Data multicast port `26651` is prohibited; the only unicast local/destination endpoints are the four exact meta/data pairs from Task 6.
+The pinned semantic digests are graph root `6e8e27504598c0fe28836b2148ec77732be00ca9cf6d5640f7193332da98e050`, dataset root `a28fea956a4520330a76d90f75a60f7781602bfd19cd13e510b2574d39b4a913`, and checkpoint file `5ddb47339f44e4fd9cace3d3960d38af1b51a25857440cfae90afc44706d7e2b`. Under the approved pinned CycloneDDS 0.10.5 configuration, the four roles use loopback UDP4, global SPDP-only multicast at `239.255.0.1:26650`, `ManySocketsMode=false`, domain 77, and fixed participant indices 0–3 for fixture, query publisher, result subscriber, and graph inspector. Receive binds include both `26650` and `26651` plus each role's fixed meta/data pair, with the SPDP group joined on both multicast receive FDs. Each participant registers exactly one unique nonzero dynamic TX endpoint `E_i` through `127.0.0.1:0` plus `getsockname`; that FD carries every outbound SPDP and unicast DDS operation. Sends from or to `26651` are prohibited, and inbound source ports must be registered `E_j` values. "No outbound user-data multicast" remains a configuration/endpoint invariant, not a payload classification inferred from the sanitized syscall trace.
 
 ```python
 EXPECTED_QUERY = SemanticExpectation(

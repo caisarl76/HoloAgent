@@ -91,7 +91,7 @@ def test_fixture_manifest_is_closed_canonical_digest_bound_and_complete():
     assert set(manifest) == {"$id", "schema_version", "cases", "additionalProperties"}
     assert manifest["additionalProperties"] is False
     names = [case["name"] for case in manifest["cases"]]
-    assert len(names) == len(set(names)) == 13
+    assert len(names) == len(set(names)) == 14
     declared = {"manifest-v1.json"}
     for case in manifest["cases"]:
         allowed = {
@@ -133,6 +133,58 @@ def test_manifest_cases_match_exact_canonical_output_without_payload_leakage():
             rendered = canonical_ndjson(records)
             assert rendered.encode() == (FIXTURES / case["expected"]).read_bytes()
         assert not any(secret in rendered for secret in SENTINELS)
+
+
+def test_cyclonedds_0_10_5_runtime_representative_golden_is_exact_and_payload_free():
+    # Sanitized deterministic reconstruction of the observed 0.10.5 syscall
+    # structure; it is intentionally not represented as byte-for-byte raw strace.
+    stem = "cyclonedds-0.10.5-runtime-representative"
+    source = (FIXTURES / f"{stem}.input").read_bytes()
+    expected = (FIXTURES / f"{stem}.expected.ndjson").read_bytes()
+    records = normalize_bytes(source)
+
+    assert canonical_ndjson(records).encode() == expected
+    assert b"RTPS" not in source and b"SECRET" not in source
+    assert [
+        record["transition"]["address"]["port"]
+        for record in records
+        if record.get("syscall") == "bind"
+    ] == [26650, 26651, 26660, 26661, 0, 0]
+    assert [
+        record["transition"]["address"]["port"]
+        for record in records
+        if record.get("syscall") == "getsockname"
+    ] == [40000, 40001]
+    assert [
+        record["transition"]["fd"]["fd"]
+        for record in records
+        if record.get("syscall") == "setsockopt"
+    ] == [7, 8]
+
+    clones = [record for record in records if record.get("syscall") == "clone"]
+    assert [record["transition"]["child_pid"] for record in clones] == [1100, 1101]
+    assert all(
+        {"CLONE_THREAD", "CLONE_FILES"} <= set(record["transition"]["flags"])
+        for record in clones
+    )
+    sends = [record for record in records if record.get("syscall") == "sendto"]
+    assert {(record["pid"], record["fds"][0]["fd"]) for record in sends} == {
+        (1100, 11),
+        (1101, 21),
+    }
+    assert {record["address"]["port"] for record in sends} == {
+        26650,
+        26660,
+        26661,
+        26662,
+        26663,
+    }
+    assert all(record["address"]["port"] != 26651 for record in sends)
+    assert {
+        record["address"]["port"]
+        for record in records
+        if record.get("syscall") == "recvfrom"
+    } == {40001}
 
 
 def test_exact_reviewed_invocation_and_platform_contract():
