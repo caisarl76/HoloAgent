@@ -585,6 +585,20 @@ and role inheritance through `fork`, `vfork`, or a `clone` missing either
 port zero or `26651`; those are now respectively a conditional TX bind and a
 receive-bind/membership endpoint.
 
+For each receive-FD class (`26650`, `26651`, fixed meta, and fixed data), prove
+that `sendto` and any connected generic write are denied even when their peer
+would be valid for the registered TX FD. Parameterize inbound `recvfrom` over
+the same four classes: a registered `E_j` passes and an unknown source fails,
+including explicit bind, membership, and source validation on `26651`. Exercise
+actual inbound and outbound DDS I/O from `fork`, `vfork`, and incomplete-clone
+descendants, then from their `CLONE_THREAD|CLONE_FILES` threads, and prove that
+no transitive lifecycle edge re-grants participant authority. Finally, pin
+`E_i` to its registered open-socket provenance: a conflicting repeated
+`getsockname` fails without replacement, a same-value repetition through the
+original FD or a proven `dup` alias preserves the registration without creating
+a second TX socket, and a later successful `getsockname` cannot erase an
+earlier unauthorized send from the violation journal.
+
 - [ ] **Step 2: Run and verify the amended policy contract is RED**
 
 Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_trace_policy.py scripts/holoagent0_setup/tests/test_trace_normalizer.py scripts/holoagent0_setup/tests/test_cyclone_policy.py`
