@@ -946,6 +946,91 @@ def test_runtime_contract_failed_unreviewed_operation_remains_violation(operatio
     assert outcome(rejected) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
 
 
+@pytest.mark.parametrize(
+    ("local", "fd"),
+    [
+        pytest.param(("127.0.0.1", 0), 17, id="tx-port-zero"),
+        pytest.param(("127.0.0.1", META_PORTS[0]), 7, id="fixed-receive"),
+    ],
+)
+def test_failed_allowed_bind_is_violation_and_socket_cannot_regain_authority(local, fd):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid = PARTICIPANT_PIDS[0]
+    assert policy.feed(records.socket(pid, fd)).status == "PASS"
+    failed_bind = records.bind(pid, fd, *local)
+    failed_bind["result"]["value"] = -1
+
+    rejected = policy.feed(failed_bind)
+    retry = policy.feed(records.bind(pid, fd, *local))
+
+    assert outcome(rejected) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert policy.journal.first_violation.record_index == rejected.violation_index
+    assert outcome(retry) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+    if local == ("127.0.0.1", 0):
+        setup = _feed_tx_options(policy, records, pid, TX_SETUP_OPTIONS)
+        observed = policy.feed(
+            records.getsockname(pid, fd, "127.0.0.1", EPHEMERAL_PORTS[0])
+        )
+        outbound = policy.feed(
+            records.io(pid, "sendto", fd, address=("239.255.0.1", 26650))
+        )
+        assert all(
+            outcome(decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+            for decision in setup
+        )
+        assert outcome(observed) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+        assert outcome(outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+def test_failed_allowed_connect_is_violation_and_poisons_registered_tx():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, fd, _ = registered_tx(policy, records, 0)
+    failed_connect = records.make(
+        pid,
+        "connect",
+        result=-1,
+        transition={
+            "operation": "connect",
+            "fd": {"fd": fd},
+            "address": {
+                "family": "AF_INET",
+                "ip": "127.0.0.1",
+                "port": META_PORTS[1],
+            },
+        },
+    )
+
+    rejected = policy.feed(failed_connect)
+    retry = policy.feed(
+        records.make(
+            pid,
+            "connect",
+            transition={
+                "operation": "connect",
+                "fd": {"fd": fd},
+                "address": {
+                    "family": "AF_INET",
+                    "ip": "127.0.0.1",
+                    "port": META_PORTS[1],
+                },
+            },
+        )
+    )
+    outbound = policy.feed(
+        records.io(pid, "sendto", fd, address=("239.255.0.1", 26650))
+    )
+
+    assert outcome(rejected) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert policy.journal.first_violation.record_index == rejected.violation_index
+    assert outcome(retry) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
 def test_runtime_contract_golden_replays_as_one_authorized_dds_window():
     source = (FIXTURES / "cyclonedds-0.10.5-runtime-representative.input").read_bytes()
     policy = make_policy()

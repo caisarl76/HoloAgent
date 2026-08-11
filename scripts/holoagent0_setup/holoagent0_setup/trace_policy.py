@@ -95,6 +95,7 @@ class _OpenDescription:
     peer: Endpoint | None = None
     local_conflict: bool = False
     peer_conflict: bool = False
+    endpoint_poisoned: bool = False
     message_peers: list[tuple[str, Endpoint]] = field(default_factory=list)
 
 
@@ -1189,6 +1190,16 @@ class TracePolicy:
             return self._missing_socket_reason(transition.get("fd"))
         if description.domain in _NEUTRAL_SOCKET_DOMAINS:
             return None
+        registration = self._tx_by_description.get(id(description))
+        if not _succeeded(record):
+            description.endpoint_poisoned = True
+            if registration is not None:
+                registration.poisoned = True
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        if description.endpoint_poisoned:
+            if registration is not None:
+                registration.poisoned = True
+            return "UNEXPECTED_NETWORK_ATTEMPT"
         if (
             description.domain != "AF_INET"
             or "SOCK_DGRAM" not in description.socket_type
@@ -1206,7 +1217,6 @@ class TracePolicy:
             or fd is None
         ):
             return "UNEXPECTED_NETWORK_ATTEMPT"
-        registration = self._tx_by_description.get(id(description))
         if operation == "getsockname":
             if registration is None:
                 if (
