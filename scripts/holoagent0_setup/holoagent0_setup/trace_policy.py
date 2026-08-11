@@ -1390,6 +1390,9 @@ class TracePolicy:
             and transition.get("option") in {"IP_ADD_MEMBERSHIP", "IP_DROP_MEMBERSHIP"}
             and _valid_multicast_membership(transition)
         ):
+            if not _succeeded(record):
+                description.endpoint_poisoned = True
+                return "UNEXPECTED_NETWORK_ATTEMPT"
             return None
         return "UNEXPECTED_NETWORK_ATTEMPT"
 
@@ -1505,6 +1508,7 @@ class TracePolicy:
             and description.protocol in {0, "IPPROTO_UDP"}
             and not description.local_conflict
             and not description.peer_conflict
+            and not description.endpoint_poisoned
             and self._network_context_valid(pid, record)
         )
 

@@ -539,6 +539,32 @@ def test_runtime_contract_26651_is_receive_join_only():
     )
 
 
+@pytest.mark.parametrize("local_port", [26650, 26651])
+@pytest.mark.parametrize("option", ["IP_ADD_MEMBERSHIP", "IP_DROP_MEMBERSHIP"])
+def test_failed_membership_is_violation_and_receive_socket_cannot_regain_authority(
+    option, local_port
+):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    _, _, remote_port = registered_tx(policy, records, 1)
+    pid, bind_decision = bound_udp(policy, records, 0, ("0.0.0.0", local_port))
+    failed_membership = records.membership(pid, 7, option=option)
+    failed_membership["result"]["value"] = -1
+
+    rejected = policy.feed(failed_membership)
+    retry = policy.feed(records.membership(pid, 7, option=option))
+    inbound = policy.feed(
+        records.io(pid, "recvfrom", 7, address=("127.0.0.1", remote_port))
+    )
+
+    assert outcome(bind_decision) == ("PASS", "OK")
+    assert outcome(rejected) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert policy.journal.first_violation.record_index == rejected.violation_index
+    assert outcome(retry) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(inbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
 def test_runtime_contract_unregistered_ephemeral_tx_cannot_send():
     policy = make_policy()
     records = Records()
