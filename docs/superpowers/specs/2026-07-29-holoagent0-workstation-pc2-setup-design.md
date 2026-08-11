@@ -476,10 +476,14 @@ must continue with exactly these non-I/O operations in order:
 
 No duplicate, omission, reordering, alias FD, unrelated socket option, endpoint
 change, or socket I/O may interpose between the port-zero bind and completion
-of that sequence. A failed reviewed option does not advance registration. The
-successful `getsockname` must establish one unique, nonzero dynamic endpoint
-`E_i` and permanently bind it to that socket's FD provenance for participant
-identity `i`. Only then may that FD and source `E_i` carry multicast SPDP and
+of that sequence. A failed syscall for one of the three reviewed options is
+neutral/`PASS` for network policy and does not advance registration; the next
+successful setup operation must still be the current expected stage, and a
+successful retry followed by the remaining exact sequence may register. A
+failed unreviewed option, endpoint, or socket-I/O operation remains a policy
+violation. The successful `getsockname` must establish one unique, nonzero
+dynamic endpoint `E_i` and permanently bind it to that socket's FD provenance
+for participant identity `i`. Only then may that FD and source `E_i` carry multicast SPDP and
 ordinary unicast endpoint-discovery and user-data traffic.
 The only outbound endpoint pairs are `E_i -> 239.255.0.1:26650` and
 `E_i -> 127.0.0.1:{26660..26667}`. A corresponding inbound operation must use
@@ -535,7 +539,12 @@ finalization additionally requires no live participant root/worker and no open
 participant socket provenance. Its input SHA-256 is
 `55bf3b4a3bd38abd2c097f61ac722d46f480923b9f9ba1325ba4befc04acba5a` and
 expected-NDJSON SHA-256 is
-`4277f1e56e0c18a0064cdfe9cb20853b0910310667844e42df7c7b44554a16c8`.
+`571fbf7932295a8476b5c03cf94b39c4a0be6ba05b464e7c93f0c6b08944c41d`.
+The expected NDJSON is the target contract and includes the decoded `value` on
+all six TX setup-option records. At this RED checkpoint the current normalizer
+omits those values, so source-to-expected exactness must fail until Task 6
+production implements value retention; manifest closure and digest checks still
+pass independently.
 At this RED contract checkpoint the repository's current config identity is
 set SHA-256
 `647ba0ee9b63e912ee7b0be0589a1729a16678901f2a3bbc380d73708f6e5ef7`,

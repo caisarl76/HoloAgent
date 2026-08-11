@@ -24,6 +24,8 @@ TX_SETUP_OPTIONS = (
     ("IP_MULTICAST_TTL", 1, 1),
     ("IP_MULTICAST_LOOP", 1, 1),
 )
+TX_STAGE_NAMES = ("if", "ttl", "loop")
+TX_INVALID_VALUES = ("0.0.0.0", 2, 0)
 FIXTURES = Path(__file__).parents[1] / "fixtures/strace"
 RECEIVE_FD_CASES = (
     ("spdp", 26650, ("239.255.0.1", 26650)),
@@ -176,7 +178,7 @@ class Records:
             transition={"operation": "close", "closed_fd": {"fd": fd}},
         )
 
-    def io(self, pid, syscall, fd, *, address=None, control=None):
+    def io(self, pid, syscall, fd, *, address=None, control=None, result=8):
         fields = {"fds": [{"fd": fd}], "lengths": {"count": 8}}
         if address is not None:
             fields["address"] = {
@@ -186,7 +188,7 @@ class Records:
             }
         if control is not None:
             fields["control"] = control
-        return self.make(pid, syscall, result=8, **fields)
+        return self.make(pid, syscall, result=result, **fields)
 
     def exit(self, pid, *, exit_code=0):
         event_index = self.index
@@ -576,82 +578,57 @@ def _start_tx_registration(policy, records, *, fd=17):
     return pid, socket_decision, bind_decision
 
 
+def _feed_tx_options(policy, records, pid, options, *, fd=17, result=0):
+    return [
+        policy.feed(
+            records.tx_socket_option(
+                pid,
+                fd,
+                option,
+                value,
+                length,
+                result=result,
+            )
+        )
+        for option, value, length in options
+    ]
+
+
 @pytest.mark.parametrize(
-    ("prefix", "rejected"),
+    ("stage", "field"),
     [
-        ((), ("IP_MULTICAST_TTL", 1, 1)),
-        ((TX_SETUP_OPTIONS[0],), TX_SETUP_OPTIONS[0]),
+        pytest.param(
+            stage,
+            field,
+            id=f"stage{stage}-{TX_STAGE_NAMES[stage]}-{field}",
+        )
+        for stage in range(3)
+        for field in (
+            "level",
+            "option",
+            "interface" if stage == 0 else "value",
+            "length",
+        )
     ],
-    ids=["wrong-order", "duplicate"],
 )
-def test_runtime_contract_rejects_reordered_or_duplicate_tx_setup_option(
-    prefix, rejected
-):
+def test_runtime_contract_rejects_malformed_tx_option_at_exact_stage(stage, field):
     policy = make_policy()
     records = Records()
     open_window(policy, records)
-    pid, socket_decision, bind_decision = _start_tx_registration(policy, records)
-    prefix_decisions = [
-        policy.feed(records.tx_socket_option(pid, 17, option, value, length))
-        for option, value, length in prefix
-    ]
-    rejected_decision = policy.feed(records.tx_socket_option(pid, 17, *rejected))
+    pid, socket_decision, _ = _start_tx_registration(policy, records)
+    prefix_decisions = _feed_tx_options(policy, records, pid, TX_SETUP_OPTIONS[:stage])
+    option, value, length = TX_SETUP_OPTIONS[stage]
+    level = "SOL_IP"
+    if field == "level":
+        level = "SOL_SOCKET"
+    elif field == "option":
+        option = "IP_TOS"
+    elif field in {"interface", "value"}:
+        value = TX_INVALID_VALUES[stage]
+    else:
+        length += 1
 
-    assert outcome(socket_decision) == ("PASS", "OK")
-    assert outcome(bind_decision) == ("PASS", "OK")
-    assert [outcome(decision) for decision in prefix_decisions] == [
-        ("PASS", "OK")
-    ] * len(prefix)
-    assert outcome(rejected_decision) == (
-        "FAIL",
-        "UNEXPECTED_NETWORK_ATTEMPT",
-    )
-
-
-def test_runtime_contract_rejects_getsockname_when_tx_setup_option_is_omitted():
-    policy = make_policy()
-    records = Records()
-    open_window(policy, records)
-    pid, socket_decision, bind_decision = _start_tx_registration(policy, records)
-    option_decisions = [
-        policy.feed(records.tx_socket_option(pid, 17, option, value, length))
-        for option, value, length in TX_SETUP_OPTIONS[:2]
-    ]
     rejected = policy.feed(
-        records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0])
-    )
-
-    assert outcome(socket_decision) == ("PASS", "OK")
-    assert outcome(bind_decision) == ("PASS", "OK")
-    assert [outcome(decision) for decision in option_decisions] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
-    assert outcome(rejected) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
-
-
-@pytest.mark.parametrize(
-    ("option", "value", "length", "level"),
-    [
-        ("IP_MULTICAST_IF", "127.0.0.1", 4, "SOL_SOCKET"),
-        ("IP_TOS", 0, 4, "SOL_IP"),
-        ("IP_MULTICAST_IF", "0.0.0.0", 4, "SOL_IP"),
-        ("IP_MULTICAST_IF", "127.0.0.1", 8, "SOL_IP"),
-        ("IP_MULTICAST_TTL", 2, 1, "SOL_IP"),
-        ("IP_MULTICAST_TTL", 1, 4, "SOL_IP"),
-        ("IP_MULTICAST_LOOP", 0, 1, "SOL_IP"),
-        ("IP_MULTICAST_LOOP", 1, 4, "SOL_IP"),
-    ],
-)
-def test_runtime_contract_rejects_wrong_tx_setup_option_field(
-    option, value, length, level
-):
-    policy = make_policy()
-    records = Records()
-    open_window(policy, records)
-    pid, _, _ = _start_tx_registration(policy, records)
-
-    decision = policy.feed(
         records.tx_socket_option(
             pid,
             17,
@@ -662,7 +639,53 @@ def test_runtime_contract_rejects_wrong_tx_setup_option_field(
         )
     )
 
-    assert outcome(decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert [outcome(decision) for decision in prefix_decisions] == [
+        ("PASS", "OK")
+    ] * stage
+    assert outcome(rejected) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+@pytest.mark.parametrize(
+    ("stage", "violation"),
+    [
+        pytest.param(
+            stage,
+            violation,
+            id=f"stage{stage}-{TX_STAGE_NAMES[stage]}-{violation}",
+        )
+        for stage in range(3)
+        for violation in ("omission", "duplicate", "reorder")
+    ],
+)
+def test_runtime_contract_rejects_sequence_violation_at_exact_stage(stage, violation):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, socket_decision, _ = _start_tx_registration(policy, records)
+    if violation == "duplicate":
+        prefix = TX_SETUP_OPTIONS[: stage + 1]
+        rejected_option = TX_SETUP_OPTIONS[stage]
+    elif violation == "reorder":
+        prefix = TX_SETUP_OPTIONS[:stage]
+        reordered_stage = (2, 0, 0)[stage]
+        rejected_option = TX_SETUP_OPTIONS[reordered_stage]
+    else:
+        prefix = TX_SETUP_OPTIONS[:stage]
+        rejected_option = TX_SETUP_OPTIONS[stage + 1] if stage < 2 else None
+    prefix_decisions = _feed_tx_options(policy, records, pid, prefix)
+    if rejected_option is None:
+        rejected = policy.feed(
+            records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0])
+        )
+    else:
+        rejected = policy.feed(records.tx_socket_option(pid, 17, *rejected_option))
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert [outcome(decision) for decision in prefix_decisions] == [
+        ("PASS", "OK")
+    ] * len(prefix)
+    assert outcome(rejected) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
 
 
 @pytest.mark.parametrize("use_alias", [False, True], ids=["other-fd", "dup-alias"])
@@ -772,32 +795,153 @@ def test_runtime_contract_pre_registration_io_poisons_tx_and_cannot_be_cured(
     assert policy.finalize(trace_integrity_ok=True) == first_violation
 
 
-def test_runtime_contract_failed_reviewed_option_does_not_advance_registration():
+@pytest.mark.parametrize(
+    "stage",
+    [
+        pytest.param(stage, id=f"stage{stage}-{TX_STAGE_NAMES[stage]}")
+        for stage in range(3)
+    ],
+)
+def test_runtime_contract_failed_reviewed_option_is_neutral_but_cannot_advance(
+    stage,
+):
     policy = make_policy()
     records = Records()
     open_window(policy, records)
-    pid, socket_decision, bind_decision = _start_tx_registration(policy, records)
+    pid, socket_decision, _ = _start_tx_registration(policy, records)
+    prefix_decisions = _feed_tx_options(policy, records, pid, TX_SETUP_OPTIONS[:stage])
     failed = policy.feed(
         records.tx_socket_option(
             pid,
             17,
-            *TX_SETUP_OPTIONS[0],
+            *TX_SETUP_OPTIONS[stage],
             result=-1,
         )
     )
-    successful = [
-        policy.feed(records.tx_socket_option(pid, 17, option, value, length))
-        for option, value, length in TX_SETUP_OPTIONS
-    ]
+    if stage < 2:
+        advanced = policy.feed(
+            records.tx_socket_option(pid, 17, *TX_SETUP_OPTIONS[stage + 1])
+        )
+    else:
+        advanced = policy.feed(
+            records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0])
+        )
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert [outcome(decision) for decision in prefix_decisions] == [
+        ("PASS", "OK")
+    ] * stage
+    assert outcome(failed) == ("PASS", "OK")
+    assert outcome(advanced) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        pytest.param(stage, id=f"stage{stage}-{TX_STAGE_NAMES[stage]}")
+        for stage in range(3)
+    ],
+)
+def test_runtime_contract_failed_reviewed_option_retry_can_register(stage):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, socket_decision, _ = _start_tx_registration(policy, records)
+    prefix_decisions = _feed_tx_options(policy, records, pid, TX_SETUP_OPTIONS[:stage])
+    failed = policy.feed(
+        records.tx_socket_option(
+            pid,
+            17,
+            *TX_SETUP_OPTIONS[stage],
+            result=-1,
+        )
+    )
+    retry_and_suffix = _feed_tx_options(policy, records, pid, TX_SETUP_OPTIONS[stage:])
     observed = policy.feed(
         records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0])
     )
 
     assert outcome(socket_decision) == ("PASS", "OK")
-    assert outcome(bind_decision) == ("PASS", "OK")
+    assert [outcome(decision) for decision in prefix_decisions] == [
+        ("PASS", "OK")
+    ] * stage
     assert outcome(failed) == ("PASS", "OK")
+    assert [outcome(decision) for decision in retry_and_suffix] == [("PASS", "OK")] * (
+        3 - stage
+    )
+    assert outcome(observed) == ("PASS", "OK")
+
+
+def test_runtime_contract_failed_future_reviewed_option_is_neutral_and_no_advance():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, socket_decision, _ = _start_tx_registration(policy, records)
+    failed_future = policy.feed(
+        records.tx_socket_option(
+            pid,
+            17,
+            *TX_SETUP_OPTIONS[1],
+            result=-1,
+        )
+    )
+    successful = _feed_tx_options(policy, records, pid, TX_SETUP_OPTIONS)
+    observed = policy.feed(
+        records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0])
+    )
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(failed_future) == ("PASS", "OK")
     assert [outcome(decision) for decision in successful] == [("PASS", "OK")] * 3
     assert outcome(observed) == ("PASS", "OK")
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["unreviewed-option", "endpoint", "socket-io"],
+)
+def test_runtime_contract_failed_unreviewed_operation_remains_violation(operation):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, socket_decision, _ = _start_tx_registration(policy, records)
+    if operation == "unreviewed-option":
+        record = records.tx_socket_option(
+            pid,
+            17,
+            "IP_TOS",
+            0,
+            4,
+            result=-1,
+        )
+    elif operation == "endpoint":
+        record = records.make(
+            pid,
+            "getpeername",
+            result=-1,
+            transition={
+                "operation": "getpeername",
+                "fd": {"fd": 17},
+                "address": {
+                    "family": "AF_INET",
+                    "ip": "127.0.0.1",
+                    "port": META_PORTS[1],
+                },
+            },
+        )
+    else:
+        record = records.io(
+            pid,
+            "sendto",
+            17,
+            address=("239.255.0.1", 26650),
+            result=-1,
+        )
+
+    rejected = policy.feed(record)
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(rejected) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
 
 
 def test_runtime_contract_golden_replays_as_one_authorized_dds_window():

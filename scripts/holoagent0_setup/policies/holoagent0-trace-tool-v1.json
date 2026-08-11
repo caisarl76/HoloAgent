@@ -83,7 +83,7 @@
       },
       "fixtures": {
         "manifest_path": "scripts/holoagent0_setup/fixtures/strace/manifest-v1.json",
-        "manifest_sha256": "7f193657add014e7befe71e81307d1ce39326ac05a12d2b563e791994d0d2f21",
+        "manifest_sha256": "2c3737088b0305eabb4afa21bfac1c573d3c0a551b72f168c8ae4bb867451a9d",
         "digest_algorithm": "sha256",
         "review_state": "REVIEWED"
       }

@@ -624,8 +624,20 @@ only permitted operations on the TX FD after its port-zero bind are successful
 `SOL_IP/IP_MULTICAST_LOOP=1` length `1`, in that order, followed by successful
 `getsockname`. They must use the original numeric FD and open-file-description;
 an alias is not accepted during registration. Reject a wrong, duplicated,
-omitted, failed, or reordered option, another option or endpoint operation, or
-any socket I/O before registration.
+omitted, or reordered successful option, another option or endpoint operation,
+or any socket I/O before registration. A failed syscall for one of the three
+reviewed options is neutral/`PASS` for network policy and does not advance
+registration: the next successful operation must remain the current expected
+stage, and a successful retry followed by the remaining exact sequence may
+register. A failed unreviewed option, endpoint, or socket-I/O operation remains
+a policy violation.
+
+Parameterize stages 0/1/2 separately. Before injecting a bad level, option,
+value/interface, or length, feed and verify the exact valid preceding prefix.
+Likewise cover omission, duplication, and reordering at every stage by feeding
+the valid prefix and then the operation that exposes that stage; test IDs name
+both stage and defect so a failure cannot be mistaken for an earlier ordering
+error.
 
 - [ ] **Step 2: Run and verify the amended policy contract is RED**
 
@@ -747,7 +759,11 @@ alternate transport/interface/address/port constants, inline or symlinked
 The runtime-representative golden is identity-bound to CycloneDDS `0.10.5`.
 Its 44-record input/expected SHA-256 values are
 `55bf3b4a3bd38abd2c097f61ac722d46f480923b9f9ba1325ba4befc04acba5a` and
-`4277f1e56e0c18a0064cdfe9cb20853b0910310667844e42df7c7b44554a16c8`.
+`571fbf7932295a8476b5c03cf94b39c4a0be6ba05b464e7c93f0c6b08944c41d`.
+The expected NDJSON is the target contract and retains the decoded `value` on
+all six TX setup-option records. Manifest closure/digests pass at this RED
+checkpoint, but exact source-to-expected normalization must fail until Task 6
+production implements that value retention.
 Reaping is coordinator-ledger evidence because the closed normalizer has no
 wait/reap transition; the golden must not invent one.
 At this RED checkpoint the checked-in p0/p1/p2/p3 config hashes are

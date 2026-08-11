@@ -142,7 +142,29 @@ def test_cyclonedds_0_10_5_runtime_representative_golden_is_exact_and_payload_fr
     source = (FIXTURES / f"{stem}.input").read_bytes()
     expected = (FIXTURES / f"{stem}.expected.ndjson").read_bytes()
     records = normalize_bytes(source)
+    target_records = [json.loads(line) for line in expected.splitlines()]
 
+    assert canonical_ndjson(target_records).encode() == expected
+    assert [
+        (
+            record["pid"],
+            record["transition"]["fd"]["fd"],
+            record["transition"]["level"],
+            record["transition"]["option"],
+            record["transition"]["value"],
+            record["transition"]["length"],
+        )
+        for record in target_records
+        if record.get("syscall") == "setsockopt"
+        and record["transition"]["option"].startswith("IP_MULTICAST_")
+    ] == [
+        (100, 11, "SOL_IP", "IP_MULTICAST_IF", "127.0.0.1", 4),
+        (100, 11, "SOL_IP", "IP_MULTICAST_TTL", 1, 1),
+        (100, 11, "SOL_IP", "IP_MULTICAST_LOOP", 1, 1),
+        (101, 21, "SOL_IP", "IP_MULTICAST_IF", "127.0.0.1", 4),
+        (101, 21, "SOL_IP", "IP_MULTICAST_TTL", 1, 1),
+        (101, 21, "SOL_IP", "IP_MULTICAST_LOOP", 1, 1),
+    ]
     assert canonical_ndjson(records).encode() == expected
     assert b"RTPS" not in source and b"SECRET" not in source
     assert [
@@ -167,16 +189,17 @@ def test_cyclonedds_0_10_5_runtime_representative_golden_is_exact_and_payload_fr
             record["transition"]["fd"]["fd"],
             record["transition"]["level"],
             record["transition"]["option"],
+            record["transition"]["value"],
             record["transition"]["length"],
         )
         for record in setup_options
     ] == [
-        (100, 11, "SOL_IP", "IP_MULTICAST_IF", 4),
-        (100, 11, "SOL_IP", "IP_MULTICAST_TTL", 1),
-        (100, 11, "SOL_IP", "IP_MULTICAST_LOOP", 1),
-        (101, 21, "SOL_IP", "IP_MULTICAST_IF", 4),
-        (101, 21, "SOL_IP", "IP_MULTICAST_TTL", 1),
-        (101, 21, "SOL_IP", "IP_MULTICAST_LOOP", 1),
+        (100, 11, "SOL_IP", "IP_MULTICAST_IF", "127.0.0.1", 4),
+        (100, 11, "SOL_IP", "IP_MULTICAST_TTL", 1, 1),
+        (100, 11, "SOL_IP", "IP_MULTICAST_LOOP", 1, 1),
+        (101, 21, "SOL_IP", "IP_MULTICAST_IF", "127.0.0.1", 4),
+        (101, 21, "SOL_IP", "IP_MULTICAST_TTL", 1, 1),
+        (101, 21, "SOL_IP", "IP_MULTICAST_LOOP", 1, 1),
     ]
     assert [
         record["transition"]["fd"]["fd"]
