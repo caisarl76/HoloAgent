@@ -1650,7 +1650,11 @@ def test_runtime_contract_same_getsockname_via_dup_preserves_tx_provenance():
     assert outcome(duplicate) == ("PASS", "OK")
     assert outcome(repeated_original) == ("PASS", "OK")
     assert outcome(repeated_alias) == ("PASS", "OK")
-    assert original_description == alias_description
+    assert {
+        key: value for key, value in original_description.items() if key != "cloexec"
+    } == {key: value for key, value in alias_description.items() if key != "cloexec"}
+    assert original_description["cloexec"] is True
+    assert alias_description["cloexec"] is False
     assert original_description["local"] == ("127.0.0.1", dynamic_port)
     assert original_description["local_conflict"] is False
     assert outcome(outbound) == ("PASS", "OK")

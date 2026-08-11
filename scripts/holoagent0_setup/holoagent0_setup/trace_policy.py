@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Literal, Mapping
 
 from .cyclone_policy import EXPECTED_CONFIG_SHA256
@@ -17,6 +18,12 @@ _NEUTRAL_SOCKET_DOMAINS = frozenset({"AF_UNIX", "AF_NETLINK"})
 _REVIEWED_INHERITED_FD_KINDS = frozenset({"character_device", "pipe", "regular_file"})
 _SPDP_ADDRESS = "239.255.0.1"
 _SPDP_PORT = 26650
+_DATA_MULTICAST_PORT = 26651
+_TX_SETUP_OPTIONS = (
+    ("SOL_IP", "IP_MULTICAST_IF", "127.0.0.1", 4),
+    ("SOL_IP", "IP_MULTICAST_TTL", 1, 1),
+    ("SOL_IP", "IP_MULTICAST_LOOP", 1, 1),
+)
 
 _OUTBOUND_SYSCALLS = frozenset(
     {"write", "writev", "pwrite64", "pwritev", "pwritev2", "vmsplice"}
@@ -44,15 +51,22 @@ class PolicyDecision:
 class PolicyViolation:
     reason: str
     record_index: int | None
+    pid: int | None
+    operation: str
 
 
 class ViolationJournal:
     """Append-only policy violations, retaining authoritative first failure."""
 
-    def __init__(self) -> None:
+    def __init__(self, sink: object) -> None:
+        persist = getattr(sink, "persist", None)
+        if not callable(persist):
+            raise ValueError("violation sink must provide persist()")
+        self._sink = sink
         self._violations: list[PolicyViolation] = []
 
     def persist(self, violation: PolicyViolation) -> None:
+        self._sink.persist(violation)
         self._violations.append(violation)
 
     @property
@@ -88,6 +102,16 @@ class _FdEntry:
     cloexec: bool = False
 
 
+@dataclass
+class _TxRegistration:
+    participant: int
+    description: _OpenDescription
+    original_fd: int
+    stage: int = 0
+    endpoint: Endpoint | None = None
+    poisoned: bool = False
+
+
 class FDProvenance:
     """Model Linux descriptor tables and shared open-file descriptions."""
 
@@ -96,6 +120,7 @@ class FDProvenance:
         initial_manifest: Mapping[int, object] | None = None,
     ) -> None:
         self._tables: dict[int, dict[int, _FdEntry]] = {}
+        self.integrity_error: str | None = None
         if initial_manifest is not None:
             self._seed_initial_manifest(initial_manifest)
 
@@ -165,7 +190,31 @@ class FDProvenance:
             return None
         return entry.description
 
+    def descriptions_for_pid(self, pid: int) -> tuple[_OpenDescription, ...]:
+        table = self._tables.get(pid, {})
+        return tuple(
+            {
+                id(entry.description): entry.description for entry in table.values()
+            }.values()
+        )
+
+    def description_is_open(self, description: _OpenDescription) -> bool:
+        return any(
+            entry.description is description
+            for table in self._tables.values()
+            for entry in table.values()
+        )
+
+    def _latch_integrity(self, reason: str) -> None:
+        if self.integrity_error is None:
+            self.integrity_error = reason
+
     def apply(self, record: CanonicalRecord) -> None:
+        if record.get("kind") == "exit":
+            pid = _exact_int(record.get("pid"))
+            if pid is not None:
+                self._tables.pop(pid, None)
+            return
         if record.get("kind") != "syscall":
             return
         pid = _exact_int(record.get("pid"))
@@ -303,7 +352,13 @@ class FDProvenance:
                 and endpoint[0] == "127.0.0.1"
                 and description.local[1] == endpoint[1]
             )
-            if wildcard_refinement:
+            port_zero_refinement = (
+                operation == "getsockname"
+                and description.local == ("127.0.0.1", 0)
+                and endpoint[0] == "127.0.0.1"
+                and endpoint[1] != 0
+            )
+            if wildcard_refinement or port_zero_refinement:
                 description.local = endpoint
             elif description.local is not None and description.local != endpoint:
                 description.local_conflict = True
@@ -328,6 +383,9 @@ class FDProvenance:
             return
         source_entry = self._entry(pid, source)
         if source_entry is None:
+            if operation in {"dup2", "dup3"}:
+                self._table(pid).pop(created, None)
+            self._latch_integrity("UNKNOWN_FD_PROVENANCE")
             return
         if operation == "dup2" and source == created:
             return
@@ -448,6 +506,18 @@ class _MarkerWindow:
     def active(self) -> bool:
         return self._state == "ACTIVE"
 
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def began(self) -> bool:
+        return self._state in {"ACTIVE", "AFTER"}
+
+    @property
+    def complete(self) -> bool:
+        return self._state == "AFTER"
+
     def authorizes(self, record: CanonicalRecord) -> bool:
         if not self.active:
             return False
@@ -521,22 +591,89 @@ class TracePolicy:
         marker_token: str,
         participants: Mapping[int, Mapping[str, object]],
         namespace_loopback_only: bool,
-        initial_fd_manifest: Mapping[int, object] | None = None,
+        initial_fd_manifest: Mapping[int, object],
+        violation_sink: object,
     ) -> None:
-        self._participants = copy.deepcopy(dict(participants))
+        if _exact_int(coordinator_pid) is None or coordinator_pid <= 0:
+            raise ValueError("coordinator PID must be a positive integer")
+        if not isinstance(initial_fd_manifest, Mapping) or set(initial_fd_manifest) != {
+            coordinator_pid
+        }:
+            raise ValueError("initial FD manifest must contain only the coordinator")
+        participant_copy = copy.deepcopy(dict(participants))
+        self._participants = MappingProxyType(
+            {
+                pid: MappingProxyType(dict(participant))
+                for pid, participant in participant_copy.items()
+                if isinstance(participant, Mapping)
+            }
+        )
+        self._coordinator_pid = coordinator_pid
         self._namespace_loopback_only = namespace_loopback_only is True
         self._configuration_valid = self._validate_configuration()
         self.provenance = FDProvenance(initial_fd_manifest)
         self.markers = _MarkerWindow(coordinator_pid, marker_token)
-        self.journal = ViolationJournal()
+        self.journal = ViolationJournal(violation_sink)
         self.trace_integrity_error: str | None = None
+        self._root_pid_by_index = {
+            participant["index"]: pid
+            for pid, participant in self._participants.items()
+            if self._configuration_valid
+        }
+        self._task_roles = {
+            pid: participant["index"]
+            for pid, participant in self._participants.items()
+            if self._configuration_valid
+        }
+        self._active_participants: set[int] = set()
+        self._exited_roots: set[int] = set()
+        self._live_workers: dict[int, int] = {}
+        self._socket_owners: dict[int, int] = {}
+        self._tracked_sockets: dict[int, _OpenDescription] = {}
+        self._explicitly_closed: set[int] = set()
+        self._receive_ports: dict[int, int] = {}
+        self._tx_by_participant: dict[int, _TxRegistration] = {}
+        self._tx_by_description: dict[int, _TxRegistration] = {}
+        self._registered_endpoints: dict[int, _TxRegistration] = {}
 
     def feed(self, record: CanonicalRecord) -> PolicyDecision:
+        marker = record.get("marker")
+        if marker is not None:
+            marker_reason = self.markers.consume(record)
+            if marker_reason is not None:
+                self._latch_integrity(marker_reason)
+            elif isinstance(marker, Mapping) and marker.get("phase") == "END":
+                if not self._lifecycle_closed():
+                    self._latch_integrity("INCOMPLETE_PARTICIPANT_LIFECYCLE")
+            return PolicyDecision("PASS", "OK", None)
+
+        pid = _exact_int(record.get("pid"))
+        if record.get("kind") == "exit":
+            if pid is not None:
+                self._handle_exit(pid)
+            self.provenance.apply(record)
+            self._sync_provenance_integrity()
+            return PolicyDecision("PASS", "OK", None)
+
+        pre_description = self._description_for_record(pid, record)
         self.provenance.apply(record)
-        reason = self._classify(record)
+        self._sync_provenance_integrity()
+        reason = self._classify(record, pre_description)
+        transition = record.get("transition")
+        if (
+            isinstance(transition, Mapping)
+            and transition.get("operation") == "close"
+            and pid is not None
+        ):
+            self._handle_close(pid, pre_description, record)
         if reason is None:
             return PolicyDecision("PASS", "OK", None)
-        violation = PolicyViolation(reason, _exact_int(record.get("record_index")))
+        violation = PolicyViolation(
+            reason=reason,
+            record_index=_exact_int(record.get("record_index")),
+            pid=pid,
+            operation=str(record.get("syscall", record.get("kind", "unknown"))),
+        )
         self.journal.persist(violation)
         return PolicyDecision("FAIL", reason, violation.record_index)
 
@@ -544,6 +681,10 @@ class TracePolicy:
         first = self.journal.first_violation
         if first is not None:
             return PolicyDecision("FAIL", first.reason, first.record_index)
+        if self.markers.active:
+            self._latch_integrity("MISSING_END_MARKER")
+        if self.markers.complete and not self._lifecycle_closed():
+            self._latch_integrity("INCOMPLETE_PARTICIPANT_LIFECYCLE")
         if trace_integrity_ok and self.trace_integrity_error is None:
             return PolicyDecision("PASS", "OK", None)
         return PolicyDecision("SKIPPED", "DEPENDENCY_NOT_AVAILABLE", None)
@@ -559,7 +700,12 @@ class TracePolicy:
         if len(self._participants) != 4:
             return False
         for pid, participant in self._participants.items():
-            if _exact_int(pid) is None or not isinstance(participant, Mapping):
+            if (
+                _exact_int(pid) is None
+                or pid <= 0
+                or not isinstance(participant, Mapping)
+                or set(participant) != {"index", "config_digest"}
+            ):
                 return False
             index = _exact_int(participant.get("index"))
             digest = participant.get("config_digest")
@@ -576,17 +722,124 @@ class TracePolicy:
         exact_pid = _exact_int(pid)
         if exact_pid is None:
             return None
-        participant = self._participants.get(exact_pid)
-        if not isinstance(participant, Mapping):
-            return None
-        return _exact_int(participant.get("index"))
+        return self._task_roles.get(exact_pid)
 
-    def _classify(self, record: CanonicalRecord) -> str | None:
-        marker_reason = self.markers.consume(record)
-        if marker_reason is not None:
-            if self.trace_integrity_error is None:
-                self.trace_integrity_error = marker_reason
+    def _latch_integrity(self, reason: str) -> None:
+        if self.trace_integrity_error is None:
+            self.trace_integrity_error = reason
+
+    def _sync_provenance_integrity(self) -> None:
+        if self.provenance.integrity_error is not None:
+            self._latch_integrity(self.provenance.integrity_error)
+
+    def _description_for_record(
+        self, pid: int | None, record: CanonicalRecord
+    ) -> _OpenDescription | None:
+        if pid is None:
             return None
+        transition = record.get("transition")
+        if isinstance(transition, Mapping):
+            for key in ("fd", "source_fd", "closed_fd"):
+                fd = _fd_number(transition.get(key))
+                if fd is not None:
+                    return self.provenance.socket_description(pid, fd)
+        fds = record.get("fds")
+        if isinstance(fds, list) and fds:
+            fd = _fd_number(fds[0])
+            if fd is not None:
+                return self.provenance.socket_description(pid, fd)
+        return None
+
+    def _activate_socket(self, participant: int, description: _OpenDescription) -> None:
+        identity = id(description)
+        self._active_participants.add(participant)
+        self._socket_owners[identity] = participant
+        self._tracked_sockets[identity] = description
+
+    def _apply_clone_authority(
+        self, pid: int, transition: Mapping[str, object], record: CanonicalRecord
+    ) -> None:
+        if not _succeeded(record):
+            return
+        child = _exact_int(transition.get("child_pid"))
+        if child is None or child <= 0:
+            return
+        self._task_roles.pop(child, None)
+        self._live_workers.pop(child, None)
+        flags = transition.get("flags")
+        parent_role = self._task_roles.get(pid)
+        if (
+            parent_role is None
+            or transition.get("fd_table") != "shared"
+            or not isinstance(flags, list)
+            or not {"CLONE_THREAD", "CLONE_FILES"}.issubset(flags)
+        ):
+            return
+        self._task_roles[child] = parent_role
+        self._live_workers[child] = parent_role
+        self._active_participants.add(parent_role)
+
+    def _handle_close(
+        self,
+        pid: int,
+        description: _OpenDescription | None,
+        record: CanonicalRecord,
+    ) -> None:
+        if description is None or not _succeeded(record):
+            return
+        identity = id(description)
+        participant = self._socket_owners.get(identity)
+        if participant is None:
+            return
+        if any(owner == participant for owner in self._live_workers.values()):
+            self._latch_integrity("SOCKET_CLOSED_BEFORE_WORKER_EXIT")
+        if pid != self._root_pid_by_index.get(participant):
+            self._latch_integrity("PARTICIPANT_SOCKET_NOT_ROOT_CLOSED")
+        if not self.provenance.description_is_open(description):
+            self._explicitly_closed.add(identity)
+            registration = self._tx_by_description.get(identity)
+            if registration is not None and registration.endpoint is not None:
+                self._registered_endpoints.pop(registration.endpoint[1], None)
+
+    def _handle_exit(self, pid: int) -> None:
+        participant = self._task_roles.pop(pid, None)
+        if participant is None:
+            return
+        if pid in self._live_workers:
+            self._live_workers.pop(pid, None)
+            return
+        if pid != self._root_pid_by_index.get(participant):
+            return
+        if any(owner == participant for owner in self._live_workers.values()):
+            self._latch_integrity("ROOT_EXIT_BEFORE_WORKER_EXIT")
+        for identity, owner in self._socket_owners.items():
+            if owner == participant and identity not in self._explicitly_closed:
+                self._latch_integrity("ROOT_EXIT_WITH_OPEN_SOCKET")
+                break
+        self._exited_roots.add(participant)
+
+    def _lifecycle_closed(self) -> bool:
+        for participant in self._active_participants:
+            if participant not in self._exited_roots:
+                return False
+            if any(owner == participant for owner in self._live_workers.values()):
+                return False
+            for identity, owner in self._socket_owners.items():
+                if owner != participant:
+                    continue
+                description = self._tracked_sockets[identity]
+                if (
+                    identity not in self._explicitly_closed
+                    or self.provenance.description_is_open(description)
+                ):
+                    return False
+        return True
+
+    def _classify(
+        self,
+        record: CanonicalRecord,
+        pre_description: _OpenDescription | None,
+    ) -> str | None:
         if record.get("kind") != "syscall":
             return None
 
@@ -611,21 +864,26 @@ class TracePolicy:
         pid = _exact_int(record.get("pid"))
         if pid is None:
             return None
+        if operation in {"fork", "vfork", "clone"} and isinstance(transition, Mapping):
+            self._apply_clone_authority(pid, transition, record)
+            return None
         if operation in {"socket", "socketpair"} and isinstance(transition, Mapping):
             return self._classify_socket_creation(pid, transition, record)
         if operation in {"bind", "connect", "getsockname", "getpeername"}:
             if isinstance(transition, Mapping):
                 return self._classify_endpoint_transition(
-                    pid, operation, transition, record
+                    pid, operation, transition, record, pre_description
                 )
         if operation in {"accept", "accept4", "listen"}:
             if isinstance(transition, Mapping):
                 return self._classify_server_operation(pid, transition)
         if operation in {"getsockopt", "setsockopt", "shutdown"}:
             if isinstance(transition, Mapping):
-                return self._classify_socket_control(pid, operation, transition, record)
+                return self._classify_socket_control(
+                    pid, operation, transition, record, pre_description
+                )
         if syscall in _MESSAGE_OUTBOUND | _MESSAGE_INBOUND:
-            return self._classify_message_io(pid, str(syscall), record)
+            return self._classify_message_io(pid, str(syscall), record, pre_description)
         if syscall in _OUTBOUND_SYSCALLS | _INBOUND_SYSCALLS | {
             "sendfile",
             "splice",
@@ -659,6 +917,18 @@ class TracePolicy:
         )
         if not is_udp or not self._network_context_valid(pid, record):
             return "UNEXPECTED_NETWORK_ATTEMPT"
+        if _succeeded(record):
+            created_fd = _fd_number(transition.get("created_fd"))
+            description = (
+                None
+                if created_fd is None
+                else self.provenance.socket_description(pid, created_fd)
+            )
+            participant = self._participant_index(pid)
+            if description is None or participant is None:
+                self._latch_integrity("MISSING_SOCKET_PROVENANCE")
+                return "UNEXPECTED_NETWORK_ATTEMPT"
+            self._activate_socket(participant, description)
         return None
 
     def _classify_endpoint_transition(
@@ -667,29 +937,124 @@ class TracePolicy:
         operation: str,
         transition: Mapping[str, object],
         record: CanonicalRecord,
+        pre_description: _OpenDescription | None,
     ) -> str | None:
         fd = _fd_number(transition.get("fd"))
-        description = (
-            None if fd is None else self.provenance.socket_description(pid, fd)
-        )
+        description = pre_description
         if description is None:
+            self._latch_integrity("UNKNOWN_FD_PROVENANCE")
             return self._missing_socket_reason(transition.get("fd"))
         if description.domain in _NEUTRAL_SOCKET_DOMAINS:
             return None
-        if not self._descriptor_context_valid(pid, description, record):
+        if (
+            description.domain != "AF_INET"
+            or "SOCK_DGRAM" not in description.socket_type
+            or description.protocol not in {0, "IPPROTO_UDP"}
+            or not self._network_context_valid(pid, record)
+        ):
             return "UNEXPECTED_NETWORK_ATTEMPT"
         endpoint = _endpoint(transition.get("address"))
         participant = self._participant_index(pid)
-        if participant is None or endpoint is None:
+        owner = self._socket_owners.get(id(description))
+        if (
+            participant is None
+            or participant != owner
+            or endpoint is None
+            or fd is None
+        ):
             return "UNEXPECTED_NETWORK_ATTEMPT"
-        if operation in {"bind", "getsockname"}:
-            if description.local_conflict or not _bind_allowed(participant, endpoint):
+        registration = self._tx_by_description.get(id(description))
+        if operation == "getsockname":
+            if registration is None:
+                if (
+                    _succeeded(record)
+                    and self._receive_ports.get(id(description)) is not None
+                    and not description.local_conflict
+                    and description.local == endpoint
+                ):
+                    return None
                 return "UNEXPECTED_NETWORK_ATTEMPT"
+            return self._classify_getsockname(
+                fd, description, registration, endpoint, record
+            )
+        if not self._descriptor_context_valid(pid, description, record):
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        if operation == "bind":
+            return self._classify_bind(participant, fd, description, endpoint, record)
+        if registration is None or registration.endpoint is None:
+            if registration is not None:
+                registration.poisoned = True
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        if registration.poisoned or fd != registration.original_fd:
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        if operation != "connect" or not self._tx_destination_allowed(endpoint):
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        if description.peer_conflict:
+            registration.poisoned = True
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        return None
+
+    def _classify_bind(
+        self,
+        participant: int,
+        fd: int,
+        description: _OpenDescription,
+        endpoint: Endpoint,
+        record: CanonicalRecord,
+    ) -> str | None:
+        if description.local_conflict:
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        if endpoint == ("127.0.0.1", 0):
+            existing = self._tx_by_participant.get(participant)
+            if existing is not None and existing.description is not description:
+                return "UNEXPECTED_NETWORK_ATTEMPT"
+            if _succeeded(record) and existing is None:
+                registration = _TxRegistration(participant, description, fd)
+                self._tx_by_participant[participant] = registration
+                self._tx_by_description[id(description)] = registration
             return None
-        if description.peer_conflict or description.local is None:
+        if not self._receive_bind_allowed(participant, endpoint):
             return "UNEXPECTED_NETWORK_ATTEMPT"
-        if not self._outbound_allowed(participant, description.local, endpoint):
+        if _succeeded(record):
+            self._receive_ports[id(description)] = endpoint[1]
+        return None
+
+    def _classify_getsockname(
+        self,
+        fd: int,
+        description: _OpenDescription,
+        registration: _TxRegistration,
+        endpoint: Endpoint,
+        record: CanonicalRecord,
+    ) -> str | None:
+        if not _succeeded(record):
+            registration.poisoned = True
             return "UNEXPECTED_NETWORK_ATTEMPT"
+        if registration.endpoint is not None:
+            if (
+                endpoint == registration.endpoint
+                and description.local == registration.endpoint
+                and not description.local_conflict
+            ):
+                return None
+            registration.poisoned = True
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        if (
+            registration.poisoned
+            or registration.stage != len(_TX_SETUP_OPTIONS)
+            or fd != registration.original_fd
+            or endpoint[0] != "127.0.0.1"
+            or endpoint[1] == 0
+            or description.local_conflict
+        ):
+            registration.poisoned = True
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        existing = self._registered_endpoints.get(endpoint[1])
+        if existing is not None and existing is not registration:
+            registration.poisoned = True
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        registration.endpoint = endpoint
+        self._registered_endpoints[endpoint[1]] = registration
         return None
 
     def _classify_server_operation(
@@ -714,73 +1079,92 @@ class TracePolicy:
         operation: str,
         transition: Mapping[str, object],
         record: CanonicalRecord,
+        pre_description: _OpenDescription | None,
     ) -> str | None:
         fd = _fd_number(transition.get("fd"))
-        description = (
-            None if fd is None else self.provenance.socket_description(pid, fd)
-        )
+        description = pre_description
         if description is None:
+            self._latch_integrity("UNKNOWN_FD_PROVENANCE")
             return self._missing_socket_reason(transition.get("fd"))
-        if (
-            operation == "setsockopt"
-            and transition.get("option") in {"IP_ADD_MEMBERSHIP", "IP_DROP_MEMBERSHIP"}
-            and (
-                description.domain != "AF_INET"
-                or not _valid_multicast_membership(transition)
-            )
-        ):
-            return "UNEXPECTED_NETWORK_ATTEMPT"
         if description.domain in _NEUTRAL_SOCKET_DOMAINS:
             return None
         if not self._descriptor_context_valid(pid, description, record):
             return "UNEXPECTED_NETWORK_ATTEMPT"
-        if operation == "shutdown":
-            participant = self._participant_index(pid)
-            if (
-                participant is None
-                or description.local is None
-                or description.peer is None
-                or not self._outbound_allowed(
-                    participant, description.local, description.peer
-                )
-            ):
+        participant = self._participant_index(pid)
+        if (
+            participant is None
+            or participant != self._socket_owners.get(id(description))
+            or fd is None
+        ):
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        registration = self._tx_by_description.get(id(description))
+        if registration is not None:
+            signature = (
+                transition.get("level"),
+                transition.get("option"),
+                transition.get("value"),
+                transition.get("length"),
+            )
+            exact_reviewed = signature in _TX_SETUP_OPTIONS
+            if operation != "setsockopt":
+                if registration.endpoint is None:
+                    registration.poisoned = True
                 return "UNEXPECTED_NETWORK_ATTEMPT"
-        return None
+            if not _succeeded(record):
+                if fd == registration.original_fd and exact_reviewed:
+                    return None
+                registration.poisoned = True
+                return "UNEXPECTED_NETWORK_ATTEMPT"
+            if (
+                registration.endpoint is not None
+                or registration.poisoned
+                or fd != registration.original_fd
+                or registration.stage >= len(_TX_SETUP_OPTIONS)
+                or signature != _TX_SETUP_OPTIONS[registration.stage]
+            ):
+                registration.poisoned = True
+                return "UNEXPECTED_NETWORK_ATTEMPT"
+            registration.stage += 1
+            return None
+
+        receive_port = self._receive_ports.get(id(description))
+        if (
+            operation == "setsockopt"
+            and receive_port in {_SPDP_PORT, _DATA_MULTICAST_PORT}
+            and transition.get("option") in {"IP_ADD_MEMBERSHIP", "IP_DROP_MEMBERSHIP"}
+            and _valid_multicast_membership(transition)
+        ):
+            return None
+        return "UNEXPECTED_NETWORK_ATTEMPT"
 
     def _classify_message_io(
-        self, pid: int, syscall: str, record: CanonicalRecord
+        self,
+        pid: int,
+        syscall: str,
+        record: CanonicalRecord,
+        pre_description: _OpenDescription | None,
     ) -> str | None:
         fds = record.get("fds")
         if not isinstance(fds, list) or not fds:
             return "UNEXPECTED_NETWORK_ATTEMPT"
         fd_value = fds[0]
         fd = _fd_number(fd_value)
-        description = (
-            None if fd is None else self.provenance.socket_description(pid, fd)
-        )
+        description = pre_description
         if description is None:
+            self._latch_integrity("UNKNOWN_FD_PROVENANCE")
             return self._missing_socket_reason(fd_value)
         if description.domain in _NEUTRAL_SOCKET_DOMAINS:
             return None
-        if not self._descriptor_context_valid(pid, description, record):
-            return "UNEXPECTED_NETWORK_ATTEMPT"
-        participant = self._participant_index(pid)
-        if participant is None or description.local is None:
-            return "UNEXPECTED_NETWORK_ATTEMPT"
         endpoints = _message_endpoints(record, description.peer)
         if endpoints is None or not endpoints:
+            registration = self._tx_by_description.get(id(description))
+            if registration is not None and registration.endpoint is None:
+                registration.poisoned = True
             return "UNEXPECTED_NETWORK_ATTEMPT"
-        if syscall in _MESSAGE_OUTBOUND:
-            allowed = all(
-                self._outbound_allowed(participant, description.local, endpoint)
-                for endpoint in endpoints
-            )
-        else:
-            allowed = all(
-                _inbound_allowed(participant, description.local, endpoint)
-                for endpoint in endpoints
-            )
-        return None if allowed else "UNEXPECTED_NETWORK_ATTEMPT"
+        direction = "outbound" if syscall in _MESSAGE_OUTBOUND else "inbound"
+        return self._classify_socket_io(
+            pid, fd, description, record, direction, endpoints
+        )
 
     def _classify_raw_io(
         self, pid: int, syscall: str, record: CanonicalRecord
@@ -796,30 +1180,60 @@ class TracePolicy:
             )
             if description is None:
                 if _fd_is_socket(fd_value):
-                    return "INHERITED_SOCKET_FD"
+                    self._latch_integrity("UNKNOWN_FD_PROVENANCE")
+                    return "UNEXPECTED_NETWORK_ATTEMPT"
+                self._latch_integrity("UNKNOWN_FD_PROVENANCE")
                 continue
             if description.domain in _NEUTRAL_SOCKET_DOMAINS:
                 continue
-            if not self._descriptor_context_valid(pid, description, record):
-                return "UNEXPECTED_NETWORK_ATTEMPT"
-            participant = self._participant_index(pid)
+            endpoints = () if description.peer is None else (description.peer,)
+            reason = self._classify_socket_io(
+                pid, fd, description, record, direction, endpoints
+            )
+            if reason is not None:
+                return reason
+        return None
+
+    def _classify_socket_io(
+        self,
+        pid: int,
+        fd: int | None,
+        description: _OpenDescription,
+        record: CanonicalRecord,
+        direction: str,
+        endpoints: tuple[Endpoint, ...],
+    ) -> str | None:
+        registration = self._tx_by_description.get(id(description))
+        if registration is not None and registration.endpoint is None:
+            registration.poisoned = True
+        if not self._descriptor_context_valid(pid, description, record):
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        participant = self._participant_index(pid)
+        if participant is None or participant != self._socket_owners.get(
+            id(description)
+        ):
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        if registration is not None:
             if (
-                participant is None
-                or description.local is None
-                or description.peer is None
+                direction != "outbound"
+                or registration.endpoint is None
+                or registration.poisoned
+                or fd != registration.original_fd
+                or not endpoints
+                or not all(
+                    self._tx_destination_allowed(endpoint) for endpoint in endpoints
+                )
             ):
                 return "UNEXPECTED_NETWORK_ATTEMPT"
-            if direction == "outbound":
-                allowed = self._outbound_allowed(
-                    participant, description.local, description.peer
-                )
-            else:
-                allowed = _inbound_allowed(
-                    participant, description.local, description.peer
-                )
-            if not allowed:
-                return "UNEXPECTED_NETWORK_ATTEMPT"
-        return None
+            return None
+        receive_port = self._receive_ports.get(id(description))
+        if direction != "inbound" or receive_port is None or not endpoints:
+            return "UNEXPECTED_NETWORK_ATTEMPT"
+        return (
+            None
+            if all(self._registered_source_allowed(endpoint) for endpoint in endpoints)
+            else "UNEXPECTED_NETWORK_ATTEMPT"
+        )
 
     def _descriptor_context_valid(
         self,
@@ -841,42 +1255,38 @@ class TracePolicy:
             self.markers.authorizes(record) and self._participant_index(pid) is not None
         )
 
-    def _outbound_allowed(
-        self, participant: int, local: Endpoint, remote: Endpoint
-    ) -> bool:
-        local_ip, local_port = local
-        if local_ip == "0.0.0.0":
-            if not self._namespace_loopback_only:
-                return False
-            local_ip = "127.0.0.1"
-        if local_ip != "127.0.0.1":
+    def _receive_bind_allowed(self, participant: int, endpoint: Endpoint) -> bool:
+        address, port = endpoint
+        if address == "0.0.0.0" and not self._namespace_loopback_only:
             return False
+        return address in _LOCAL_ADDRESSES and port in {
+            _SPDP_PORT,
+            _DATA_MULTICAST_PORT,
+            META_PORTS[participant],
+            DATA_PORTS[participant],
+        }
+
+    @staticmethod
+    def _tx_destination_allowed(remote: Endpoint) -> bool:
         if remote == (_SPDP_ADDRESS, _SPDP_PORT):
-            return local_port == META_PORTS[participant]
+            return True
+        return remote[0] == "127.0.0.1" and remote[1] in range(26660, 26668)
+
+    def _registered_source_allowed(self, remote: Endpoint) -> bool:
         if remote[0] != "127.0.0.1":
             return False
-        if local_port == META_PORTS[participant]:
-            return remote[1] in META_PORTS.values()
-        if local_port == DATA_PORTS[participant]:
-            return remote[1] in DATA_PORTS.values()
-        return False
+        registration = self._registered_endpoints.get(remote[1])
+        return (
+            registration is not None
+            and registration.endpoint == remote
+            and not registration.poisoned
+            and self.provenance.description_is_open(registration.description)
+        )
 
     @staticmethod
     def _missing_socket_reason(fd_value: object) -> str:
-        return (
-            "INHERITED_SOCKET_FD"
-            if _fd_is_socket(fd_value)
-            else "UNEXPECTED_NETWORK_ATTEMPT"
-        )
-
-
-def _bind_allowed(participant: int, endpoint: Endpoint) -> bool:
-    address, port = endpoint
-    return address in _LOCAL_ADDRESSES and port in {
-        _SPDP_PORT,
-        META_PORTS[participant],
-        DATA_PORTS[participant],
-    }
+        del fd_value
+        return "UNEXPECTED_NETWORK_ATTEMPT"
 
 
 def _valid_multicast_membership(transition: Mapping[str, object]) -> bool:
@@ -889,20 +1299,6 @@ def _valid_multicast_membership(transition: Mapping[str, object]) -> bool:
         and membership.get("group") == _SPDP_ADDRESS
         and membership.get("interface") == "127.0.0.1"
     )
-
-
-def _inbound_allowed(participant: int, local: Endpoint, remote: Endpoint) -> bool:
-    local_address, local_port = local
-    remote_address, remote_port = remote
-    if local_address not in _LOCAL_ADDRESSES or remote_address != "127.0.0.1":
-        return False
-    if local_port == _SPDP_PORT:
-        return remote_port in META_PORTS.values()
-    if local_port == META_PORTS[participant]:
-        return remote_port in META_PORTS.values()
-    if local_port == DATA_PORTS[participant]:
-        return remote_port in DATA_PORTS.values()
-    return False
 
 
 def _raw_directions(syscall: str, fd_count: int) -> tuple[str, ...]:

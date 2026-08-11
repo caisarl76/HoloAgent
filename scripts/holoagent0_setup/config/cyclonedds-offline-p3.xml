@@ -3,7 +3,7 @@
   <Domain Id="77">
     <General>
       <Interfaces>
-        <NetworkInterface name="lo" autodetermine="false" presence_required="true" multicast="true" allow_multicast="spdp"/>
+        <NetworkInterface name="lo" autodetermine="false" presence_required="true" multicast="true"/>
       </Interfaces>
       <Transport>udp</Transport>
       <AllowMulticast>spdp</AllowMulticast>
@@ -15,7 +15,7 @@
       <ParticipantIndex>3</ParticipantIndex>
       <SPDPMulticastAddress>239.255.0.1</SPDPMulticastAddress>
       <DefaultMulticastAddress>239.255.0.1</DefaultMulticastAddress>
-      <Peers AddLocalhost="false"/>
+      <Peers/>
       <Ports>
         <Base>7400</Base>
         <DomainGain>250</DomainGain>

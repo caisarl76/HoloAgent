@@ -766,17 +766,15 @@ checkpoint, but exact source-to-expected normalization must fail until Task 6
 production implements that value retention.
 Reaping is coordinator-ledger evidence because the closed normalizer has no
 wait/reap transition; the golden must not invent one.
-At this RED checkpoint the checked-in p0/p1/p2/p3 config hashes are
-`907977aeca2783f26816eafe3c822ba8930180b4855272fec75fac8370708f8b`,
-`48c53063ee9925b00768f9f022e2183290ba1fd0c26297c0a30f500af563228d`,
-`b2bdf5cc73d29ec28a61cf668517904b399a6c88fd8773678a7ce6836f3a3d19`,
-and `1fa8c8f12ebf3652e95fd2bbf24acaacc46ce95153a0bdfa0443f35223c145a9`;
+The reviewed Task 6 p0/p1/p2/p3 config hashes are
+`103da44a684613ead128dd221cace5455ae8890322f8ef50607ea4aa53283ed1`,
+`fed9c399b9cc2139440e359d89231d4c0dabe2ddaac99a256146f45faeb3c9fd`,
+`badd1e0472ab796697c7aca008f392f76c30af55e25c4502d04116c34dad19e2`,
+and `1fc59441a89e0ac1632b84786f54ec9bfb40470d4498dbed4b18962cdab6993c`;
 the set hash is
-`647ba0ee9b63e912ee7b0be0589a1729a16678901f2a3bbc380d73708f6e5ef7`.
-They identify current fixture inputs, not approval of unsupported XML. Task 6
-implementation must correct the tracked XML, review and repin resulting member/
-set digests, and update the closed trace-fixture-manifest digest explicitly. No
-run learns or amends any digest.
+`2f4b15dfe1ee168425ad0552c45d5434d068e6ff6bab43c45f82d7869dcb5879`.
+They pin the corrected 0.10.5 grammar described above. No run learns or amends
+any digest.
 
 - [ ] **Step 4: Run provenance, registration-order, lifecycle, marker, endpoint, and thread-authority tests**
 

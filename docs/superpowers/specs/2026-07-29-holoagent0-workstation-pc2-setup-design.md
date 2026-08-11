@@ -545,18 +545,16 @@ all six TX setup-option records. At this RED checkpoint the current normalizer
 omits those values, so source-to-expected exactness must fail until Task 6
 production implements value retention; manifest closure and digest checks still
 pass independently.
-At this RED contract checkpoint the repository's current config identity is
+The reviewed Task 6 repository config identity is
 set SHA-256
-`647ba0ee9b63e912ee7b0be0589a1729a16678901f2a3bbc380d73708f6e5ef7`,
+`2f4b15dfe1ee168425ad0552c45d5434d068e6ff6bab43c45f82d7869dcb5879`,
 with p0/p1/p2/p3 member SHA-256 values
-`907977aeca2783f26816eafe3c822ba8930180b4855272fec75fac8370708f8b`,
-`48c53063ee9925b00768f9f022e2183290ba1fd0c26297c0a30f500af563228d`,
-`b2bdf5cc73d29ec28a61cf668517904b399a6c88fd8773678a7ce6836f3a3d19`,
-and `1fa8c8f12ebf3652e95fd2bbf24acaacc46ce95153a0bdfa0443f35223c145a9`.
-Those values identify the checked-in fixture inputs; they do not bless XML
-outside the 0.10.5 grammar. Task 6 implementation must correct the tracked XML
-and explicitly review and repin the resulting member/set digests rather than
-learning them during a run.
+`103da44a684613ead128dd221cace5455ae8890322f8ef50607ea4aa53283ed1`,
+`fed9c399b9cc2139440e359d89231d4c0dabe2ddaac99a256146f45faeb3c9fd`,
+`badd1e0472ab796697c7aca008f392f76c30af55e25c4502d04116c34dad19e2`,
+and `1fc59441a89e0ac1632b84786f54ec9bfb40470d4498dbed4b18962cdab6993c`.
+Those values pin the corrected 0.10.5 grammar and are never learned during a
+run.
 
 The supervisor gives the coordinator a 64-hex run nonce in the initialized
 ledger. After the action child reports namespace/config validation and

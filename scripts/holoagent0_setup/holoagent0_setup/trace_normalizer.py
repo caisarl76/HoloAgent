@@ -675,6 +675,18 @@ def _ip_membership(value: str) -> dict[str, str]:
     }
 
 
+def _ip_multicast_setup_value(option: str, value: str) -> str | int:
+    if option == "IP_MULTICAST_IF":
+        return _ipv4_inet_addr(value, "ip-multicast-interface")
+    values = _vector(value, "ip-multicast-option-value")
+    if len(values) != 1:
+        raise _fail("ip-multicast-option-value")
+    parsed = _integer(values[0], "ip-multicast-option-value")
+    if not 0 <= parsed <= 255:
+        raise _fail("ip-multicast-option-value")
+    return parsed
+
+
 def _address(value: str) -> dict[str, object] | None:
     if value == "NULL":
         return None
@@ -1191,6 +1203,12 @@ def _transition_metadata(
                 "IP_DROP_MEMBERSHIP",
             }:
                 transition["membership"] = _ip_membership(arguments[3])
+            elif level == "SOL_IP" and option in {
+                "IP_MULTICAST_IF",
+                "IP_MULTICAST_TTL",
+                "IP_MULTICAST_LOOP",
+            }:
+                transition["value"] = _ip_multicast_setup_value(option, arguments[3])
         else:
             length = _output_length(arguments[4], "getsockopt-length")
         if length is not None and length < 0:

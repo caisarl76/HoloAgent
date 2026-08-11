@@ -21,12 +21,12 @@ CONFIG_ROLES = (
     "graph_inspector",
 )
 EXPECTED_CONFIG_SHA256 = {
-    0: "907977aeca2783f26816eafe3c822ba8930180b4855272fec75fac8370708f8b",
-    1: "48c53063ee9925b00768f9f022e2183290ba1fd0c26297c0a30f500af563228d",
-    2: "b2bdf5cc73d29ec28a61cf668517904b399a6c88fd8773678a7ce6836f3a3d19",
-    3: "1fa8c8f12ebf3652e95fd2bbf24acaacc46ce95153a0bdfa0443f35223c145a9",
+    0: "103da44a684613ead128dd221cace5455ae8890322f8ef50607ea4aa53283ed1",
+    1: "fed9c399b9cc2139440e359d89231d4c0dabe2ddaac99a256146f45faeb3c9fd",
+    2: "badd1e0472ab796697c7aca008f392f76c30af55e25c4502d04116c34dad19e2",
+    3: "1fc59441a89e0ac1632b84786f54ec9bfb40470d4498dbed4b18962cdab6993c",
 }
-CONFIG_SET_SHA256 = "647ba0ee9b63e912ee7b0be0589a1729a16678901f2a3bbc380d73708f6e5ef7"
+CONFIG_SET_SHA256 = "2f4b15dfe1ee168425ad0552c45d5434d068e6ff6bab43c45f82d7869dcb5879"
 
 _REPOSITORY_CONFIG_PREFIX = "scripts/holoagent0_setup/config"
 _EXPECTED_INTERFACE = {
@@ -34,7 +34,6 @@ _EXPECTED_INTERFACE = {
     "autodetermine": False,
     "presence_required": True,
     "multicast": True,
-    "allow_multicast": "spdp",
 }
 _EXPECTED_PORTS = {
     "base": 7400,
@@ -83,14 +82,13 @@ class CycloneConfigSet:
     multicast_ttl: int
     spdp_multicast_address: str
     default_multicast_address: str
-    add_localhost: bool
     peers: tuple[str, ...]
     many_sockets_mode: bool
     monitor_port: int
     redundant_networking: bool
     ports: dict[str, int]
     spdp_port: int
-    prohibited_data_multicast_port: int
+    data_multicast_receive_port: int
     unicast_ports: dict[int, tuple[int, int]]
 
 
@@ -102,14 +100,12 @@ class _ParsedConfig:
     interface_autodetermine: bool
     interface_presence_required: bool
     interface_multicast: bool
-    interface_allow_multicast: str
     transport: str
     allow_multicast: str
     multicast_loopback: bool
     multicast_ttl: int
     spdp_multicast_address: str
     default_multicast_address: str
-    add_localhost: bool
     peers: tuple[str, ...]
     many_sockets_mode: bool
     monitor_port: int
@@ -195,7 +191,6 @@ def load_pinned_cyclone_configs(
             "autodetermine": shared.interface_autodetermine,
             "presence_required": shared.interface_presence_required,
             "multicast": shared.interface_multicast,
-            "allow_multicast": shared.interface_allow_multicast,
         },
         transport=shared.transport,
         allow_multicast=shared.allow_multicast,
@@ -203,16 +198,13 @@ def load_pinned_cyclone_configs(
         multicast_ttl=shared.multicast_ttl,
         spdp_multicast_address=shared.spdp_multicast_address,
         default_multicast_address=shared.default_multicast_address,
-        add_localhost=shared.add_localhost,
         peers=shared.peers,
         many_sockets_mode=shared.many_sockets_mode,
         monitor_port=shared.monitor_port,
         redundant_networking=shared.redundant_networking,
         ports=ports,
         spdp_port=discovery_base + ports["multicast_meta_offset"],
-        prohibited_data_multicast_port=(
-            discovery_base + ports["multicast_data_offset"]
-        ),
+        data_multicast_receive_port=(discovery_base + ports["multicast_data_offset"]),
         unicast_ports={
             index: (
                 discovery_base
@@ -416,7 +408,6 @@ def _parse_config(payload: bytes, name: str) -> _ParsedConfig:
             "autodetermine": "false",
             "presence_required": "true",
             "multicast": "true",
-            "allow_multicast": "spdp",
         },
     )
     _require_children(network_interface, (), name)
@@ -438,7 +429,7 @@ def _parse_config(payload: bytes, name: str) -> _ParsedConfig:
         ),
         name,
     )
-    _require_element(peers, "Peers", {"AddLocalhost": "false"})
+    _require_element(peers, "Peers", {})
     peer_elements = _require_children(peers, (), name)
     _require_element(port_elements, "Ports", {})
     parsed_port_elements = _require_children(
@@ -473,14 +464,12 @@ def _parse_config(payload: bytes, name: str) -> _ParsedConfig:
             network_interface, "presence_required", name
         ),
         interface_multicast=_boolean_attribute(network_interface, "multicast", name),
-        interface_allow_multicast=network_interface.attrib["allow_multicast"],
         transport=_leaf_text(transport, name),
         allow_multicast=_leaf_text(allow_multicast, name),
         multicast_loopback=_boolean_text(multicast_loopback, name),
         multicast_ttl=_integer_text(multicast_ttl, name),
         spdp_multicast_address=_leaf_text(spdp_multicast_address, name),
         default_multicast_address=_leaf_text(default_multicast_address, name),
-        add_localhost=_boolean_attribute(peers, "AddLocalhost", name),
         peers=tuple(element.attrib.get("Address", "") for element in peer_elements),
         many_sockets_mode=_boolean_text(many_sockets_mode, name),
         monitor_port=_integer_text(monitor_port, name),
@@ -495,7 +484,6 @@ def _require_expected_semantics(parsed: _ParsedConfig, name: str) -> None:
         "autodetermine": parsed.interface_autodetermine,
         "presence_required": parsed.interface_presence_required,
         "multicast": parsed.interface_multicast,
-        "allow_multicast": parsed.interface_allow_multicast,
     }
     expected_values = (
         parsed.domain_id == 77,
@@ -506,7 +494,6 @@ def _require_expected_semantics(parsed: _ParsedConfig, name: str) -> None:
         parsed.multicast_ttl == 1,
         parsed.spdp_multicast_address == "239.255.0.1",
         parsed.default_multicast_address == "239.255.0.1",
-        parsed.add_localhost is False,
         parsed.peers == (),
         parsed.many_sockets_mode is False,
         parsed.monitor_port == -1,
