@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import inspect
 import itertools
 
 import pytest
@@ -15,6 +17,34 @@ PARTICIPANT_PIDS = {index: 100 + index for index in range(4)}
 CONFIG_DIGESTS = EXPECTED_CONFIG_SHA256
 META_PORTS = {0: 26660, 1: 26662, 2: 26664, 3: 26666}
 DATA_PORTS = {0: 26661, 1: 26663, 2: 26665, 3: 26667}
+
+
+def _launcher_manifest():
+    return {
+        COORDINATOR_PID: [
+            {
+                "fd": 0,
+                "kind": "character_device",
+                "inode": 101,
+                "cloexec": False,
+            },
+            {"fd": 4, "kind": "pipe", "inode": 102, "cloexec": True},
+        ]
+    }
+
+
+class RecordingViolationSink:
+    def __init__(self):
+        self.events = []
+
+    def persist(self, violation):
+        self.events.append(violation)
+
+
+class FailingViolationSink:
+    def persist(self, violation):
+        del violation
+        raise RuntimeError("violation sink unavailable")
 
 
 class Records:
@@ -84,6 +114,16 @@ class Records:
             fields["control"] = control
         return self.make(pid, syscall, result=8, **fields)
 
+    def exit(self, pid, *, exit_code=0):
+        event_index = self.index
+        self.index += 1
+        return {
+            "kind": "exit",
+            "pid": pid,
+            "record_index": event_index,
+            "exit_code": exit_code,
+        }
+
 
 def _trace_line(call, *, pid=100):
     prefix = f"{pid:<5} 1700000060.000001 "
@@ -92,24 +132,47 @@ def _trace_line(call, *, pid=100):
 
 
 def make_policy(
-    *, loopback_only=True, participant_digests=None, initial_fd_manifest=None
+    *,
+    loopback_only=True,
+    participant_digests=None,
+    initial_fd_manifest=None,
+    violation_sink=None,
 ):
     participant_digests = participant_digests or CONFIG_DIGESTS
-    manifest_argument = (
-        {}
-        if initial_fd_manifest is None
-        else {"initial_fd_manifest": initial_fd_manifest}
-    )
-    return TracePolicy(
-        coordinator_pid=COORDINATOR_PID,
-        marker_token=TOKEN,
-        participants={
+    constructor_arguments = {
+        "coordinator_pid": COORDINATOR_PID,
+        "marker_token": TOKEN,
+        "participants": {
             pid: {"index": index, "config_digest": participant_digests[index]}
             for index, pid in PARTICIPANT_PIDS.items()
         },
-        namespace_loopback_only=loopback_only,
-        **manifest_argument,
-    )
+        "namespace_loopback_only": loopback_only,
+        "initial_fd_manifest": copy.deepcopy(
+            _launcher_manifest() if initial_fd_manifest is None else initial_fd_manifest
+        ),
+    }
+    if "violation_sink" in inspect.signature(TracePolicy).parameters:
+        constructor_arguments["violation_sink"] = (
+            RecordingViolationSink() if violation_sink is None else violation_sink
+        )
+    return TracePolicy(**constructor_arguments)
+
+
+def _constructor_arguments(*, include_manifest=True, include_sink=True):
+    arguments = {
+        "coordinator_pid": COORDINATOR_PID,
+        "marker_token": TOKEN,
+        "participants": {
+            pid: {"index": index, "config_digest": CONFIG_DIGESTS[index]}
+            for index, pid in PARTICIPANT_PIDS.items()
+        },
+        "namespace_loopback_only": True,
+    }
+    if include_manifest:
+        arguments["initial_fd_manifest"] = _launcher_manifest()
+    if include_sink and "violation_sink" in inspect.signature(TracePolicy).parameters:
+        arguments["violation_sink"] = RecordingViolationSink()
+    return arguments
 
 
 def open_window(policy, records):
@@ -120,6 +183,30 @@ def bound_udp(policy, records, participant, local, *, fd=7):
     pid = PARTICIPANT_PIDS[participant]
     assert policy.feed(records.socket(pid, fd)).status == "PASS"
     return pid, policy.feed(records.bind(pid, fd, *local))
+
+
+def connected_udp(policy, records, participant=0, *, fd=7):
+    pid, decision = bound_udp(
+        policy, records, participant, ("127.0.0.1", META_PORTS[participant]), fd=fd
+    )
+    assert decision.status == "PASS"
+    decision = policy.feed(
+        records.make(
+            pid,
+            "connect",
+            transition={
+                "operation": "connect",
+                "fd": {"fd": fd},
+                "address": {
+                    "family": "AF_INET",
+                    "ip": "127.0.0.1",
+                    "port": META_PORTS[1],
+                },
+            },
+        )
+    )
+    assert decision.status == "PASS"
+    return pid
 
 
 @pytest.mark.parametrize("syscall", ["write", "writev", "sendfile", "splice"])
@@ -735,3 +822,232 @@ def test_meta_and_data_port_sets_are_closed_and_disjoint():
     )
     assert not set(META_PORTS.values()) & set(DATA_PORTS.values())
     assert len(tuple(itertools.product(PARTICIPANT_PIDS, PARTICIPANT_PIDS))) == 16
+
+
+def test_launcher_manifest_is_mandatory():
+    arguments = _constructor_arguments(include_manifest=False)
+    with pytest.raises((TypeError, ValueError), match="manifest"):
+        TracePolicy(**arguments)
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {999: _launcher_manifest()[COORDINATOR_PID]},
+        {
+            **_launcher_manifest(),
+            999: [{"fd": 8, "kind": "pipe", "inode": 108, "cloexec": True}],
+        },
+    ],
+)
+def test_launcher_manifest_is_bound_only_to_the_coordinator(manifest):
+    arguments = _constructor_arguments()
+    arguments["initial_fd_manifest"] = manifest
+    with pytest.raises(ValueError, match="coordinator"):
+        TracePolicy(**arguments)
+
+
+def test_open_marker_without_end_cannot_finalize_as_pass():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+
+    decision = policy.finalize(trace_integrity_ok=True)
+
+    assert (decision.status, decision.reason) == (
+        "SKIPPED",
+        "DEPENDENCY_NOT_AVAILABLE",
+    )
+    assert policy.trace_integrity_error is not None
+
+
+def test_matching_begin_and_end_can_finalize_as_pass():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    assert policy.feed(records.marker("END")).status == "PASS"
+
+    assert policy.finalize(trace_integrity_ok=True).status == "PASS"
+
+
+def test_unknown_raw_fd_fails_trace_integrity_without_inventing_network_evidence():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+
+    decision = policy.feed(records.io(PARTICIPANT_PIDS[0], "write", 77))
+
+    assert (decision.status, decision.reason) == ("PASS", "OK")
+    assert policy.trace_integrity_error is not None
+    assert policy.finalize(trace_integrity_ok=True).status == "SKIPPED"
+
+
+def test_annotated_unknown_socket_fails_both_integrity_and_network_policy():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    record = records.io(PARTICIPANT_PIDS[0], "write", 77)
+    record["fds"][0]["provenance"] = {"kind": "socket", "inode": 7077}
+
+    decision = policy.feed(record)
+
+    assert (decision.status, decision.reason) == (
+        "FAIL",
+        "UNEXPECTED_NETWORK_ATTEMPT",
+    )
+    assert policy.trace_integrity_error is not None
+
+
+@pytest.mark.parametrize(
+    ("operation", "flags"),
+    [("dup2", None), ("dup3", [])],
+)
+def test_dup_from_unknown_source_evicts_stale_target_and_fails_integrity(
+    operation, flags
+):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid = connected_udp(policy, records)
+    transition = {
+        "operation": operation,
+        "source_fd": {"fd": 99},
+        "target_fd": {"fd": 7},
+        "created_fd": {"fd": 7},
+    }
+    if flags is not None:
+        transition["flags"] = flags
+
+    policy.feed(records.make(pid, operation, result=7, transition=transition))
+
+    assert policy.provenance.describe(pid, 7) is None
+    assert policy.trace_integrity_error is not None
+
+
+def test_clone_thread_inherits_participant_role_and_socket_authority():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid = connected_udp(policy, records)
+    thread_pid = 200
+    assert (
+        policy.feed(
+            records.make(
+                pid,
+                "clone",
+                result=thread_pid,
+                transition={
+                    "operation": "clone",
+                    "child_pid": thread_pid,
+                    "fd_table": "shared",
+                    "flags": [
+                        "CLONE_VM",
+                        "CLONE_FILES",
+                        "CLONE_SIGHAND",
+                        "CLONE_THREAD",
+                    ],
+                },
+            )
+        ).status
+        == "PASS"
+    )
+
+    assert policy.feed(records.io(thread_pid, "write", 7)).status == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("syscall", "transition"),
+    [
+        (
+            "fork",
+            {"operation": "fork", "child_pid": 200, "fd_table": "copied"},
+        ),
+        (
+            "clone",
+            {
+                "operation": "clone",
+                "child_pid": 200,
+                "fd_table": "shared",
+                "flags": ["CLONE_VM", "CLONE_FILES", "SIGCHLD"],
+            },
+        ),
+    ],
+)
+def test_nonthread_descendants_do_not_inherit_participant_role(syscall, transition):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid = connected_udp(policy, records)
+    assert policy.feed(records.make(pid, syscall, result=200, transition=transition))
+
+    decision = policy.feed(records.io(200, "write", 7))
+
+    assert (decision.status, decision.reason) == (
+        "FAIL",
+        "UNEXPECTED_NETWORK_ATTEMPT",
+    )
+
+
+def test_canonical_exit_removes_pid_descriptor_authority():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid = connected_udp(policy, records)
+
+    assert policy.feed(records.exit(pid)).status == "PASS"
+
+    assert policy.provenance.describe(pid, 7) is None
+
+
+def test_pid_reuse_after_exit_is_not_authorized_without_registration():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid = connected_udp(policy, records)
+    assert policy.feed(records.exit(pid)).status == "PASS"
+
+    decision = policy.feed(records.socket(pid, 11))
+
+    assert (decision.status, decision.reason) == (
+        "FAIL",
+        "UNEXPECTED_NETWORK_ATTEMPT",
+    )
+
+
+def test_violation_sink_is_mandatory():
+    arguments = _constructor_arguments(include_sink=False)
+    with pytest.raises((TypeError, ValueError), match="violation.*sink|sink"):
+        TracePolicy(**arguments)
+
+
+def test_violation_sink_receives_complete_event_before_feed_returns():
+    sink = RecordingViolationSink()
+    policy = make_policy(violation_sink=sink)
+    records = Records()
+    open_window(policy, records)
+    pid, decision = bound_udp(policy, records, 0, ("127.0.0.1", META_PORTS[0]))
+    assert decision.status == "PASS"
+    record = records.io(pid, "sendto", 7, address=("203.0.113.10", 443))
+
+    decision = policy.feed(record)
+
+    assert decision.reason == "UNEXPECTED_NETWORK_ATTEMPT"
+    (event,) = sink.events
+    assert (event.record_index, event.pid, event.operation, event.reason) == (
+        record["record_index"],
+        pid,
+        "sendto",
+        "UNEXPECTED_NETWORK_ATTEMPT",
+    )
+
+
+def test_violation_sink_failure_cannot_return_a_policy_decision():
+    policy = make_policy(violation_sink=FailingViolationSink())
+    records = Records()
+    open_window(policy, records)
+    pid, decision = bound_udp(policy, records, 0, ("127.0.0.1", META_PORTS[0]))
+    assert decision.status == "PASS"
+    record = records.io(pid, "sendto", 7, address=("203.0.113.10", 443))
+
+    with pytest.raises(Exception, match="violation sink unavailable"):
+        policy.feed(record)
