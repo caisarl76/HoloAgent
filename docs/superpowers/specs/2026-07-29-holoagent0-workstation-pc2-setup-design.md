@@ -466,24 +466,40 @@ destination port `26651`.
 
 Cyclone also creates exactly one transmit socket for the selected `lo`
 interface by binding `127.0.0.1:0`. A successful bind does not yet authorize
-traffic: the subsequent successful `getsockname` must establish one unique,
-nonzero dynamic endpoint `E_i` and permanently bind it to that socket's FD
-provenance for participant identity `i`. That same FD and source `E_i` carry
-multicast SPDP and ordinary unicast endpoint-discovery and user-data traffic.
+traffic. On that same numeric FD and open-file-description, successful setup
+must continue with exactly these non-I/O operations in order:
+
+1. `setsockopt(SOL_IP, IP_MULTICAST_IF, 127.0.0.1, 4)`;
+2. `setsockopt(SOL_IP, IP_MULTICAST_TTL, 1, 1)`;
+3. `setsockopt(SOL_IP, IP_MULTICAST_LOOP, 1, 1)`; and
+4. `getsockname -> 127.0.0.1:E_i` as the first successful endpoint observation.
+
+No duplicate, omission, reordering, alias FD, unrelated socket option, endpoint
+change, or socket I/O may interpose between the port-zero bind and completion
+of that sequence. A failed reviewed option does not advance registration. The
+successful `getsockname` must establish one unique, nonzero dynamic endpoint
+`E_i` and permanently bind it to that socket's FD provenance for participant
+identity `i`. Only then may that FD and source `E_i` carry multicast SPDP and
+ordinary unicast endpoint-discovery and user-data traffic.
 The only outbound endpoint pairs are `E_i -> 239.255.0.1:26650` and
 `E_i -> 127.0.0.1:{26660..26667}`. A corresponding inbound operation must use
 one of the authorized receive FDs and a loopback source `E_j` previously
 registered by another or the same approved participant. A second transmit
-socket for an identity, an absent/conflicting/post-hoc `getsockname`, a zero or
-duplicate `E_i`, an unknown inbound `E_j`, a fixed receive FD used to send,
-destination `26651`, IPv6, a non-loopback endpoint, or another multicast group
-fails closed.
+socket for an identity, an absent/conflicting/post-hoc `getsockname`, an invalid
+pre-registration option sequence, a zero or duplicate `E_i`, an unknown inbound
+`E_j`, a fixed receive FD used to send, destination `26651`, IPv6, a non-
+loopback endpoint, or another multicast group fails closed. "Post-hoc" means
+that outbound, receive, connect, or generic socket I/O was attempted before
+registration completed; the three reviewed setup options above are not post-
+hoc operations.
 
 This socket shape follows CycloneDDS 0.10.5's creation of a port-zero transmit
 connection for each selected interface and its reuse of that connection for
 both multicast and unicast address sets and writes; receive setup separately
 adds both multicast receive sockets and the transmit connection to the receive
 waitset. See
+[`ddsi_udp.c` transmit socket options](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/ddsi_udp.c#L408-L425),
+[`ddsi_udp.c` bind/option/port-observation order](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/ddsi_udp.c#L529-L575),
 [`q_init.c` transmit creation](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_init.c#L1715-L1741),
 [`q_addrset.c` connection selection](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_addrset.c#L313-L355),
 [`q_xmsg.c` connection write](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_xmsg.c#L1178-L1201),
@@ -504,16 +520,22 @@ already authorized TID creating another thread with both flags. `fork`,
 descendant retain FD provenance as Linux requires but inherit no participant
 role or DDS network authority.
 
-The committed
+The committed 44-record
 `cyclonedds-0.10.5-runtime-representative.{input,expected.ndjson}` golden is a
 sanitized, payload-free, deterministic reconstruction of the syscall structure
 observed in the live pinned 0.10.5 run; it is not byte-for-byte raw strace. It
 covers both multicast receive binds and memberships, fixed receive binds,
-port-zero bind plus `getsockname`, registered `E_i`/`E_j`, SPDP and unicast
-destinations, and worker TIDs. Its input SHA-256 is
-`ad5516e742888d64541029cb9512ef4f01ee127000abf1e6e983357f9eaeebe0` and
+both port-zero TX binds followed by the exact three-option sequences and
+`getsockname`, registered `E_i`/`E_j`, SPDP and unicast destinations, worker
+TIDs, worker exits, root-owned socket closes, root exits, and END after that
+cleanup. The closed normalizer has canonical exit records but no closed
+wait/reap transition, so reaping remains separately proven by the coordinator
+ledger; the golden does not fabricate a wait record. Successful policy
+finalization additionally requires no live participant root/worker and no open
+participant socket provenance. Its input SHA-256 is
+`55bf3b4a3bd38abd2c097f61ac722d46f480923b9f9ba1325ba4befc04acba5a` and
 expected-NDJSON SHA-256 is
-`735efcd4f299e99f491891a41895ce205bf4ba4b894867705175dd124512f251`.
+`4277f1e56e0c18a0064cdfe9cb20853b0910310667844e42df7c7b44554a16c8`.
 At this RED contract checkpoint the repository's current config identity is
 set SHA-256
 `647ba0ee9b63e912ee7b0be0589a1729a16678901f2a3bbc380d73708f6e5ef7`,

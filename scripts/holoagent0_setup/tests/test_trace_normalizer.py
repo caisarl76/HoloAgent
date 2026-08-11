@@ -155,11 +155,81 @@ def test_cyclonedds_0_10_5_runtime_representative_golden_is_exact_and_payload_fr
         for record in records
         if record.get("syscall") == "getsockname"
     ] == [40000, 40001]
+    setup_options = [
+        record
+        for record in records
+        if record.get("syscall") == "setsockopt"
+        and record["transition"]["option"].startswith("IP_MULTICAST_")
+    ]
+    assert [
+        (
+            record["pid"],
+            record["transition"]["fd"]["fd"],
+            record["transition"]["level"],
+            record["transition"]["option"],
+            record["transition"]["length"],
+        )
+        for record in setup_options
+    ] == [
+        (100, 11, "SOL_IP", "IP_MULTICAST_IF", 4),
+        (100, 11, "SOL_IP", "IP_MULTICAST_TTL", 1),
+        (100, 11, "SOL_IP", "IP_MULTICAST_LOOP", 1),
+        (101, 21, "SOL_IP", "IP_MULTICAST_IF", 4),
+        (101, 21, "SOL_IP", "IP_MULTICAST_TTL", 1),
+        (101, 21, "SOL_IP", "IP_MULTICAST_LOOP", 1),
+    ]
     assert [
         record["transition"]["fd"]["fd"]
         for record in records
         if record.get("syscall") == "setsockopt"
+        and record["transition"]["option"] == "IP_ADD_MEMBERSHIP"
     ] == [7, 8]
+
+    for pid, fd in ((100, 11), (101, 21)):
+        registration = [
+            record
+            for record in records
+            if record.get("pid") == pid
+            and (
+                record.get("syscall") in {"bind", "getsockname"}
+                or (
+                    record.get("syscall") == "setsockopt"
+                    and record["transition"]["option"].startswith("IP_MULTICAST_")
+                )
+            )
+            and record["transition"]["fd"]["fd"] == fd
+        ]
+        assert [record["syscall"] for record in registration] == [
+            "bind",
+            "setsockopt",
+            "setsockopt",
+            "setsockopt",
+            "getsockname",
+        ]
+        assert [record["transition"].get("option") for record in registration[1:4]] == [
+            "IP_MULTICAST_IF",
+            "IP_MULTICAST_TTL",
+            "IP_MULTICAST_LOOP",
+        ]
+        registered_at = registration[-1]["record_index"]
+        assert all(
+            record["record_index"] > registered_at
+            for record in records
+            if record.get("fds")
+            and record["fds"][0]["fd"] == fd
+            and record.get("syscall")
+            in {
+                "connect",
+                "read",
+                "readv",
+                "recvfrom",
+                "recvmsg",
+                "sendto",
+                "sendmsg",
+                "write",
+                "writev",
+            }
+        )
 
     clones = [record for record in records if record.get("syscall") == "clone"]
     assert [record["transition"]["child_pid"] for record in clones] == [1100, 1101]
@@ -185,6 +255,56 @@ def test_cyclonedds_0_10_5_runtime_representative_golden_is_exact_and_payload_fr
         for record in records
         if record.get("syscall") == "recvfrom"
     } == {40001}
+    end_index = next(
+        record["record_index"]
+        for record in records
+        if record.get("marker", {}).get("phase") == "END"
+    )
+    exits = [record for record in records if record.get("kind") == "exit"]
+    assert [(record["pid"], record["exit_code"]) for record in exits] == [
+        (1100, 0),
+        (1101, 0),
+        (100, 0),
+        (101, 0),
+    ]
+    closes = [record for record in records if record.get("syscall") == "close"]
+    assert [
+        (record["pid"], record["transition"]["closed_fd"]["fd"]) for record in closes
+    ] == [(100, 7), (100, 8), (100, 9), (100, 10), (100, 11), (101, 21)]
+    assert max(record["record_index"] for record in exits + closes) < end_index
+    assert not any(
+        record.get("syscall") in {"wait4", "waitid", "waitpid"} for record in records
+    )
+
+
+@pytest.mark.parametrize(
+    ("option", "argument", "length", "expected_value"),
+    [
+        ("IP_MULTICAST_IF", 'inet_addr("127.0.0.1")', 4, "127.0.0.1"),
+        ("IP_MULTICAST_TTL", "[1]", 1, 1),
+        ("IP_MULTICAST_LOOP", "[1]", 1, 1),
+    ],
+)
+def test_cyclonedds_tx_setup_option_values_are_canonical_and_payload_free(
+    option, argument, length, expected_value
+):
+    source = (
+        "100   1700000070.000001 "
+        f"setsockopt(11<UDP:[127.0.0.1:0]>, SOL_IP, {option}, "
+        f"{argument}, {length}) = 0 <0.000001>\n"
+    ).encode()
+
+    (record,) = normalize_bytes(source)
+
+    assert record["transition"] == {
+        "operation": "setsockopt",
+        "fd": {"fd": 11, "provenance": {"kind": "socket", "protocol": "UDP"}},
+        "level": "SOL_IP",
+        "option": option,
+        "value": expected_value,
+        "length": length,
+    }
+    assert argument not in canonical_ndjson([record])
 
 
 def test_exact_reviewed_invocation_and_platform_contract():

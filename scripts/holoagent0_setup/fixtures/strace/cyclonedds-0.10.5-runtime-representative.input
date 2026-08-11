@@ -11,18 +11,34 @@
 100   1700000070.000011 bind(10<UDP:[10010]>, {sa_family=AF_INET, sin_port=htons(26661), sin_addr=inet_addr("0.0.0.0")}, 16) = 0 <0.000001>
 100   1700000070.000012 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_UDP) = 11<UDP:[10011]> <0.000001>
 100   1700000070.000013 bind(11<UDP:[10011]>, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("127.0.0.1")}, 16) = 0 <0.000001>
-100   1700000070.000014 getsockname(11<UDP:[127.0.0.1:40000]>, {sa_family=AF_INET, sin_port=htons(40000), sin_addr=inet_addr("127.0.0.1")}, [16]) = 0 <0.000001>
-100   1700000070.000015 clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD) = 1100 <0.000001>
-101   1700000070.000016 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_UDP) = 21<UDP:[10121]> <0.000001>
-101   1700000070.000017 bind(21<UDP:[10121]>, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("127.0.0.1")}, 16) = 0 <0.000001>
-101   1700000070.000018 getsockname(21<UDP:[127.0.0.1:40001]>, {sa_family=AF_INET, sin_port=htons(40001), sin_addr=inet_addr("127.0.0.1")}, [16]) = 0 <0.000001>
-101   1700000070.000019 clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD) = 1101 <0.000001>
-1100  1700000070.000020 sendto(11<UDP:[127.0.0.1:40000]>, "", 64, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(26650), sin_addr=inet_addr("239.255.0.1")}, 16) = 64 <0.000001>
-1100  1700000070.000021 sendto(11<UDP:[127.0.0.1:40000]>, "", 72, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(26662), sin_addr=inet_addr("127.0.0.1")}, 16) = 72 <0.000001>
-1100  1700000070.000022 sendto(11<UDP:[127.0.0.1:40000]>, "", 80, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(26663), sin_addr=inet_addr("127.0.0.1")}, 16) = 80 <0.000001>
-1101  1700000070.000023 sendto(21<UDP:[127.0.0.1:40001]>, "", 72, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(26660), sin_addr=inet_addr("127.0.0.1")}, 16) = 72 <0.000001>
-1101  1700000070.000024 sendto(21<UDP:[127.0.0.1:40001]>, "", 80, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(26661), sin_addr=inet_addr("127.0.0.1")}, 16) = 80 <0.000001>
-1100  1700000070.000025 recvfrom(7<UDP:[0.0.0.0:26650]>, "", 65536, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(40001), sin_addr=inet_addr("127.0.0.1")}, [16]) = 64 <0.000001>
-1100  1700000070.000026 recvfrom(9<UDP:[0.0.0.0:26660]>, "", 65536, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(40001), sin_addr=inet_addr("127.0.0.1")}, [16]) = 72 <0.000001>
-1100  1700000070.000027 recvfrom(10<UDP:[0.0.0.0:26661]>, "", 65536, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(40001), sin_addr=inet_addr("127.0.0.1")}, [16]) = 80 <0.000001>
-90    1700000070.000028 prctl(PR_SET_NAME, "H0E0123456789ab"...) = 0 <0.000001>
+100   1700000070.000014 setsockopt(11<UDP:[127.0.0.1:0]>, SOL_IP, IP_MULTICAST_IF, inet_addr("127.0.0.1"), 4) = 0 <0.000001>
+100   1700000070.000015 setsockopt(11<UDP:[127.0.0.1:0]>, SOL_IP, IP_MULTICAST_TTL, [1], 1) = 0 <0.000001>
+100   1700000070.000016 setsockopt(11<UDP:[127.0.0.1:0]>, SOL_IP, IP_MULTICAST_LOOP, [1], 1) = 0 <0.000001>
+100   1700000070.000017 getsockname(11<UDP:[127.0.0.1:40000]>, {sa_family=AF_INET, sin_port=htons(40000), sin_addr=inet_addr("127.0.0.1")}, [16]) = 0 <0.000001>
+100   1700000070.000018 clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD) = 1100 <0.000001>
+101   1700000070.000019 socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_UDP) = 21<UDP:[10121]> <0.000001>
+101   1700000070.000020 bind(21<UDP:[10121]>, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("127.0.0.1")}, 16) = 0 <0.000001>
+101   1700000070.000021 setsockopt(21<UDP:[127.0.0.1:0]>, SOL_IP, IP_MULTICAST_IF, inet_addr("127.0.0.1"), 4) = 0 <0.000001>
+101   1700000070.000022 setsockopt(21<UDP:[127.0.0.1:0]>, SOL_IP, IP_MULTICAST_TTL, [1], 1) = 0 <0.000001>
+101   1700000070.000023 setsockopt(21<UDP:[127.0.0.1:0]>, SOL_IP, IP_MULTICAST_LOOP, [1], 1) = 0 <0.000001>
+101   1700000070.000024 getsockname(21<UDP:[127.0.0.1:40001]>, {sa_family=AF_INET, sin_port=htons(40001), sin_addr=inet_addr("127.0.0.1")}, [16]) = 0 <0.000001>
+101   1700000070.000025 clone(child_stack=NULL, flags=CLONE_VM|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD) = 1101 <0.000001>
+1100  1700000070.000026 sendto(11<UDP:[127.0.0.1:40000]>, "", 64, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(26650), sin_addr=inet_addr("239.255.0.1")}, 16) = 64 <0.000001>
+1100  1700000070.000027 sendto(11<UDP:[127.0.0.1:40000]>, "", 72, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(26662), sin_addr=inet_addr("127.0.0.1")}, 16) = 72 <0.000001>
+1100  1700000070.000028 sendto(11<UDP:[127.0.0.1:40000]>, "", 80, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(26663), sin_addr=inet_addr("127.0.0.1")}, 16) = 80 <0.000001>
+1101  1700000070.000029 sendto(21<UDP:[127.0.0.1:40001]>, "", 72, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(26660), sin_addr=inet_addr("127.0.0.1")}, 16) = 72 <0.000001>
+1101  1700000070.000030 sendto(21<UDP:[127.0.0.1:40001]>, "", 80, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(26661), sin_addr=inet_addr("127.0.0.1")}, 16) = 80 <0.000001>
+1100  1700000070.000031 recvfrom(7<UDP:[0.0.0.0:26650]>, "", 65536, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(40001), sin_addr=inet_addr("127.0.0.1")}, [16]) = 64 <0.000001>
+1100  1700000070.000032 recvfrom(9<UDP:[0.0.0.0:26660]>, "", 65536, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(40001), sin_addr=inet_addr("127.0.0.1")}, [16]) = 72 <0.000001>
+1100  1700000070.000033 recvfrom(10<UDP:[0.0.0.0:26661]>, "", 65536, MSG_DONTWAIT, {sa_family=AF_INET, sin_port=htons(40001), sin_addr=inet_addr("127.0.0.1")}, [16]) = 80 <0.000001>
+1100  1700000070.000034 +++ exited with 0 +++
+1101  1700000070.000035 +++ exited with 0 +++
+100   1700000070.000036 close(7<UDP:[0.0.0.0:26650]>) = 0 <0.000001>
+100   1700000070.000037 close(8<UDP:[0.0.0.0:26651]>) = 0 <0.000001>
+100   1700000070.000038 close(9<UDP:[0.0.0.0:26660]>) = 0 <0.000001>
+100   1700000070.000039 close(10<UDP:[0.0.0.0:26661]>) = 0 <0.000001>
+100   1700000070.000040 close(11<UDP:[127.0.0.1:40000]>) = 0 <0.000001>
+101   1700000070.000041 close(21<UDP:[127.0.0.1:40001]>) = 0 <0.000001>
+100   1700000070.000042 +++ exited with 0 +++
+101   1700000070.000043 +++ exited with 0 +++
+90    1700000070.000044 prctl(PR_SET_NAME, "H0E0123456789ab"...) = 0 <0.000001>

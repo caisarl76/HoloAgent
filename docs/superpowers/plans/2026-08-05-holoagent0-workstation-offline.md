@@ -493,6 +493,14 @@ def register_tx(policy, records, participant, fd, dynamic_port):
         policy, records, participant, fd=fd, local=("127.0.0.1", 0)
     )
     assert decision.status == "PASS"
+    for level, option, value, length in (
+        ("SOL_IP", "IP_MULTICAST_IF", "127.0.0.1", 4),
+        ("SOL_IP", "IP_MULTICAST_TTL", 1, 1),
+        ("SOL_IP", "IP_MULTICAST_LOOP", 1, 1),
+    ):
+        assert policy.feed(
+            tx_socket_option(pid, fd, level, option, value, length)
+        ).status == "PASS"
     decision = policy.feed(
         getsockname(pid, fd, local=("127.0.0.1", dynamic_port))
     )
@@ -573,9 +581,13 @@ is a sanitized, payload-free, deterministic reconstruction of the syscall
 structure observed in the live pinned CycloneDDS 0.10.5 run, not byte-for-byte
 raw strace. The normalizer test must reproduce the expected NDJSON exactly and
 assert both multicast binds/memberships, the fixed receive pair, port-zero bind
-plus nonzero `getsockname`, worker TIDs, SPDP destination, unicast
-destinations, and registered inbound source. The policy replay must accept the
-entire marker-bounded golden once Task 6 production implements this amendment.
+plus the exact three post-bind option records and nonzero `getsockname`, worker
+TIDs, SPDP destination, unicast destinations, registered inbound source, worker
+and root exits, root-owned socket closes, and END only after that cleanup. The
+closed normalizer has no wait/reap transition, so reaping is coordinator/ledger
+evidence outside this representative trace; do not fabricate a wait record.
+The policy replay must accept the entire marker-bounded golden only when no
+participant task or tracked participant socket remains live at finalization.
 
 Also cover rejection of a second TX socket for one identity, a duplicate/zero
 or unknown `E_i`, an unknown inbound `E_j`, IPv6, non-loopback endpoints,
@@ -602,9 +614,18 @@ A same-value repeated
 registration without creating a second TX socket. A conflicting repetition
 fails without replacing `E_i`, poisons that TX provenance and the run, and
 leaves later outbound or receive I/O denied. A post-hoc `getsockname` is one
-observed after any attempted outbound or receive I/O on the port-zero-bound FD
+observed after any attempted outbound, receive, connect, or generic socket I/O
+on the port-zero-bound FD
 before registration completed; reject it for authority purposes, keep later I/O
-denied, and retain the first violation in the journal.
+denied, and retain the first violation in the journal. Before registration, the
+only permitted operations on the TX FD after its port-zero bind are successful
+`SOL_IP/IP_MULTICAST_IF=127.0.0.1` length `4`,
+`SOL_IP/IP_MULTICAST_TTL=1` length `1`, and
+`SOL_IP/IP_MULTICAST_LOOP=1` length `1`, in that order, followed by successful
+`getsockname`. They must use the original numeric FD and open-file-description;
+an alias is not accepted during registration. Reject a wrong, duplicated,
+omitted, failed, or reordered option, another option or endpoint operation, or
+any socket I/O before registration.
 
 - [ ] **Step 2: Run and verify the amended policy contract is RED**
 
@@ -661,7 +682,7 @@ allowance is:
 |---|---|---|---|
 | Bind multicast receive sockets | wildcard/loopback `:26650` and `:26651` | none | Both binds are required; join `239.255.0.1` on both FDs through loopback |
 | Bind fixed unicast receive sockets | wildcard/loopback at that participant's pair | none | p0 `26660/26661`; p1 `26662/26663`; p2 `26664/26665`; p3 `26666/26667` |
-| Register transmit socket | exactly one FD bound `127.0.0.1:0` | the next operation on that FD is a successful `getsockname -> 127.0.0.1:E_i`, before any I/O | `E_i` must be unique and nonzero and remains bound to that FD provenance |
+| Register transmit socket | exactly one FD bound `127.0.0.1:0` | exact successful `IP_MULTICAST_IF=127.0.0.1`/length 4, `IP_MULTICAST_TTL=1`/length 1, `IP_MULTICAST_LOOP=1`/length 1, then the first successful endpoint observation is `getsockname -> 127.0.0.1:E_i` | All steps use the same numeric FD/open-file-description before any socket I/O; `E_i` is unique and nonzero |
 | Outbound DDS | registered TX FD/source `E_i` | `239.255.0.1:26650` or loopback `26660..26667` | The same TX FD carries SPDP and ordinary unicast SEDP/user data |
 | Inbound DDS | an approved multicast/fixed receive FD | loopback source at a previously registered `E_j` | Unknown source ports never inherit permission from destination validity |
 | Worker-TID DDS operation | FD from the participant's shared table | same endpoint rules | TID role requires lifecycle proof containing both `CLONE_THREAD` and `CLONE_FILES` |
@@ -669,8 +690,9 @@ allowance is:
 The `26651` socket is receive/join-only: reject sends from that FD and every
 destination `:26651`. Fixed receive sockets likewise do not become TX FDs.
 Reject a second port-zero TX socket for an identity and zero, duplicate, or
-unknown `E_i`. The port-zero bind plus its correct immediate successful
-`getsockname` is the only registration path. After registration, an exact
+unknown `E_i`. The port-zero bind plus its exact three successful post-bind
+options and successful `getsockname` is the only registration path. No other
+operation may interpose on that FD. After registration, an exact
 same-value `getsockname` on the FD or a proven `dup` alias is permitted and
 preserves the original provenance. A conflicting repetition is a TX-provenance
 integrity/policy failure: never overwrite `E_i`, poison that FD/run, and reject
@@ -696,6 +718,8 @@ This behavior is specific to the approved pinned configuration. CycloneDDS
 that connection for multicast and unicast address sets/writes, creates separate
 receive sockets on both multicast ports, joins SPDP on both, and adds the TX
 connection to its receive waitset. The source anchors are
+[`ddsi_udp.c` transmit socket options](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/ddsi_udp.c#L408-L425),
+[`ddsi_udp.c` bind/option/port-observation order](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/ddsi_udp.c#L529-L575),
 [`q_init.c` transmit creation](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_init.c#L1715-L1741),
 [`q_addrset.c` connection selection](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_addrset.c#L313-L355),
 [`q_xmsg.c` connection write](https://github.com/eclipse-cyclonedds/cyclonedds/blob/0.10.5/src/core/ddsi/src/q_xmsg.c#L1178-L1201),
@@ -721,9 +745,11 @@ alternate transport/interface/address/port constants, inline or symlinked
 `CYCLONEDDS_URI`, and any digest mismatch before a ROS import.
 
 The runtime-representative golden is identity-bound to CycloneDDS `0.10.5`.
-Its input/expected SHA-256 values are
-`ad5516e742888d64541029cb9512ef4f01ee127000abf1e6e983357f9eaeebe0` and
-`735efcd4f299e99f491891a41895ce205bf4ba4b894867705175dd124512f251`.
+Its 44-record input/expected SHA-256 values are
+`55bf3b4a3bd38abd2c097f61ac722d46f480923b9f9ba1325ba4befc04acba5a` and
+`4277f1e56e0c18a0064cdfe9cb20853b0910310667844e42df7c7b44554a16c8`.
+Reaping is coordinator-ledger evidence because the closed normalizer has no
+wait/reap transition; the golden must not invent one.
 At this RED checkpoint the checked-in p0/p1/p2/p3 config hashes are
 `907977aeca2783f26816eafe3c822ba8930180b4855272fec75fac8370708f8b`,
 `48c53063ee9925b00768f9f022e2183290ba1fd0c26297c0a30f500af563228d`,
@@ -736,7 +762,7 @@ implementation must correct the tracked XML, review and repin resulting member/
 set digests, and update the closed trace-fixture-manifest digest explicitly. No
 run learns or amends any digest.
 
-- [ ] **Step 4: Run provenance, marker, endpoint, and thread-authority tests**
+- [ ] **Step 4: Run provenance, registration-order, lifecycle, marker, endpoint, and thread-authority tests**
 
 Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_trace_policy.py scripts/holoagent0_setup/tests/test_trace_normalizer.py scripts/holoagent0_setup/tests/test_cyclone_policy.py`
 

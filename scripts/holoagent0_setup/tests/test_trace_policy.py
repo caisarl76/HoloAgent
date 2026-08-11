@@ -19,6 +19,11 @@ CONFIG_DIGESTS = EXPECTED_CONFIG_SHA256
 META_PORTS = {0: 26660, 1: 26662, 2: 26664, 3: 26666}
 DATA_PORTS = {0: 26661, 1: 26663, 2: 26665, 3: 26667}
 EPHEMERAL_PORTS = {0: 40000, 1: 40001, 2: 40002, 3: 40003}
+TX_SETUP_OPTIONS = (
+    ("IP_MULTICAST_IF", "127.0.0.1", 4),
+    ("IP_MULTICAST_TTL", 1, 1),
+    ("IP_MULTICAST_LOOP", 1, 1),
+)
 FIXTURES = Path(__file__).parents[1] / "fixtures/strace"
 RECEIVE_FD_CASES = (
     ("spdp", 26650, ("239.255.0.1", 26650)),
@@ -139,6 +144,38 @@ class Records:
             },
         )
 
+    def tx_socket_option(
+        self,
+        pid,
+        fd,
+        option,
+        value,
+        length,
+        *,
+        level="SOL_IP",
+        result=0,
+    ):
+        return self.make(
+            pid,
+            "setsockopt",
+            result=result,
+            transition={
+                "operation": "setsockopt",
+                "fd": {"fd": fd},
+                "level": level,
+                "option": option,
+                "value": value,
+                "length": length,
+            },
+        )
+
+    def close(self, pid, fd):
+        return self.make(
+            pid,
+            "close",
+            transition={"operation": "close", "closed_fd": {"fd": fd}},
+        )
+
     def io(self, pid, syscall, fd, *, address=None, control=None):
         fields = {"fds": [{"fd": fd}], "lengths": {"count": 8}}
         if address is not None:
@@ -220,6 +257,10 @@ def outcome(decision):
     return decision.status, decision.reason
 
 
+def passing_registration():
+    return [("PASS", "OK")] * 6
+
+
 def bound_udp(policy, records, participant, local, *, fd=7):
     pid = PARTICIPANT_PIDS[participant]
     assert policy.feed(records.socket(pid, fd)).status == "PASS"
@@ -236,6 +277,9 @@ def registered_tx(policy, records, participant, *, fd=17, port=None):
         fd=fd,
     )
     assert decision.status == "PASS"
+    for option, value, length in TX_SETUP_OPTIONS:
+        decision = policy.feed(records.tx_socket_option(pid, fd, option, value, length))
+        assert decision.status == "PASS"
     decision = policy.feed(records.getsockname(pid, fd, "127.0.0.1", dynamic_port))
     assert decision.status == "PASS"
     return pid, fd, dynamic_port
@@ -247,6 +291,10 @@ def observe_tx_registration(policy, records, participant, *, fd=17, port=None):
     decisions = (
         policy.feed(records.socket(pid, fd)),
         policy.feed(records.bind(pid, fd, "127.0.0.1", 0)),
+        *(
+            policy.feed(records.tx_socket_option(pid, fd, option, value, length))
+            for option, value, length in TX_SETUP_OPTIONS
+        ),
         policy.feed(records.getsockname(pid, fd, "127.0.0.1", dynamic_port)),
     )
     return pid, fd, dynamic_port, decisions
@@ -421,6 +469,11 @@ def test_runtime_contract_dynamic_tx_endpoints_are_globally_unique():
 
     pid, decision = bound_udp(policy, records, 1, ("127.0.0.1", 0), fd=18)
     assert decision.status == "PASS"
+    for option, value, length in TX_SETUP_OPTIONS:
+        assert (
+            policy.feed(records.tx_socket_option(pid, 18, option, value, length)).status
+            == "PASS"
+        )
     duplicate = policy.feed(
         records.getsockname(pid, 18, "127.0.0.1", EPHEMERAL_PORTS[0])
     )
@@ -500,6 +553,253 @@ def test_runtime_contract_unregistered_ephemeral_tx_cannot_send():
     )
 
 
+def test_runtime_contract_exact_tx_setup_sequence_registers_dynamic_endpoint():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+
+    pid, fd, dynamic_port, decisions = observe_tx_registration(
+        policy, records, 0, fd=17
+    )
+
+    assert [outcome(decision) for decision in decisions] == passing_registration()
+    assert policy.provenance.describe(pid, fd)["local"] == (
+        "127.0.0.1",
+        dynamic_port,
+    )
+
+
+def _start_tx_registration(policy, records, *, fd=17):
+    pid = PARTICIPANT_PIDS[0]
+    socket_decision = policy.feed(records.socket(pid, fd))
+    bind_decision = policy.feed(records.bind(pid, fd, "127.0.0.1", 0))
+    return pid, socket_decision, bind_decision
+
+
+@pytest.mark.parametrize(
+    ("prefix", "rejected"),
+    [
+        ((), ("IP_MULTICAST_TTL", 1, 1)),
+        ((TX_SETUP_OPTIONS[0],), TX_SETUP_OPTIONS[0]),
+    ],
+    ids=["wrong-order", "duplicate"],
+)
+def test_runtime_contract_rejects_reordered_or_duplicate_tx_setup_option(
+    prefix, rejected
+):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, socket_decision, bind_decision = _start_tx_registration(policy, records)
+    prefix_decisions = [
+        policy.feed(records.tx_socket_option(pid, 17, option, value, length))
+        for option, value, length in prefix
+    ]
+    rejected_decision = policy.feed(records.tx_socket_option(pid, 17, *rejected))
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(bind_decision) == ("PASS", "OK")
+    assert [outcome(decision) for decision in prefix_decisions] == [
+        ("PASS", "OK")
+    ] * len(prefix)
+    assert outcome(rejected_decision) == (
+        "FAIL",
+        "UNEXPECTED_NETWORK_ATTEMPT",
+    )
+
+
+def test_runtime_contract_rejects_getsockname_when_tx_setup_option_is_omitted():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, socket_decision, bind_decision = _start_tx_registration(policy, records)
+    option_decisions = [
+        policy.feed(records.tx_socket_option(pid, 17, option, value, length))
+        for option, value, length in TX_SETUP_OPTIONS[:2]
+    ]
+    rejected = policy.feed(
+        records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0])
+    )
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(bind_decision) == ("PASS", "OK")
+    assert [outcome(decision) for decision in option_decisions] == [
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+    ]
+    assert outcome(rejected) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "length", "level"),
+    [
+        ("IP_MULTICAST_IF", "127.0.0.1", 4, "SOL_SOCKET"),
+        ("IP_TOS", 0, 4, "SOL_IP"),
+        ("IP_MULTICAST_IF", "0.0.0.0", 4, "SOL_IP"),
+        ("IP_MULTICAST_IF", "127.0.0.1", 8, "SOL_IP"),
+        ("IP_MULTICAST_TTL", 2, 1, "SOL_IP"),
+        ("IP_MULTICAST_TTL", 1, 4, "SOL_IP"),
+        ("IP_MULTICAST_LOOP", 0, 1, "SOL_IP"),
+        ("IP_MULTICAST_LOOP", 1, 4, "SOL_IP"),
+    ],
+)
+def test_runtime_contract_rejects_wrong_tx_setup_option_field(
+    option, value, length, level
+):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, _, _ = _start_tx_registration(policy, records)
+
+    decision = policy.feed(
+        records.tx_socket_option(
+            pid,
+            17,
+            option,
+            value,
+            length,
+            level=level,
+        )
+    )
+
+    assert outcome(decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+@pytest.mark.parametrize("use_alias", [False, True], ids=["other-fd", "dup-alias"])
+def test_runtime_contract_tx_setup_requires_original_numeric_fd(use_alias):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, _, _ = _start_tx_registration(policy, records)
+    other_fd = 18
+    if use_alias:
+        assert (
+            policy.feed(
+                records.make(
+                    pid,
+                    "dup",
+                    result=other_fd,
+                    transition={
+                        "operation": "dup",
+                        "source_fd": {"fd": 17},
+                        "created_fd": {"fd": other_fd},
+                    },
+                )
+            ).status
+            == "PASS"
+        )
+    else:
+        assert policy.feed(records.socket(pid, other_fd)).status == "PASS"
+
+    decision = policy.feed(
+        records.tx_socket_option(pid, other_fd, *TX_SETUP_OPTIONS[0])
+    )
+
+    assert outcome(decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+@pytest.mark.parametrize("operation", ["getsockopt", "getpeername"])
+def test_runtime_contract_rejects_unreviewed_control_or_endpoint_interposition(
+    operation,
+):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, _, _ = _start_tx_registration(policy, records)
+    if operation == "getsockopt":
+        transition = {
+            "operation": "getsockopt",
+            "fd": {"fd": 17},
+            "level": "SOL_SOCKET",
+            "option": "SO_ERROR",
+            "length": 4,
+        }
+    else:
+        transition = {
+            "operation": "getpeername",
+            "fd": {"fd": 17},
+            "address": {
+                "family": "AF_INET",
+                "ip": "127.0.0.1",
+                "port": META_PORTS[1],
+            },
+        }
+
+    decision = policy.feed(records.make(pid, operation, transition=transition))
+
+    assert outcome(decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+@pytest.mark.parametrize("syscall", ["sendto", "recvfrom", "connect", "write"])
+def test_runtime_contract_pre_registration_io_poisons_tx_and_cannot_be_cured(
+    syscall,
+):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, _, _ = _start_tx_registration(policy, records)
+    if syscall == "connect":
+        attempted = records.make(
+            pid,
+            syscall,
+            transition={
+                "operation": "connect",
+                "fd": {"fd": 17},
+                "address": {
+                    "family": "AF_INET",
+                    "ip": "127.0.0.1",
+                    "port": META_PORTS[1],
+                },
+            },
+        )
+    else:
+        address = None
+        if syscall == "sendto":
+            address = ("239.255.0.1", 26650)
+        elif syscall == "recvfrom":
+            address = ("127.0.0.1", EPHEMERAL_PORTS[1])
+        attempted = records.io(pid, syscall, 17, address=address)
+    first_violation = policy.feed(attempted)
+    option_decisions = [
+        policy.feed(records.tx_socket_option(pid, 17, option, value, length))
+        for option, value, length in TX_SETUP_OPTIONS
+    ]
+    posthoc = policy.feed(records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0]))
+
+    assert outcome(first_violation) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert all(decision.status == "FAIL" for decision in option_decisions)
+    assert outcome(posthoc) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert policy.finalize(trace_integrity_ok=True) == first_violation
+
+
+def test_runtime_contract_failed_reviewed_option_does_not_advance_registration():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, socket_decision, bind_decision = _start_tx_registration(policy, records)
+    failed = policy.feed(
+        records.tx_socket_option(
+            pid,
+            17,
+            *TX_SETUP_OPTIONS[0],
+            result=-1,
+        )
+    )
+    successful = [
+        policy.feed(records.tx_socket_option(pid, 17, option, value, length))
+        for option, value, length in TX_SETUP_OPTIONS
+    ]
+    observed = policy.feed(
+        records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0])
+    )
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(bind_decision) == ("PASS", "OK")
+    assert outcome(failed) == ("PASS", "OK")
+    assert [outcome(decision) for decision in successful] == [("PASS", "OK")] * 3
+    assert outcome(observed) == ("PASS", "OK")
+
+
 def test_runtime_contract_golden_replays_as_one_authorized_dds_window():
     source = (FIXTURES / "cyclonedds-0.10.5-runtime-representative.input").read_bytes()
     policy = make_policy()
@@ -511,7 +811,89 @@ def test_runtime_contract_golden_replays_as_one_authorized_dds_window():
     ]
 
     assert failures == []
+    for pid, fds in ((100, (7, 8, 9, 10, 11)), (101, (21,))):
+        assert all(policy.provenance.describe(pid, fd) is None for fd in fds)
     assert policy.finalize(trace_integrity_ok=True).status == "PASS"
+
+
+@pytest.mark.parametrize(
+    "lifecycle",
+    ["open-socket", "root-live", "worker-live"],
+)
+def test_runtime_contract_cannot_finalize_with_live_participant_or_socket(lifecycle):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, bind_decision = bound_udp(policy, records, 0, ("0.0.0.0", META_PORTS[0]))
+    assert bind_decision.status == "PASS"
+    if lifecycle == "root-live":
+        assert policy.feed(records.close(pid, 7)).status == "PASS"
+    elif lifecycle == "worker-live":
+        assert clone_worker(policy, records, pid, 1100).status == "PASS"
+        assert policy.feed(records.close(pid, 7)).status == "PASS"
+        assert policy.feed(records.exit(pid)).status == "PASS"
+    else:
+        assert policy.feed(records.exit(pid)).status == "PASS"
+    assert policy.feed(records.marker("END")).status == "PASS"
+
+    assert policy.finalize(trace_integrity_ok=True).status != "PASS"
+
+
+def test_runtime_contract_complete_trace_visible_lifecycle_can_finalize():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, bind_decision = bound_udp(policy, records, 0, ("0.0.0.0", META_PORTS[0]))
+    assert bind_decision.status == "PASS"
+    assert clone_worker(policy, records, pid, 1100).status == "PASS"
+    assert policy.feed(records.exit(1100)).status == "PASS"
+    assert policy.feed(records.close(pid, 7)).status == "PASS"
+    assert policy.feed(records.exit(pid)).status == "PASS"
+    assert policy.feed(records.marker("END")).status == "PASS"
+
+    assert policy.provenance.describe(pid, 7) is None
+    assert policy.finalize(trace_integrity_ok=True).status == "PASS"
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        ("close", "worker-exit", "root-exit", "end"),
+        ("worker-exit", "root-exit", "close", "end"),
+        ("end", "worker-exit", "close", "root-exit"),
+    ],
+    ids=["close-before-worker-exit", "root-exit-before-close", "end-before-cleanup"],
+)
+def test_runtime_contract_rejects_out_of_order_cleanup_before_end(order):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, bind_decision = bound_udp(policy, records, 0, ("0.0.0.0", META_PORTS[0]))
+    assert bind_decision.status == "PASS"
+    assert clone_worker(policy, records, pid, 1100).status == "PASS"
+    actions = {
+        "worker-exit": lambda: records.exit(1100),
+        "close": lambda: records.close(pid, 7),
+        "root-exit": lambda: records.exit(pid),
+        "end": lambda: records.marker("END"),
+    }
+
+    decisions = [policy.feed(actions[action]()) for action in order]
+
+    assert any(decision.status != "PASS" for decision in decisions) or (
+        policy.finalize(trace_integrity_ok=True).status != "PASS"
+    )
+
+
+def test_runtime_contract_truncated_golden_cannot_finalize_as_pass():
+    source = (FIXTURES / "cyclonedds-0.10.5-runtime-representative.input").read_bytes()
+    records = normalize_bytes(source)
+    policy = make_policy()
+
+    for record in records[:-1]:
+        policy.feed(record)
+
+    assert policy.finalize(trace_integrity_ok=True).status != "PASS"
 
 
 def test_runtime_contract_receive_fds_are_never_sendto_sources():
@@ -628,11 +1010,7 @@ def test_runtime_contract_inbound_source_registry_covers_every_receive_fd_class(
     )
 
     assert outcome(receive_decision) == expected_receive
-    assert [outcome(decision) for decision in registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
+    assert [outcome(decision) for decision in registration] == passing_registration()
     assert outcome(bind_decision) == ("PASS", "OK")
     if membership_decision is not None:
         assert outcome(membership_decision) == ("PASS", "OK")
@@ -711,16 +1089,12 @@ def test_runtime_contract_nonthread_descendants_cannot_perform_dds_io(
         )
     )
 
-    assert [outcome(decision) for decision in local_registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
-    assert [outcome(decision) for decision in remote_registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
+    assert [outcome(decision) for decision in local_registration] == (
+        passing_registration()
+    )
+    assert [outcome(decision) for decision in remote_registration] == (
+        passing_registration()
+    )
     assert outcome(receive_bind) == ("PASS", "OK")
     assert outcome(lifecycle) == ("PASS", "OK")
     assert outcome(outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
@@ -818,16 +1192,12 @@ def test_runtime_contract_nonthread_descendant_thread_cannot_regain_authority(
         )
     )
 
-    assert [outcome(decision) for decision in local_registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
-    assert [outcome(decision) for decision in remote_registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
+    assert [outcome(decision) for decision in local_registration] == (
+        passing_registration()
+    )
+    assert [outcome(decision) for decision in remote_registration] == (
+        passing_registration()
+    )
     assert outcome(receive_bind) == ("PASS", "OK")
     assert outcome(descendant) == ("PASS", "OK")
     assert outcome(thread) == ("PASS", "OK")
@@ -883,16 +1253,12 @@ def test_runtime_contract_authority_propagates_across_transitive_worker_threads(
     assert outcome(edge_b) == ("PASS", "OK")
     assert outcome(outbound) == ("PASS", "OK")
     assert outcome(inbound) == ("PASS", "OK")
-    assert [outcome(decision) for decision in local_registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
-    assert [outcome(decision) for decision in remote_registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
+    assert [outcome(decision) for decision in local_registration] == (
+        passing_registration()
+    )
+    assert [outcome(decision) for decision in remote_registration] == (
+        passing_registration()
+    )
     assert outcome(receive_bind) == ("PASS", "OK")
 
 
@@ -996,16 +1362,12 @@ def test_runtime_contract_exited_worker_tid_has_no_stale_or_transitive_authority
     assert outcome(initial_edge) == ("PASS", "OK")
     assert outcome(initial_outbound) == ("PASS", "OK")
     assert outcome(initial_inbound) == ("PASS", "OK")
-    assert [outcome(decision) for decision in local_registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
-    assert [outcome(decision) for decision in remote_registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
+    assert [outcome(decision) for decision in local_registration] == (
+        passing_registration()
+    )
+    assert [outcome(decision) for decision in remote_registration] == (
+        passing_registration()
+    )
     assert outcome(receive_bind) == ("PASS", "OK")
     assert final == stale_outbound
 
@@ -1068,16 +1430,12 @@ def test_runtime_contract_fresh_root_edge_reauthorizes_reused_worker_tid():
     assert outcome(fresh_edge) == ("PASS", "OK")
     assert outcome(fresh_outbound) == ("PASS", "OK")
     assert outcome(fresh_inbound) == ("PASS", "OK")
-    assert [outcome(decision) for decision in local_registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
-    assert [outcome(decision) for decision in remote_registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
+    assert [outcome(decision) for decision in local_registration] == (
+        passing_registration()
+    )
+    assert [outcome(decision) for decision in remote_registration] == (
+        passing_registration()
+    )
     assert outcome(receive_bind) == ("PASS", "OK")
 
 
@@ -1099,11 +1457,7 @@ def test_runtime_contract_conflicting_getsockname_preserves_ei_and_poisons_tx():
     )
     final = policy.finalize(trace_integrity_ok=True)
 
-    assert [outcome(decision) for decision in registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
+    assert [outcome(decision) for decision in registration] == passing_registration()
     assert outcome(conflict) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
     assert description["local"] == ("127.0.0.1", original_port)
     assert outcome(outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
@@ -1144,11 +1498,7 @@ def test_runtime_contract_same_getsockname_via_dup_preserves_tx_provenance():
         records.io(pid, "sendto", fd, address=("239.255.0.1", 26650))
     )
 
-    assert [outcome(decision) for decision in registration] == [
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-        ("PASS", "OK"),
-    ]
+    assert [outcome(decision) for decision in registration] == passing_registration()
     assert outcome(duplicate) == ("PASS", "OK")
     assert outcome(repeated_original) == ("PASS", "OK")
     assert outcome(repeated_alias) == ("PASS", "OK")
@@ -1185,11 +1535,9 @@ def test_runtime_contract_posthoc_getsockname_cannot_cure_prior_io(syscall):
     final = policy.finalize(trace_integrity_ok=True)
 
     if remote_registration:
-        assert [outcome(decision) for decision in remote_registration] == [
-            ("PASS", "OK"),
-            ("PASS", "OK"),
-            ("PASS", "OK"),
-        ]
+        assert [outcome(decision) for decision in remote_registration] == (
+            passing_registration()
+        )
     assert outcome(socket_decision) == ("PASS", "OK")
     assert outcome(bind_decision) == ("PASS", "OK")
     assert outcome(unauthorized) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
@@ -1324,6 +1672,13 @@ def test_ephemeral_tx_requires_loopback_bind_and_nonzero_getsockname():
         open_window(policy, records)
         pid, decision = bound_udp(policy, records, 0, (bind_address, 0), fd=17)
         if decision.status == "PASS":
+            for option, value, length in TX_SETUP_OPTIONS:
+                assert (
+                    policy.feed(
+                        records.tx_socket_option(pid, 17, option, value, length)
+                    ).status
+                    == "PASS"
+                )
             decision = policy.feed(
                 records.getsockname(pid, 17, observed_address, observed_port)
             )
