@@ -17,6 +17,7 @@ _LOCAL_ADDRESSES = frozenset({"0.0.0.0", "127.0.0.1"})
 _NEUTRAL_SOCKET_DOMAINS = frozenset({"AF_UNIX", "AF_NETLINK"})
 _REVIEWED_INHERITED_FD_KINDS = frozenset({"character_device", "pipe", "regular_file"})
 _REVIEWED_RAW_FD_KINDS = frozenset({"character_device", "path", "pipe"})
+_REVIEWED_GENERIC_FD_SYSCALLS = frozenset({"open", "openat"})
 _SPDP_ADDRESS = "239.255.0.1"
 _SPDP_PORT = 26650
 _DATA_MULTICAST_PORT = 26651
@@ -240,6 +241,7 @@ class FDProvenance:
         self._record_message_peers(pid, record)
         transition = record.get("transition")
         if not isinstance(transition, Mapping):
+            self._create_generic_fd(pid, record)
             return
         operation = transition.get("operation")
         if not isinstance(operation, str):
@@ -269,6 +271,35 @@ class FDProvenance:
             self._close(pid, transition, record)
         elif operation == "close_range":
             self._close_range(pid, transition, record)
+
+    def _create_generic_fd(self, pid: int, record: CanonicalRecord) -> None:
+        if not _succeeded(record):
+            return
+        result = record.get("result")
+        descriptor = result.get("fd") if isinstance(result, Mapping) else None
+        if descriptor is None:
+            return
+        fd = _fd_number(descriptor)
+        result_value = _exact_int(result.get("value"))
+        if (
+            record.get("syscall") not in _REVIEWED_GENERIC_FD_SYSCALLS
+            or not isinstance(descriptor, Mapping)
+            or set(descriptor) != {"fd", "provenance"}
+            or fd is None
+            or fd < 0
+            or result_value != fd
+            or not _reviewed_raw_nonsocket_annotation(descriptor)
+            or self._entry(pid, fd) is not None
+        ):
+            self._latch_integrity("UNKNOWN_FD_PROVENANCE")
+            return
+        provenance = descriptor["provenance"]
+        kind = str(provenance["kind"])
+        inode = _exact_int(provenance.get("inode"))
+        self._table(pid)[fd] = _FdEntry(
+            description=_OpenDescription(kind=kind, inode=inode),
+            cloexec=False,
+        )
 
     def _entry(self, pid: int, fd: int) -> _FdEntry | None:
         table = self._tables.get(pid)
@@ -716,10 +747,11 @@ class TracePolicy:
             return PolicyDecision("PASS", "OK", None)
 
         pre_description = self._description_for_record(pid, record)
-        close_range_descriptions = self._close_range_descriptions(pid, record)
+        interposition_descriptions = self._interposition_descriptions(pid, record)
+        close_range_closes = self._close_range_closes(record)
         self.provenance.apply(record)
         self._sync_provenance_integrity()
-        reason = self._classify(record, pre_description, close_range_descriptions)
+        reason = self._classify(record, pre_description, interposition_descriptions)
         transition = record.get("transition")
         if (
             isinstance(transition, Mapping)
@@ -727,8 +759,8 @@ class TracePolicy:
             and pid is not None
         ):
             self._handle_close(pid, pre_description, record)
-        if close_range_descriptions and pid is not None:
-            for description in close_range_descriptions:
+        if close_range_closes and interposition_descriptions and pid is not None:
+            for description in interposition_descriptions:
                 self._handle_close(pid, description, record)
         if reason is None:
             return PolicyDecision("PASS", "OK", None)
@@ -814,28 +846,59 @@ class TracePolicy:
                 return self.provenance.socket_description(pid, fd)
         return None
 
-    def _close_range_descriptions(
+    def _interposition_descriptions(
         self, pid: int | None, record: CanonicalRecord
     ) -> tuple[_OpenDescription, ...]:
-        if pid is None or not _succeeded(record):
+        if pid is None:
             return ()
+        transition = record.get("transition")
+        if not isinstance(transition, Mapping):
+            return ()
+        operation = transition.get("operation")
+        if operation == "close_range":
+            if not _succeeded(record):
+                return ()
+            first_fd = _exact_int(transition.get("first_fd"))
+            last_fd = _exact_int(transition.get("last_fd"))
+            if first_fd is None or last_fd is None:
+                return ()
+            return self.provenance.descriptions_in_range(pid, first_fd, last_fd)
+        keys: tuple[str, ...]
+        if operation in {"dup2", "dup3"}:
+            keys = ("source_fd", "target_fd") if _succeeded(record) else ("source_fd",)
+        elif operation in {
+            "dup",
+            "fcntl_dup",
+            "fcntl_getfd",
+            "fcntl_getfl",
+            "fcntl_setfd",
+            "fcntl_setfl",
+        }:
+            keys = ("source_fd",)
+        elif operation == "close":
+            keys = ("closed_fd",)
+        else:
+            return ()
+        descriptions: dict[int, _OpenDescription] = {}
+        for key in keys:
+            fd = _fd_number(transition.get(key))
+            description = None if fd is None else self.provenance.description(pid, fd)
+            if description is not None:
+                descriptions[id(description)] = description
+        return tuple(descriptions.values())
+
+    @staticmethod
+    def _close_range_closes(record: CanonicalRecord) -> bool:
+        if not _succeeded(record):
+            return False
         transition = record.get("transition")
         if (
             not isinstance(transition, Mapping)
             or transition.get("operation") != "close_range"
         ):
-            return ()
+            return False
         flags = transition.get("flags")
-        first_fd = _exact_int(transition.get("first_fd"))
-        last_fd = _exact_int(transition.get("last_fd"))
-        if (
-            not isinstance(flags, list)
-            or "CLOSE_RANGE_CLOEXEC" in flags
-            or first_fd is None
-            or last_fd is None
-        ):
-            return ()
-        return self.provenance.descriptions_in_range(pid, first_fd, last_fd)
+        return isinstance(flags, list) and "CLOSE_RANGE_CLOEXEC" not in flags
 
     def _activate_socket(self, participant: int, description: _OpenDescription) -> None:
         identity = id(description)
@@ -853,6 +916,10 @@ class TracePolicy:
             return
         configured_root_role = self._configured_root_roles.get(child)
         if configured_root_role is not None:
+            if configured_root_role in self._exited_roots:
+                self._task_roles.pop(child, None)
+                self._live_workers.pop(child, None)
+                return
             self._task_roles[child] = configured_root_role
             self._live_workers.pop(child, None)
             return
@@ -937,7 +1004,7 @@ class TracePolicy:
         self,
         record: CanonicalRecord,
         pre_description: _OpenDescription | None,
-        close_range_descriptions: tuple[_OpenDescription, ...],
+        interposition_descriptions: tuple[_OpenDescription, ...],
     ) -> str | None:
         if record.get("kind") != "syscall":
             return None
@@ -964,7 +1031,7 @@ class TracePolicy:
         if pid is None:
             return None
         interposition = self._classify_tx_interposition(
-            operation, pre_description, close_range_descriptions
+            operation, interposition_descriptions
         )
         if interposition is not None:
             return interposition
@@ -972,11 +1039,11 @@ class TracePolicy:
             if operation == "exec":
                 self._revoke_worker_authority(pid)
             elif operation == "unshare_files":
-                self._revoke_worker_authority(pid)
+                self._revoke_split_authority(pid)
             elif operation == "close_range" and isinstance(transition, Mapping):
                 flags = transition.get("flags")
                 if isinstance(flags, list) and "CLOSE_RANGE_UNSHARE" in flags:
-                    self._revoke_worker_authority(pid)
+                    self._revoke_split_authority(pid)
         if operation in {"fork", "vfork", "clone"} and isinstance(transition, Mapping):
             self._apply_clone_authority(pid, transition, record)
             return None
@@ -1010,11 +1077,19 @@ class TracePolicy:
         if pid in self._live_workers:
             self._task_roles.pop(pid, None)
 
+    def _revoke_split_authority(self, pid: int) -> None:
+        configured_role = self._configured_root_roles.get(pid)
+        if configured_role is not None and self._task_roles.get(pid) == configured_role:
+            for worker_pid, participant in self._live_workers.items():
+                if participant == configured_role:
+                    self._task_roles.pop(worker_pid, None)
+            return
+        self._revoke_worker_authority(pid)
+
     def _classify_tx_interposition(
         self,
         operation: object,
-        pre_description: _OpenDescription | None,
-        close_range_descriptions: tuple[_OpenDescription, ...],
+        descriptions: tuple[_OpenDescription, ...],
     ) -> str | None:
         if operation not in {
             "close",
@@ -1029,15 +1104,13 @@ class TracePolicy:
             "fcntl_setfl",
         }:
             return None
-        descriptions = close_range_descriptions or (
-            () if pre_description is None else (pre_description,)
-        )
+        violation = False
         for description in descriptions:
             registration = self._tx_by_description.get(id(description))
             if registration is not None and registration.endpoint is None:
                 registration.poisoned = True
-                return "UNEXPECTED_NETWORK_ATTEMPT"
-        return None
+                violation = True
+        return "UNEXPECTED_NETWORK_ATTEMPT" if violation else None
 
     def _classify_socket_creation(
         self,

@@ -393,15 +393,6 @@ def _raw_integer(value: str, code: str) -> int:
     return int(value, 0)
 
 
-def _raw_fd(value: str, code: str) -> dict[str, object]:
-    if _RAW_INTEGER.fullmatch(value) is not None:
-        return {"fd": int(value, 0)}
-    descriptor = _fd(value, code)
-    if "provenance" not in descriptor:
-        raise _fail(code)
-    return descriptor
-
-
 def _provenance(value: str) -> dict[str, object]:
     inode = re.fullmatch(r"(socket|pipe):\[([0-9]+)\]", value)
     if inode is not None:
@@ -925,11 +916,14 @@ def _raw_metadata(name: str, arguments: list[str]) -> dict[str, object]:
         raise _fail("raw-syscall-arity")
     for index, argument in enumerate(arguments):
         if index in fd_indexes:
-            _raw_fd(argument, "invalid-raw-fd")
+            _raw_integer(argument, "invalid-raw-fd")
         else:
             _raw_integer(argument, "invalid-raw-number")
     metadata: dict[str, object] = {
-        "fds": [_raw_fd(arguments[index], "invalid-raw-fd") for index in fd_indexes],
+        "fds": [
+            {"fd": _raw_integer(arguments[index], "invalid-raw-fd")}
+            for index in fd_indexes
+        ],
         "lengths": {
             length_key: _raw_integer(arguments[length_index], "invalid-raw-length")
         },

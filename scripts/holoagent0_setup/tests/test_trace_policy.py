@@ -2566,7 +2566,7 @@ def test_normalized_external_path_raw_io_is_neutral_without_manifest_entry():
                 result="77</tmp/TASK6_SECRET>",
             ),
             _trace_line(
-                "write(77</tmp/TASK6_SECRET>, 0x7fff0000, 0x4)",
+                "write(0x4d, 0x7fff0000, 0x4)",
                 pid=COORDINATOR_PID,
                 result="0x4",
             ),
@@ -2577,12 +2577,37 @@ def test_normalized_external_path_raw_io_is_neutral_without_manifest_entry():
 
     decisions = [policy.feed(record) for record in normalized]
 
-    assert normalized[1]["fds"] == [{"fd": 77, "provenance": {"kind": "path"}}]
+    assert normalized[0]["result"]["fd"] == {
+        "fd": 77,
+        "provenance": {"kind": "path"},
+    }
+    assert normalized[1]["fds"] == [{"fd": 77}]
     assert [outcome(decision) for decision in decisions] == [
         ("PASS", "OK"),
         ("PASS", "OK"),
     ]
     assert policy.trace_integrity_error is None
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        {"kind": "socket", "inode": 7077},
+        {"kind": "unknown"},
+        {"kind": "path", "unexpected": True},
+    ],
+    ids=["socket", "unknown-kind", "malformed-path"],
+)
+def test_generic_fd_creation_with_unreviewed_provenance_fails_integrity(provenance):
+    policy = make_policy()
+    records = Records()
+    created = records.make(COORDINATOR_PID, "openat", result=77)
+    created["result"]["fd"] = {"fd": 77, "provenance": provenance}
+
+    decision = policy.feed(created)
+
+    assert outcome(decision) == ("PASS", "OK")
+    assert policy.trace_integrity_error == "UNKNOWN_FD_PROVENANCE"
 
 
 @pytest.mark.parametrize(
@@ -2624,6 +2649,101 @@ def test_worker_loses_network_authority_after_fd_table_unshare(syscall, transiti
 
     assert outcome(unshared) == ("PASS", "OK")
     assert outcome(outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+@pytest.mark.parametrize(
+    ("syscall", "transition"),
+    [
+        (
+            "unshare",
+            {"operation": "unshare_files", "flags": ["CLONE_FILES"]},
+        ),
+        (
+            "close_range",
+            {
+                "operation": "close_range",
+                "first_fd": 100,
+                "last_fd": 100,
+                "flags": ["CLOSE_RANGE_UNSHARE"],
+            },
+        ),
+    ],
+    ids=["unshare", "close-range-unshare"],
+)
+def test_root_fd_table_split_revokes_every_live_worker(syscall, transition):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid, tx_fd, _ = registered_tx(policy, records, 0)
+    worker_tids = (1100, 1101)
+    for worker_tid in worker_tids:
+        assert clone_worker(policy, records, root_pid, worker_tid).status == "PASS"
+
+    split = policy.feed(records.make(root_pid, syscall, transition=transition))
+    worker_outbound = [
+        policy.feed(
+            records.io(
+                worker_tid,
+                "sendto",
+                tx_fd,
+                address=("239.255.0.1", 26650),
+            )
+        )
+        for worker_tid in worker_tids
+    ]
+    root_outbound = policy.feed(
+        records.io(
+            root_pid,
+            "sendto",
+            tx_fd,
+            address=("239.255.0.1", 26650),
+        )
+    )
+
+    assert outcome(split) == ("PASS", "OK")
+    assert [outcome(decision) for decision in worker_outbound] == [
+        ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT"),
+        ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT"),
+    ]
+    assert outcome(root_outbound) == ("PASS", "OK")
+
+
+def test_worker_fd_table_split_revokes_only_that_worker():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid, tx_fd, _ = registered_tx(policy, records, 0)
+    worker_tids = (1100, 1101)
+    for worker_tid in worker_tids:
+        assert clone_worker(policy, records, root_pid, worker_tid).status == "PASS"
+
+    split = policy.feed(
+        records.make(
+            worker_tids[0],
+            "unshare",
+            transition={"operation": "unshare_files", "flags": ["CLONE_FILES"]},
+        )
+    )
+    revoked = policy.feed(
+        records.io(
+            worker_tids[0],
+            "sendto",
+            tx_fd,
+            address=("239.255.0.1", 26650),
+        )
+    )
+    retained = policy.feed(
+        records.io(
+            worker_tids[1],
+            "sendto",
+            tx_fd,
+            address=("239.255.0.1", 26650),
+        )
+    )
+
+    assert outcome(split) == ("PASS", "OK")
+    assert outcome(revoked) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(retained) == ("PASS", "OK")
 
 
 def test_root_close_range_cleanup_satisfies_participant_lifecycle():
@@ -2738,6 +2858,63 @@ def test_dup_cannot_interpose_during_tx_registration():
     assert outcome(observed) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
 
 
+def test_close_range_cloexec_poisons_incomplete_tx_without_lifecycle_close():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, socket_decision, bind_decision = _start_tx_registration(policy, records)
+
+    cloexec = policy.feed(
+        records.make(
+            pid,
+            "close_range",
+            transition={
+                "operation": "close_range",
+                "first_fd": 7,
+                "last_fd": 17,
+                "flags": ["CLOSE_RANGE_CLOEXEC"],
+            },
+        )
+    )
+    later = _feed_tx_options(policy, records, pid, TX_SETUP_OPTIONS)
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(bind_decision) == ("PASS", "OK")
+    assert outcome(cloexec) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert policy.provenance.describe(pid, 17)["cloexec"] is True
+    assert policy.provenance.describe(pid, 17)["kind"] == "socket"
+    assert all(
+        outcome(decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+        for decision in later
+    )
+
+
+@pytest.mark.parametrize("operation", ["dup2", "dup3"])
+def test_dup_target_interposition_poisons_implicitly_closed_incomplete_tx(operation):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid = PARTICIPANT_PIDS[0]
+    assert policy.feed(records.socket(pid, 18, domain="AF_UNIX")).status == "PASS"
+    pid, socket_decision, bind_decision = _start_tx_registration(policy, records)
+    transition = {
+        "operation": operation,
+        "source_fd": {"fd": 18},
+        "target_fd": {"fd": 17},
+        "created_fd": {"fd": 17},
+    }
+    if operation == "dup3":
+        transition["flags"] = []
+
+    duplicate = policy.feed(
+        records.make(pid, operation, result=17, transition=transition)
+    )
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(bind_decision) == ("PASS", "OK")
+    assert outcome(duplicate) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
 def test_incomplete_tx_registration_cannot_finalize_as_pass():
     policy = make_policy()
     records = Records()
@@ -2794,6 +2971,25 @@ def test_configured_root_survives_observed_spawn_and_validated_exec_lifecycle(
     assert outcome(spawn) == ("PASS", "OK")
     assert outcome(exec_decision) == ("PASS", "OK")
     assert outcome(socket_decision) == ("PASS", "OK")
+
+
+@pytest.mark.parametrize(
+    "parent_pid",
+    [COORDINATOR_PID, 999],
+    ids=["coordinator-parent", "nonparticipant-launcher-parent"],
+)
+def test_exited_configured_root_pid_cannot_be_reauthorized_by_numeric_reuse(parent_pid):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid = PARTICIPANT_PIDS[0]
+    assert policy.feed(records.exit(root_pid)).status == "PASS"
+
+    respawn = _spawn_configured_root(policy, records, 0, parent_pid=parent_pid)
+    socket_decision = policy.feed(records.socket(root_pid, 7))
+
+    assert outcome(respawn) == ("PASS", "OK")
+    assert outcome(socket_decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
 
 
 def test_successful_worker_exec_revokes_shared_thread_authority():

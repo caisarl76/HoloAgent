@@ -451,6 +451,7 @@ def test_exact_raw_hex_grammar_preserves_all_fd_operands(
         b"303   1.0 sendfile(0x4, 0x7fff0000, 0x10) = 0x10 <0.1>\n",
         b'303   1.0 read(0x3, "decoded payload", 0x10) = 0x10 <0.1>\n',
         b"303   1.0 splice(0x3, 0, 0x4, 0x10, 0x1) = 0x10 <0.1>\n",
+        b"303   1.0 write(77</tmp/annotated>, 0x7fff0000, 0x4) = 0x4 <0.1>\n",
     ],
 )
 def test_malformed_raw_shapes_fail_closed_without_fallback(source):

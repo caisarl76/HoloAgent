@@ -325,19 +325,23 @@ launcher manifest. It applies every successful `pipe`/`pipe2`,
 `clone*` inheritance; `CLONE_FILES` sharing and `unshare(CLONE_FILES)`/
 `CLOSE_RANGE_UNSHARE` splitting; close-on-exec transition; `close`/
 `close_range` removal; and decoded descriptor return in canonical record order.
+An exact successful `open`/`openat` result carrying the normalizer's closed
+redacted `path` provenance establishes that numeric FD in the table before any
+later raw I/O. Pinned raw-I/O records contain numeric FD operands only and must
+resolve through that table; they do not supply a second provenance source.
 Internet-family
 socket provenance, connected peer, local bind, protocol, and socket type follow
 every alias and descendant until the last close. Any FD-producing syscall that
-returns a strace socket annotation but has no closed provenance transition is
-a trace-integrity failure. `SCM_RIGHTS` receipt and `pidfd_getfd` are prohibited
+returns a socket, malformed, or unknown annotation without a dedicated closed
+provenance transition is a trace-integrity failure. `SCM_RIGHTS` receipt and `pidfd_getfd` are prohibited
 acquisition transitions rather than trusted provenance sources.
 Generic I/O on a manifest-seeded or trace-created, provenance-known non-socket
-descriptor is neutral. When no table entry exists, only the normalizer's closed
+descriptor is neutral. The canonical policy defensively recognizes only closed
 non-socket annotation shapes (`path`, or nonnegative-inode `pipe`/
-`character_device`) are neutral; extra fields, missing or negative inodes, and
-unknown kinds fail trace integrity. An unannotated unknown descriptor remains a
-trace-integrity failure, and an unknown descriptor annotated as a socket is also
-a network-policy violation.
+`character_device`), but pinned raw-I/O grammar is numeric and conformance does
+not depend on such annotations. Extra fields, missing or negative inodes,
+unknown kinds, and an unannotated unknown descriptor fail trace integrity; an
+unknown descriptor annotated as a socket is also a network-policy violation.
 
 Every attempted generic I/O operation whose input or output FD resolves to an
 `AF_INET`/`AF_INET6` socket is a network-policy event, regardless of success.
@@ -490,8 +494,11 @@ successful setup operation must still be the current expected stage, and a
 successful retry followed by the remaining exact sequence may register. A
 failed unreviewed option, endpoint, or socket-I/O operation remains a policy
 violation. A repeated bind, descriptor duplication/control operation, or close
-before registration likewise poisons the registration; an incomplete
-registration cannot finalize as a pass. The successful `getsockname` must
+before registration likewise poisons the registration. Interposition examines
+every affected pre-apply open-file-description: `dup2`/`dup3` include both the
+source and implicitly closed target, and every selected `close_range` FD is
+examined even for `CLOSE_RANGE_CLOEXEC`. CLOEXEC marking does not count as a
+lifecycle close. An incomplete registration cannot finalize as a pass. The successful `getsockname` must
 establish one unique, nonzero
 dynamic endpoint `E_i` and permanently bind it to that socket's FD provenance
 for participant identity `i`. Only then may that FD and source `E_i` carry multicast SPDP and
@@ -536,9 +543,13 @@ descendant retain FD provenance as Linux requires but inherit no participant
 role or DDS network authority. The participant mapping is already bound to the
 externally validated ownership journal and config digest before replay; an
 observed spawn or successful exec of that exact configured root does not erase
-its root role. A worker/non-root exec, `unshare(CLONE_FILES)`, or
-`close_range(..., CLOSE_RANGE_UNSHARE)` revokes its DDS role immediately while
-retaining the task in lifecycle accounting until exit.
+its root role before exit. Root exit permanently terminates that configured
+incarnation for the run: later numeric PID reuse cannot restore its role. A
+worker/non-root exec or worker-side `unshare(CLONE_FILES)`/
+`close_range(..., CLOSE_RANGE_UNSHARE)` revokes only that worker's DDS role. A
+root-side FD-table split revokes every live worker for that participant while
+the root retains its role. All revoked tasks remain in lifecycle accounting
+until exit.
 
 The committed 44-record
 `cyclonedds-0.10.5-runtime-representative.{input,expected.ndjson}` golden is a

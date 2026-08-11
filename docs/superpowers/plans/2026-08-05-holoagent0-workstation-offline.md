@@ -680,11 +680,14 @@ class TracePolicy:
 Track pipe and socket creation, local binds, `getsockname`, connected and
 message peers, `dup*`, `fcntl(F_DUPFD*)`, fork/clone table semantics,
 thread-group semantics, exec, exit, close/`close_range`, decoded `SCM_RIGHTS`,
-and `pidfd_getfd`. Known non-socket I/O is neutral. Without a table entry, only
-the normalizer's closed `path`, nonnegative-inode `pipe`, and nonnegative-inode
-`character_device` annotation shapes are neutral; unannotated, malformed, or
-unknown FD provenance fails trace integrity and an unknown annotated socket also
-fails network policy.
+and `pidfd_getfd`. Register an exact successful generic `open`/`openat` result
+with closed redacted `path` provenance, then resolve the pinned raw-I/O grammar's
+numeric FD operand through that table. Known non-socket I/O is neutral. The
+canonical policy may defensively accept only exact closed `path`,
+nonnegative-inode `pipe`, and nonnegative-inode `character_device` annotations,
+but pinned raw records do not carry them. Unannotated, malformed, or unknown FD
+provenance fails trace integrity and an unknown annotated socket also fails
+network policy.
 Classify TCP/DNS, host-namespace IP, non-loopback routes, any `pidfd_getfd`
 acquisition attempt, any decoded `SCM_RIGHTS` transfer, and any UDP operation
 outside the exact four identity/config-digest participant roots, their
@@ -722,6 +725,12 @@ destination outside the table. A wildcard receive bind is permitted only after
 the preflight artifact proves the private namespace has exactly `lo` and no
 non-loopback interface or route.
 
+Before applying TX interposition, inspect every affected open-file-description.
+For `dup2`/`dup3`, this includes both the source and the implicitly closed target;
+for `close_range`, it includes the entire selected range even when
+`CLOSE_RANGE_CLOEXEC` is present. Poison and journal any incomplete registration
+found. CLOEXEC-only ranges remain open for lifecycle accounting.
+
 Participant authority is not inherited merely because a descendant has an FD.
 A successful lifecycle edge from an authorized task grants authority only when
 the clone flags prove both the same thread group and the same FD table through
@@ -729,9 +738,13 @@ the clone flags prove both the same thread group and the same FD table through
 either flag retain only their ordinary FD-provenance semantics; they receive no
 participant role. Exit removes the task/TID authority without granting it to a
 later PID reuse. The externally journal-validated configured root remains the
-root across its observed spawn/exec lifecycle. A worker exec or successful
-`unshare(CLONE_FILES)`/`close_range(..., CLOSE_RANGE_UNSHARE)` revokes worker
-network authority while lifecycle tracking continues until exit.
+root across its first observed spawn/exec lifecycle, but its exit permanently
+closes that incarnation and later numeric PID reuse cannot reauthorize it. A
+worker exec or worker-side successful `unshare(CLONE_FILES)`/
+`close_range(..., CLOSE_RANGE_UNSHARE)` revokes only that worker's network
+authority. A root-side split revokes every live worker for the participant while
+the root stays authorized; lifecycle tracking for revoked workers continues
+until exit.
 
 This behavior is specific to the approved pinned configuration. CycloneDDS
 0.10.5 creates one port-zero transmit connection per selected interface, uses
