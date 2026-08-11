@@ -814,7 +814,7 @@ def test_runtime_contract_nonthread_descendant_thread_cannot_regain_authority(
     assert outcome(inbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
 
 
-def test_runtime_contract_conflicting_getsockname_preserves_original_ei():
+def test_runtime_contract_conflicting_getsockname_preserves_ei_and_poisons_tx():
     policy = make_policy()
     records = Records()
     open_window(policy, records)
@@ -830,6 +830,7 @@ def test_runtime_contract_conflicting_getsockname_preserves_original_ei():
     outbound = policy.feed(
         records.io(pid, "sendto", fd, address=("239.255.0.1", 26650))
     )
+    final = policy.finalize(trace_integrity_ok=True)
 
     assert [outcome(decision) for decision in registration] == [
         ("PASS", "OK"),
@@ -838,8 +839,8 @@ def test_runtime_contract_conflicting_getsockname_preserves_original_ei():
     ]
     assert outcome(conflict) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
     assert description["local"] == ("127.0.0.1", original_port)
-    assert description["local_conflict"] is False
-    assert outcome(outbound) == ("PASS", "OK")
+    assert outcome(outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert final == conflict
 
 
 def test_runtime_contract_same_getsockname_via_dup_preserves_tx_provenance():
@@ -890,30 +891,43 @@ def test_runtime_contract_same_getsockname_via_dup_preserves_tx_provenance():
     assert outcome(outbound) == ("PASS", "OK")
 
 
-def test_runtime_contract_late_getsockname_cannot_cure_unauthorized_send():
+@pytest.mark.parametrize("syscall", ["sendto", "recvfrom"])
+def test_runtime_contract_posthoc_getsockname_cannot_cure_prior_io(syscall):
     policy = make_policy()
     records = Records()
     open_window(policy, records)
+    remote_registration = ()
+    remote_source = EPHEMERAL_PORTS[1]
+    if syscall == "recvfrom":
+        _, _, remote_source, remote_registration = observe_tx_registration(
+            policy,
+            records,
+            1,
+            fd=18,
+        )
     pid = PARTICIPANT_PIDS[0]
     fd = 17
     socket_decision = policy.feed(records.socket(pid, fd))
     bind_decision = policy.feed(records.bind(pid, fd, "127.0.0.1", 0))
-    unauthorized = policy.feed(
-        records.io(pid, "sendto", fd, address=("239.255.0.1", 26650))
+    address = (
+        ("239.255.0.1", 26650) if syscall == "sendto" else ("127.0.0.1", remote_source)
     )
-    late_registration = policy.feed(
-        records.getsockname(pid, fd, "127.0.0.1", EPHEMERAL_PORTS[0])
-    )
-    later_send = policy.feed(
-        records.io(pid, "sendto", fd, address=("239.255.0.1", 26650))
-    )
+    unauthorized = policy.feed(records.io(pid, syscall, fd, address=address))
+    posthoc = policy.feed(records.getsockname(pid, fd, "127.0.0.1", EPHEMERAL_PORTS[0]))
+    later_io = policy.feed(records.io(pid, syscall, fd, address=address))
     final = policy.finalize(trace_integrity_ok=True)
 
+    if remote_registration:
+        assert [outcome(decision) for decision in remote_registration] == [
+            ("PASS", "OK"),
+            ("PASS", "OK"),
+            ("PASS", "OK"),
+        ]
     assert outcome(socket_decision) == ("PASS", "OK")
     assert outcome(bind_decision) == ("PASS", "OK")
     assert outcome(unauthorized) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
-    assert outcome(late_registration) == ("PASS", "OK")
-    assert outcome(later_send) == ("PASS", "OK")
+    assert outcome(posthoc) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(later_io) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
     assert final == unauthorized
 
 

@@ -593,11 +593,14 @@ including explicit bind, membership, and source validation on `26651`. Exercise
 actual inbound and outbound DDS I/O from `fork`, `vfork`, and incomplete-clone
 descendants, then from their `CLONE_THREAD|CLONE_FILES` threads, and prove that
 no transitive lifecycle edge re-grants participant authority. Finally, pin
-`E_i` to its registered open-socket provenance: a conflicting repeated
-`getsockname` fails without replacement, a same-value repetition through the
-original FD or a proven `dup` alias preserves the registration without creating
-a second TX socket, and a later successful `getsockname` cannot erase an
-earlier unauthorized send from the violation journal.
+`E_i` to its registered open-socket provenance. A same-value repeated
+`getsockname` through the original FD or a proven `dup` alias preserves the
+registration without creating a second TX socket. A conflicting repetition
+fails without replacing `E_i`, poisons that TX provenance and the run, and
+leaves later outbound or receive I/O denied. A post-hoc `getsockname` is one
+observed after any attempted outbound or receive I/O on the port-zero-bound FD
+before registration completed; reject it for authority purposes, keep later I/O
+denied, and retain the first violation in the journal.
 
 - [ ] **Step 2: Run and verify the amended policy contract is RED**
 
@@ -654,18 +657,26 @@ allowance is:
 |---|---|---|---|
 | Bind multicast receive sockets | wildcard/loopback `:26650` and `:26651` | none | Both binds are required; join `239.255.0.1` on both FDs through loopback |
 | Bind fixed unicast receive sockets | wildcard/loopback at that participant's pair | none | p0 `26660/26661`; p1 `26662/26663`; p2 `26664/26665`; p3 `26666/26667` |
-| Register transmit socket | exactly one FD bound `127.0.0.1:0` | subsequent `getsockname -> 127.0.0.1:E_i` | `E_i` must be unique and nonzero and remains bound to that FD provenance |
+| Register transmit socket | exactly one FD bound `127.0.0.1:0` | the next operation on that FD is a successful `getsockname -> 127.0.0.1:E_i`, before any I/O | `E_i` must be unique and nonzero and remains bound to that FD provenance |
 | Outbound DDS | registered TX FD/source `E_i` | `239.255.0.1:26650` or loopback `26660..26667` | The same TX FD carries SPDP and ordinary unicast SEDP/user data |
 | Inbound DDS | an approved multicast/fixed receive FD | loopback source at a previously registered `E_j` | Unknown source ports never inherit permission from destination validity |
 | Worker-TID DDS operation | FD from the participant's shared table | same endpoint rules | TID role requires lifecycle proof containing both `CLONE_THREAD` and `CLONE_FILES` |
 
 The `26651` socket is receive/join-only: reject sends from that FD and every
 destination `:26651`. Fixed receive sockets likewise do not become TX FDs.
-Reject a second port-zero TX socket for an identity, conflicting or post-hoc
-`getsockname`, zero/duplicate/unknown `E_i`, unknown inbound `E_j`, IPv6,
-non-loopback endpoints, alternate multicast groups, and every destination
-outside the table. A wildcard receive bind is permitted only after the
-preflight artifact proves the private namespace has exactly `lo` and no
+Reject a second port-zero TX socket for an identity and zero, duplicate, or
+unknown `E_i`. The port-zero bind plus its correct immediate successful
+`getsockname` is the only registration path. After registration, an exact
+same-value `getsockname` on the FD or a proven `dup` alias is permitted and
+preserves the original provenance. A conflicting repetition is a TX-provenance
+integrity/policy failure: never overwrite `E_i`, poison that FD/run, and reject
+later outbound or receive use. "Post-hoc" means after any attempted outbound or
+receive I/O before registration completed; reject that observation for
+authority, do not register the endpoint, keep every later use denied, and
+preserve the earlier violation as authoritative. Also reject unknown inbound
+`E_j`, IPv6, non-loopback endpoints, alternate multicast groups, and every
+destination outside the table. A wildcard receive bind is permitted only after
+the preflight artifact proves the private namespace has exactly `lo` and no
 non-loopback interface or route.
 
 Participant authority is not inherited merely because a descendant has an FD.
