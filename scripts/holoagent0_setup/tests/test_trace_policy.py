@@ -201,10 +201,10 @@ class Records:
         }
 
 
-def _trace_line(call, *, pid=100):
+def _trace_line(call, *, pid=100, result="0"):
     prefix = f"{pid:<5} 1700000060.000001 "
     padding = " " * max(1, 40 - len(prefix) - len(call))
-    return f"{prefix}{call}{padding}= 0 <0.000001>\n".encode()
+    return f"{prefix}{call}{padding}= {result} <0.000001>\n".encode()
 
 
 def make_policy(
@@ -696,21 +696,19 @@ def test_runtime_contract_tx_setup_requires_original_numeric_fd(use_alias):
     pid, _, _ = _start_tx_registration(policy, records)
     other_fd = 18
     if use_alias:
-        assert (
-            policy.feed(
-                records.make(
-                    pid,
-                    "dup",
-                    result=other_fd,
-                    transition={
-                        "operation": "dup",
-                        "source_fd": {"fd": 17},
-                        "created_fd": {"fd": other_fd},
-                    },
-                )
-            ).status
-            == "PASS"
+        duplicate = policy.feed(
+            records.make(
+                pid,
+                "dup",
+                result=other_fd,
+                transition={
+                    "operation": "dup",
+                    "source_fd": {"fd": 17},
+                    "created_fd": {"fd": other_fd},
+                },
+            )
         )
+        assert outcome(duplicate) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
     else:
         assert policy.feed(records.socket(pid, other_fd)).status == "PASS"
 
@@ -2463,3 +2461,356 @@ def test_violation_sink_failure_cannot_return_a_policy_decision():
 
     with pytest.raises(Exception, match="violation sink unavailable"):
         policy.feed(record)
+
+
+@pytest.mark.parametrize(
+    ("syscall", "fd"),
+    [("read", 0), ("write", 4)],
+    ids=["reviewed-character-device", "reviewed-pipe"],
+)
+def test_reviewed_non_socket_io_does_not_poison_trace_integrity(syscall, fd):
+    policy = make_policy()
+    records = Records()
+
+    decision = policy.feed(records.io(COORDINATOR_PID, syscall, fd))
+
+    assert outcome(decision) == ("PASS", "OK")
+    assert policy.trace_integrity_error is None
+    assert policy.finalize(trace_integrity_ok=True).status == "PASS"
+
+
+def test_new_pipe_provenance_makes_raw_io_neutral():
+    policy = make_policy()
+    records = Records()
+    created = policy.feed(
+        records.make(
+            COORDINATOR_PID,
+            "pipe2",
+            transition={
+                "operation": "pipe",
+                "created_fds": [
+                    {
+                        "fd": 5,
+                        "provenance": {"kind": "pipe", "inode": 105},
+                    },
+                    {
+                        "fd": 6,
+                        "provenance": {"kind": "pipe", "inode": 105},
+                    },
+                ],
+                "cloexec": True,
+            },
+        )
+    )
+
+    read_decision = policy.feed(records.io(COORDINATOR_PID, "read", 5))
+    write_decision = policy.feed(records.io(COORDINATOR_PID, "write", 6))
+
+    assert outcome(created) == ("PASS", "OK")
+    assert outcome(read_decision) == ("PASS", "OK")
+    assert outcome(write_decision) == ("PASS", "OK")
+    assert policy.provenance.describe(COORDINATOR_PID, 5)["kind"] == "pipe"
+    assert policy.provenance.describe(COORDINATOR_PID, 6)["cloexec"] is True
+    assert policy.trace_integrity_error is None
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        {"kind": "path"},
+        {"kind": "pipe", "inode": 105},
+        {"kind": "character_device", "inode": 106},
+    ],
+    ids=["path", "pipe", "character-device"],
+)
+def test_reviewed_raw_fd_annotation_is_neutral_without_manifest_entry(provenance):
+    policy = make_policy()
+    records = Records()
+    record = records.io(COORDINATOR_PID, "write", 77)
+    record["fds"][0]["provenance"] = provenance
+
+    decision = policy.feed(record)
+
+    assert outcome(decision) == ("PASS", "OK")
+    assert policy.trace_integrity_error is None
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        {"kind": "unknown"},
+        {"kind": "path", "inode": 107},
+        {"kind": "pipe"},
+        {"kind": "character_device", "inode": -1},
+    ],
+    ids=["unknown-kind", "path-extra-field", "pipe-missing-inode", "negative-inode"],
+)
+def test_unreviewed_raw_fd_annotation_fails_trace_integrity(provenance):
+    policy = make_policy()
+    records = Records()
+    record = records.io(COORDINATOR_PID, "write", 77)
+    record["fds"][0]["provenance"] = provenance
+
+    decision = policy.feed(record)
+
+    assert outcome(decision) == ("PASS", "OK")
+    assert policy.trace_integrity_error == "UNKNOWN_FD_PROVENANCE"
+
+
+def test_normalized_external_path_raw_io_is_neutral_without_manifest_entry():
+    source = b"".join(
+        [
+            _trace_line(
+                'openat(AT_FDCWD, "/tmp/TASK6_SECRET", O_WRONLY)',
+                pid=COORDINATOR_PID,
+                result="77</tmp/TASK6_SECRET>",
+            ),
+            _trace_line(
+                "write(77</tmp/TASK6_SECRET>, 0x7fff0000, 0x4)",
+                pid=COORDINATOR_PID,
+                result="0x4",
+            ),
+        ]
+    )
+    normalized = normalize_bytes(source)
+    policy = make_policy()
+
+    decisions = [policy.feed(record) for record in normalized]
+
+    assert normalized[1]["fds"] == [{"fd": 77, "provenance": {"kind": "path"}}]
+    assert [outcome(decision) for decision in decisions] == [
+        ("PASS", "OK"),
+        ("PASS", "OK"),
+    ]
+    assert policy.trace_integrity_error is None
+
+
+@pytest.mark.parametrize(
+    ("syscall", "transition"),
+    [
+        (
+            "unshare",
+            {"operation": "unshare_files", "flags": ["CLONE_FILES"]},
+        ),
+        (
+            "close_range",
+            {
+                "operation": "close_range",
+                "first_fd": 100,
+                "last_fd": 100,
+                "flags": ["CLOSE_RANGE_UNSHARE"],
+            },
+        ),
+    ],
+    ids=["unshare", "close-range-unshare"],
+)
+def test_worker_loses_network_authority_after_fd_table_unshare(syscall, transition):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid, tx_fd, _ = registered_tx(policy, records, 0)
+    worker_tid = 1100
+    assert clone_worker(policy, records, root_pid, worker_tid).status == "PASS"
+
+    unshared = policy.feed(records.make(worker_tid, syscall, transition=transition))
+    outbound = policy.feed(
+        records.io(
+            worker_tid,
+            "sendto",
+            tx_fd,
+            address=("239.255.0.1", 26650),
+        )
+    )
+
+    assert outcome(unshared) == ("PASS", "OK")
+    assert outcome(outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+def test_root_close_range_cleanup_satisfies_participant_lifecycle():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid, bind_decision = bound_udp(
+        policy,
+        records,
+        0,
+        ("0.0.0.0", META_PORTS[0]),
+    )
+    assert bind_decision.status == "PASS"
+
+    close_decision = policy.feed(
+        records.make(
+            root_pid,
+            "close_range",
+            transition={
+                "operation": "close_range",
+                "first_fd": 7,
+                "last_fd": 7,
+                "flags": [],
+            },
+        )
+    )
+    root_exit = policy.feed(records.exit(root_pid))
+    end = policy.feed(records.marker("END"))
+
+    assert outcome(close_decision) == ("PASS", "OK")
+    assert outcome(root_exit) == ("PASS", "OK")
+    assert outcome(end) == ("PASS", "OK")
+    assert policy.provenance.describe(root_pid, 7) is None
+    assert policy.finalize(trace_integrity_ok=True).status == "PASS"
+
+
+def test_marker_metadata_cannot_suppress_a_decoded_ip_violation():
+    policy = make_policy()
+    records = Records()
+    record = records.socket(PARTICIPANT_PIDS[0], 7)
+    record["marker"] = {"phase": "BEGIN", "token": TOKEN}
+
+    decision = policy.feed(record)
+
+    assert outcome(decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert policy.trace_integrity_error == "INVALID_MARKER"
+    assert policy.journal.first_violation.reason == "UNEXPECTED_NETWORK_ATTEMPT"
+
+
+def test_repeated_port_zero_bind_poisons_tx_registration():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, socket_decision, first_bind = _start_tx_registration(policy, records)
+
+    repeated_bind = policy.feed(records.bind(pid, 17, "127.0.0.1", 0))
+    later = [
+        policy.feed(records.tx_socket_option(pid, 17, option, value, length))
+        for option, value, length in TX_SETUP_OPTIONS
+    ]
+    observed = policy.feed(
+        records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0])
+    )
+    outbound = policy.feed(
+        records.io(pid, "sendto", 17, address=("239.255.0.1", 26650))
+    )
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(first_bind) == ("PASS", "OK")
+    assert outcome(repeated_bind) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert all(
+        outcome(decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+        for decision in later
+    )
+    assert outcome(observed) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert outcome(outbound) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+def test_dup_cannot_interpose_during_tx_registration():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, socket_decision, bind_decision = _start_tx_registration(policy, records)
+
+    duplicate = policy.feed(
+        records.make(
+            pid,
+            "dup",
+            result=18,
+            transition={
+                "operation": "dup",
+                "source_fd": {"fd": 17},
+                "created_fd": {"fd": 18},
+            },
+        )
+    )
+    setup = [
+        policy.feed(records.tx_socket_option(pid, 17, option, value, length))
+        for option, value, length in TX_SETUP_OPTIONS
+    ]
+    observed = policy.feed(
+        records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0])
+    )
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(bind_decision) == ("PASS", "OK")
+    assert outcome(duplicate) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert all(
+        outcome(decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+        for decision in setup
+    )
+    assert outcome(observed) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+
+
+def test_incomplete_tx_registration_cannot_finalize_as_pass():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    pid, socket_decision, bind_decision = _start_tx_registration(policy, records)
+
+    close_decision = policy.feed(records.close(pid, 17))
+    assert policy.feed(records.exit(pid)).status == "PASS"
+    assert policy.feed(records.marker("END")).status == "PASS"
+
+    assert outcome(socket_decision) == ("PASS", "OK")
+    assert outcome(bind_decision) == ("PASS", "OK")
+    assert outcome(close_decision) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")
+    assert policy.finalize(trace_integrity_ok=True).status != "PASS"
+
+
+def _spawn_configured_root(policy, records, participant, *, parent_pid=COORDINATOR_PID):
+    return policy.feed(
+        records.make(
+            parent_pid,
+            "fork",
+            result=PARTICIPANT_PIDS[participant],
+            transition={
+                "operation": "fork",
+                "child_pid": PARTICIPANT_PIDS[participant],
+                "fd_table": "copied",
+            },
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "parent_pid",
+    [COORDINATOR_PID, 999],
+    ids=["coordinator-parent", "nonparticipant-launcher-parent"],
+)
+def test_configured_root_survives_observed_spawn_and_validated_exec_lifecycle(
+    parent_pid,
+):
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+
+    spawn = _spawn_configured_root(policy, records, 0, parent_pid=parent_pid)
+    exec_decision = policy.feed(
+        records.make(
+            PARTICIPANT_PIDS[0],
+            "execve",
+            transition={"operation": "exec", "cloexec_fds": "closed"},
+        )
+    )
+    socket_decision = policy.feed(records.socket(PARTICIPANT_PIDS[0], 7))
+
+    assert outcome(spawn) == ("PASS", "OK")
+    assert outcome(exec_decision) == ("PASS", "OK")
+    assert outcome(socket_decision) == ("PASS", "OK")
+
+
+def test_successful_worker_exec_revokes_shared_thread_authority():
+    policy = make_policy()
+    records = Records()
+    open_window(policy, records)
+    root_pid, _, _ = registered_tx(policy, records, 0)
+    worker_tid = 1100
+    assert clone_worker(policy, records, root_pid, worker_tid).status == "PASS"
+    exec_decision = policy.feed(
+        records.make(
+            worker_tid,
+            "execve",
+            transition={"operation": "exec", "cloexec_fds": "closed"},
+        )
+    )
+    after_exec = policy.feed(records.socket(worker_tid, 22))
+
+    assert outcome(exec_decision) == ("PASS", "OK")
+    assert outcome(after_exec) == ("FAIL", "UNEXPECTED_NETWORK_ATTEMPT")

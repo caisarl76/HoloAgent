@@ -393,6 +393,15 @@ def _raw_integer(value: str, code: str) -> int:
     return int(value, 0)
 
 
+def _raw_fd(value: str, code: str) -> dict[str, object]:
+    if _RAW_INTEGER.fullmatch(value) is not None:
+        return {"fd": int(value, 0)}
+    descriptor = _fd(value, code)
+    if "provenance" not in descriptor:
+        raise _fail(code)
+    return descriptor
+
+
 def _provenance(value: str) -> dict[str, object]:
     inode = re.fullmatch(r"(socket|pipe):\[([0-9]+)\]", value)
     if inode is not None:
@@ -400,6 +409,9 @@ def _provenance(value: str) -> dict[str, object]:
     anon = re.fullmatch(r"anon_inode:\[([A-Za-z0-9_-]+)\]", value)
     if anon is not None:
         return {"kind": "anon_inode", "type": anon.group(1)}
+    pipe = re.fullmatch(r"pipe:\[([0-9]+)\]", value)
+    if pipe is not None:
+        return {"kind": "pipe", "inode": int(pipe.group(1))}
     annotated_socket = re.fullmatch(r"([A-Za-z0-9/-]+):\[(.*)\]", value)
     if annotated_socket is not None:
         protocol, annotation = annotated_socket.groups()
@@ -913,14 +925,11 @@ def _raw_metadata(name: str, arguments: list[str]) -> dict[str, object]:
         raise _fail("raw-syscall-arity")
     for index, argument in enumerate(arguments):
         if index in fd_indexes:
-            _raw_integer(argument, "invalid-raw-fd")
+            _raw_fd(argument, "invalid-raw-fd")
         else:
             _raw_integer(argument, "invalid-raw-number")
     metadata: dict[str, object] = {
-        "fds": [
-            {"fd": _raw_integer(arguments[index], "invalid-raw-fd")}
-            for index in fd_indexes
-        ],
+        "fds": [_raw_fd(arguments[index], "invalid-raw-fd") for index in fd_indexes],
         "lengths": {
             length_key: _raw_integer(arguments[length_index], "invalid-raw-length")
         },
@@ -1062,6 +1071,8 @@ def _address_metadata(
 
 _TRANSITION_SYSCALLS = frozenset(
     {
+        "pipe",
+        "pipe2",
         "socket",
         "socketpair",
         "accept",
@@ -1122,7 +1133,29 @@ def _transition_metadata(
     name: str, arguments: list[str], result: dict[str, object]
 ) -> dict[str, object]:
     transition: dict[str, object] = {"operation": name}
-    if name == "socket":
+    if name in {"pipe", "pipe2"}:
+        _arity(arguments, 1 if name == "pipe" else 2, f"{name}-arity")
+        transition["operation"] = "pipe"
+        if name == "pipe2":
+            flags = _closed_flags(
+                arguments[1],
+                frozenset({"O_CLOEXEC", "O_NONBLOCK"}),
+                "unsupported-pipe2-flags",
+            )
+        else:
+            flags = []
+        transition["cloexec"] = "O_CLOEXEC" in flags
+        if _successful(result):
+            descriptors = [
+                _fd(value, f"{name}-fd")
+                for value in _vector(arguments[0], f"{name}-vector")
+            ]
+            if len(descriptors) != 2:
+                raise _fail(f"{name}-count")
+            transition["created_fds"] = descriptors
+        else:
+            _raw_integer(arguments[0], f"{name}-output-pointer")
+    elif name == "socket":
         _arity(arguments, 3, "socket-arity")
         transition.update(_socket_parameters(arguments))
         if _successful(result):

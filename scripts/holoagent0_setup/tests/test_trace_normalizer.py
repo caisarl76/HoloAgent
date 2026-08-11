@@ -988,3 +988,19 @@ def test_resource_bounds_are_enforced():
             max_pending_processes=1,
         )
     assert math.isfinite(float("1.0"))
+
+
+def test_pipe2_creation_retains_non_socket_provenance_for_policy_replay():
+    (record,) = normalize_bytes(
+        b"90    1700000080.000001 pipe2([5<pipe:[105]>, 6<pipe:[105]>], "
+        b"O_CLOEXEC) = 0 <0.000001>\n"
+    )
+
+    assert record["transition"] == {
+        "operation": "pipe",
+        "created_fds": [
+            {"fd": 5, "provenance": {"kind": "pipe", "inode": 105}},
+            {"fd": 6, "provenance": {"kind": "pipe", "inode": 105}},
+        ],
+        "cloexec": True,
+    }

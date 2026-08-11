@@ -677,9 +677,14 @@ class TracePolicy:
         return PolicyDecision("SKIPPED", "DEPENDENCY_NOT_AVAILABLE", None)
 ```
 
-Track socket creation, local binds, `getsockname`, connected and message
-peers, `dup*`, `fcntl(F_DUPFD*)`, fork/clone table semantics, thread-group
-semantics, exec, exit, close, decoded `SCM_RIGHTS`, and `pidfd_getfd`.
+Track pipe and socket creation, local binds, `getsockname`, connected and
+message peers, `dup*`, `fcntl(F_DUPFD*)`, fork/clone table semantics,
+thread-group semantics, exec, exit, close/`close_range`, decoded `SCM_RIGHTS`,
+and `pidfd_getfd`. Known non-socket I/O is neutral. Without a table entry, only
+the normalizer's closed `path`, nonnegative-inode `pipe`, and nonnegative-inode
+`character_device` annotation shapes are neutral; unannotated, malformed, or
+unknown FD provenance fails trace integrity and an unknown annotated socket also
+fails network policy.
 Classify TCP/DNS, host-namespace IP, non-loopback routes, any `pidfd_getfd`
 acquisition attempt, any decoded `SCM_RIGHTS` transfer, and any UDP operation
 outside the exact four identity/config-digest participant roots, their
@@ -723,7 +728,10 @@ the clone flags prove both the same thread group and the same FD table through
 `CLONE_THREAD|CLONE_FILES`. `fork`, `vfork`, and any `clone` missing
 either flag retain only their ordinary FD-provenance semantics; they receive no
 participant role. Exit removes the task/TID authority without granting it to a
-later PID reuse.
+later PID reuse. The externally journal-validated configured root remains the
+root across its observed spawn/exec lifecycle. A worker exec or successful
+`unshare(CLONE_FILES)`/`close_range(..., CLOSE_RANGE_UNSHARE)` revokes worker
+network authority while lifecycle tracking continues until exit.
 
 This behavior is specific to the approved pinned configuration. CycloneDDS
 0.10.5 creates one port-zero transmit connection per selected interface, uses
@@ -761,9 +769,9 @@ Its 44-record input/expected SHA-256 values are
 `55bf3b4a3bd38abd2c097f61ac722d46f480923b9f9ba1325ba4befc04acba5a` and
 `571fbf7932295a8476b5c03cf94b39c4a0be6ba05b464e7c93f0c6b08944c41d`.
 The expected NDJSON is the target contract and retains the decoded `value` on
-all six TX setup-option records. Manifest closure/digests pass at this RED
-checkpoint, but exact source-to-expected normalization must fail until Task 6
-production implements that value retention.
+all six TX setup-option records. Task 6 production retains those values, so
+exact source-to-expected normalization and manifest closure/digests pass
+together.
 Reaping is coordinator-ledger evidence because the closed normalizer has no
 wait/reap transition; the golden must not invent one.
 The reviewed Task 6 p0/p1/p2/p3 config hashes are

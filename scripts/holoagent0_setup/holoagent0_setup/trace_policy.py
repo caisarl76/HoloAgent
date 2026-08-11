@@ -16,6 +16,7 @@ _PARTICIPANT_INDEXES = frozenset(range(4))
 _LOCAL_ADDRESSES = frozenset({"0.0.0.0", "127.0.0.1"})
 _NEUTRAL_SOCKET_DOMAINS = frozenset({"AF_UNIX", "AF_NETLINK"})
 _REVIEWED_INHERITED_FD_KINDS = frozenset({"character_device", "pipe", "regular_file"})
+_REVIEWED_RAW_FD_KINDS = frozenset({"character_device", "path", "pipe"})
 _SPDP_ADDRESS = "239.255.0.1"
 _SPDP_PORT = 26650
 _DATA_MULTICAST_PORT = 26651
@@ -190,6 +191,22 @@ class FDProvenance:
             return None
         return entry.description
 
+    def description(self, pid: int, fd: int) -> _OpenDescription | None:
+        entry = self._entry(pid, fd)
+        return None if entry is None else entry.description
+
+    def descriptions_in_range(
+        self, pid: int, first_fd: int, last_fd: int
+    ) -> tuple[_OpenDescription, ...]:
+        table = self._tables.get(pid, {})
+        return tuple(
+            {
+                id(entry.description): entry.description
+                for fd, entry in table.items()
+                if first_fd <= fd <= last_fd
+            }.values()
+        )
+
     def descriptions_for_pid(self, pid: int) -> tuple[_OpenDescription, ...]:
         table = self._tables.get(pid, {})
         return tuple(
@@ -228,7 +245,9 @@ class FDProvenance:
         if not isinstance(operation, str):
             return
 
-        if operation == "socket":
+        if operation == "pipe":
+            self._create_pipe(pid, transition, record)
+        elif operation == "socket":
             self._create_socket(pid, transition, record)
         elif operation == "socketpair":
             self._create_socketpair(pid, transition, record)
@@ -276,6 +295,39 @@ class FDProvenance:
             ),
             cloexec="SOCK_CLOEXEC" in type_items,
         )
+
+    def _create_pipe(
+        self, pid: int, transition: Mapping[str, object], record: CanonicalRecord
+    ) -> None:
+        created = transition.get("created_fds")
+        cloexec = transition.get("cloexec")
+        if (
+            not _succeeded(record)
+            or not isinstance(created, list)
+            or len(created) != 2
+            or type(cloexec) is not bool
+        ):
+            return
+        table = self._table(pid)
+        for descriptor in created:
+            fd = _fd_number(descriptor)
+            provenance = (
+                descriptor.get("provenance")
+                if isinstance(descriptor, Mapping)
+                else None
+            )
+            inode = (
+                _exact_int(provenance.get("inode"))
+                if isinstance(provenance, Mapping) and provenance.get("kind") == "pipe"
+                else None
+            )
+            if fd is None or fd < 0 or inode is None or inode < 0:
+                self._latch_integrity("UNKNOWN_FD_PROVENANCE")
+                continue
+            table[fd] = _FdEntry(
+                description=_OpenDescription(kind="pipe", inode=inode),
+                cloexec=cloexec,
+            )
 
     def _create_socketpair(
         self, pid: int, transition: Mapping[str, object], record: CanonicalRecord
@@ -620,6 +672,9 @@ class TracePolicy:
             for pid, participant in self._participants.items()
             if self._configuration_valid
         }
+        self._configured_root_roles = {
+            pid: index for index, pid in self._root_pid_by_index.items()
+        }
         self._task_roles = {
             pid: participant["index"]
             for pid, participant in self._participants.items()
@@ -642,10 +697,15 @@ class TracePolicy:
             marker_reason = self.markers.consume(record)
             if marker_reason is not None:
                 self._latch_integrity(marker_reason)
-            elif isinstance(marker, Mapping) and marker.get("phase") == "END":
-                if not self._lifecycle_closed():
+            if record.get("kind") == "syscall" and record.get("syscall") == "prctl":
+                if (
+                    marker_reason is None
+                    and isinstance(marker, Mapping)
+                    and marker.get("phase") == "END"
+                    and not self._lifecycle_closed()
+                ):
                     self._latch_integrity("INCOMPLETE_PARTICIPANT_LIFECYCLE")
-            return PolicyDecision("PASS", "OK", None)
+                return PolicyDecision("PASS", "OK", None)
 
         pid = _exact_int(record.get("pid"))
         if record.get("kind") == "exit":
@@ -656,9 +716,10 @@ class TracePolicy:
             return PolicyDecision("PASS", "OK", None)
 
         pre_description = self._description_for_record(pid, record)
+        close_range_descriptions = self._close_range_descriptions(pid, record)
         self.provenance.apply(record)
         self._sync_provenance_integrity()
-        reason = self._classify(record, pre_description)
+        reason = self._classify(record, pre_description, close_range_descriptions)
         transition = record.get("transition")
         if (
             isinstance(transition, Mapping)
@@ -666,6 +727,9 @@ class TracePolicy:
             and pid is not None
         ):
             self._handle_close(pid, pre_description, record)
+        if close_range_descriptions and pid is not None:
+            for description in close_range_descriptions:
+                self._handle_close(pid, description, record)
         if reason is None:
             return PolicyDecision("PASS", "OK", None)
         violation = PolicyViolation(
@@ -750,6 +814,29 @@ class TracePolicy:
                 return self.provenance.socket_description(pid, fd)
         return None
 
+    def _close_range_descriptions(
+        self, pid: int | None, record: CanonicalRecord
+    ) -> tuple[_OpenDescription, ...]:
+        if pid is None or not _succeeded(record):
+            return ()
+        transition = record.get("transition")
+        if (
+            not isinstance(transition, Mapping)
+            or transition.get("operation") != "close_range"
+        ):
+            return ()
+        flags = transition.get("flags")
+        first_fd = _exact_int(transition.get("first_fd"))
+        last_fd = _exact_int(transition.get("last_fd"))
+        if (
+            not isinstance(flags, list)
+            or "CLOSE_RANGE_CLOEXEC" in flags
+            or first_fd is None
+            or last_fd is None
+        ):
+            return ()
+        return self.provenance.descriptions_in_range(pid, first_fd, last_fd)
+
     def _activate_socket(self, participant: int, description: _OpenDescription) -> None:
         identity = id(description)
         self._active_participants.add(participant)
@@ -763,6 +850,11 @@ class TracePolicy:
             return
         child = _exact_int(transition.get("child_pid"))
         if child is None or child <= 0:
+            return
+        configured_root_role = self._configured_root_roles.get(child)
+        if configured_root_role is not None:
+            self._task_roles[child] = configured_root_role
+            self._live_workers.pop(child, None)
             return
         self._task_roles.pop(child, None)
         self._live_workers.pop(child, None)
@@ -802,11 +894,12 @@ class TracePolicy:
                 self._registered_endpoints.pop(registration.endpoint[1], None)
 
     def _handle_exit(self, pid: int) -> None:
-        participant = self._task_roles.pop(pid, None)
-        if participant is None:
+        participant = self._live_workers.pop(pid, None)
+        self._task_roles.pop(pid, None)
+        if participant is not None:
             return
-        if pid in self._live_workers:
-            self._live_workers.pop(pid, None)
+        participant = self._configured_root_roles.get(pid)
+        if participant is None:
             return
         if pid != self._root_pid_by_index.get(participant):
             return
@@ -819,6 +912,11 @@ class TracePolicy:
         self._exited_roots.add(participant)
 
     def _lifecycle_closed(self) -> bool:
+        if any(
+            registration.endpoint is None
+            for registration in self._tx_by_participant.values()
+        ):
+            return False
         for participant in self._active_participants:
             if participant not in self._exited_roots:
                 return False
@@ -839,6 +937,7 @@ class TracePolicy:
         self,
         record: CanonicalRecord,
         pre_description: _OpenDescription | None,
+        close_range_descriptions: tuple[_OpenDescription, ...],
     ) -> str | None:
         if record.get("kind") != "syscall":
             return None
@@ -864,6 +963,20 @@ class TracePolicy:
         pid = _exact_int(record.get("pid"))
         if pid is None:
             return None
+        interposition = self._classify_tx_interposition(
+            operation, pre_description, close_range_descriptions
+        )
+        if interposition is not None:
+            return interposition
+        if _succeeded(record):
+            if operation == "exec":
+                self._revoke_worker_authority(pid)
+            elif operation == "unshare_files":
+                self._revoke_worker_authority(pid)
+            elif operation == "close_range" and isinstance(transition, Mapping):
+                flags = transition.get("flags")
+                if isinstance(flags, list) and "CLOSE_RANGE_UNSHARE" in flags:
+                    self._revoke_worker_authority(pid)
         if operation in {"fork", "vfork", "clone"} and isinstance(transition, Mapping):
             self._apply_clone_authority(pid, transition, record)
             return None
@@ -891,6 +1004,39 @@ class TracePolicy:
             "copy_file_range",
         }:
             return self._classify_raw_io(pid, str(syscall), record)
+        return None
+
+    def _revoke_worker_authority(self, pid: int) -> None:
+        if pid in self._live_workers:
+            self._task_roles.pop(pid, None)
+
+    def _classify_tx_interposition(
+        self,
+        operation: object,
+        pre_description: _OpenDescription | None,
+        close_range_descriptions: tuple[_OpenDescription, ...],
+    ) -> str | None:
+        if operation not in {
+            "close",
+            "close_range",
+            "dup",
+            "dup2",
+            "dup3",
+            "fcntl_dup",
+            "fcntl_getfd",
+            "fcntl_getfl",
+            "fcntl_setfd",
+            "fcntl_setfl",
+        }:
+            return None
+        descriptions = close_range_descriptions or (
+            () if pre_description is None else (pre_description,)
+        )
+        for description in descriptions:
+            registration = self._tx_by_description.get(id(description))
+            if registration is not None and registration.endpoint is None:
+                registration.poisoned = True
+                return "UNEXPECTED_NETWORK_ATTEMPT"
         return None
 
     def _classify_socket_creation(
@@ -1007,6 +1153,9 @@ class TracePolicy:
         if endpoint == ("127.0.0.1", 0):
             existing = self._tx_by_participant.get(participant)
             if existing is not None and existing.description is not description:
+                return "UNEXPECTED_NETWORK_ATTEMPT"
+            if existing is not None:
+                existing.poisoned = True
                 return "UNEXPECTED_NETWORK_ATTEMPT"
             if _succeeded(record) and existing is None:
                 registration = _TxRegistration(participant, description, fd)
@@ -1175,14 +1324,16 @@ class TracePolicy:
         directions = _raw_directions(syscall, len(fds))
         for fd_value, direction in zip(fds, directions):
             fd = _fd_number(fd_value)
-            description = (
-                None if fd is None else self.provenance.socket_description(pid, fd)
-            )
+            description = None if fd is None else self.provenance.description(pid, fd)
             if description is None:
+                if _reviewed_raw_nonsocket_annotation(fd_value):
+                    continue
                 if _fd_is_socket(fd_value):
                     self._latch_integrity("UNKNOWN_FD_PROVENANCE")
                     return "UNEXPECTED_NETWORK_ATTEMPT"
                 self._latch_integrity("UNKNOWN_FD_PROVENANCE")
+                continue
+            if description.kind != "socket":
                 continue
             if description.domain in _NEUTRAL_SOCKET_DOMAINS:
                 continue
@@ -1391,6 +1542,21 @@ def _fd_is_socket(value: object) -> bool:
         return False
     provenance = value.get("provenance")
     return isinstance(provenance, Mapping) and provenance.get("kind") == "socket"
+
+
+def _reviewed_raw_nonsocket_annotation(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    provenance = value.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    kind = provenance.get("kind")
+    if kind not in _REVIEWED_RAW_FD_KINDS:
+        return False
+    if kind == "path":
+        return set(provenance) == {"kind"}
+    inode = _exact_int(provenance.get("inode"))
+    return set(provenance) == {"kind", "inode"} and inode is not None and inode >= 0
 
 
 def _succeeded(record: CanonicalRecord) -> bool:
