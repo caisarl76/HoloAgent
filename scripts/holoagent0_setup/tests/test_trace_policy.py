@@ -860,6 +860,7 @@ def test_runtime_contract_failed_reviewed_option_retry_can_register(stage):
     observed = policy.feed(
         records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0])
     )
+    sent = policy.feed(records.io(pid, "sendto", 17, address=("239.255.0.1", 26650)))
 
     assert outcome(socket_decision) == ("PASS", "OK")
     assert [outcome(decision) for decision in prefix_decisions] == [
@@ -870,6 +871,7 @@ def test_runtime_contract_failed_reviewed_option_retry_can_register(stage):
         3 - stage
     )
     assert outcome(observed) == ("PASS", "OK")
+    assert outcome(sent) == ("PASS", "OK")
 
 
 def test_runtime_contract_failed_future_reviewed_option_is_neutral_and_no_advance():
@@ -889,11 +891,13 @@ def test_runtime_contract_failed_future_reviewed_option_is_neutral_and_no_advanc
     observed = policy.feed(
         records.getsockname(pid, 17, "127.0.0.1", EPHEMERAL_PORTS[0])
     )
+    sent = policy.feed(records.io(pid, "sendto", 17, address=("239.255.0.1", 26650)))
 
     assert outcome(socket_decision) == ("PASS", "OK")
     assert outcome(failed_future) == ("PASS", "OK")
     assert [outcome(decision) for decision in successful] == [("PASS", "OK")] * 3
     assert outcome(observed) == ("PASS", "OK")
+    assert outcome(sent) == ("PASS", "OK")
 
 
 @pytest.mark.parametrize(
