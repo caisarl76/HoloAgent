@@ -7,12 +7,20 @@ import shutil
 import pytest
 
 from holoagent0_setup.contract import ContractError, ContractLoadError, ContractSet
+from holoagent0_setup.atomic_io import canonical_json_bytes
 from holoagent0_setup.result_policy import ResultPolicy, ResultPolicyError
 
 
 PACKAGE_ROOT = Path(__file__).parents[1]
 CONTRACT_ROOT = PACKAGE_ROOT
 SHA256 = "a" * 64
+EVIDENCE_IDENTITY = {
+    "pid": 801,
+    "pgid": 801,
+    "start_time": 8010,
+    "executable_path": "/bin/true",
+    "executable_sha256": f"{801:064x}",
+}
 
 
 def _digest(path: Path) -> str:
@@ -143,6 +151,120 @@ def _gate(gate_id: str, role: str) -> dict[str, object]:
     }
 
 
+def _bootstrap_descriptor(artifact: dict[str, object]) -> dict[str, object]:
+    ready_request = {
+        "type": "SIGNAL_READY",
+        "run_nonce": "c" * 64,
+        "sequence": 1,
+        "identity": copy.deepcopy(EVIDENCE_IDENTITY),
+        "blocked_signals": ["HUP", "INT", "TERM"],
+        "dispositions": {"HUP": True, "INT": True, "TERM": True},
+    }
+    ready_sha256 = hashlib.sha256(canonical_json_bytes(ready_request)).hexdigest()
+    accepted_sha256 = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "type": "SIGNAL_READY_ACCEPTED",
+                "run_nonce": "c" * 64,
+                "identity": copy.deepcopy(EVIDENCE_IDENTITY),
+                "request_sequence": 1,
+                "request_sha256": ready_sha256,
+            }
+        )
+    ).hexdigest()
+    return {
+        **copy.deepcopy(artifact),
+        "terminal_launch_state": "COORDINATOR_LAUNCH_COMMITTED",
+        "coordinator_launch_committed": True,
+        "first_signal": None,
+        "handoff": {
+            "event_sequence": [
+                {"sequence": 0, "state": "AWAITING_READY"},
+                {"sequence": 1, "state": "AWAITING_ACCEPTANCE"},
+                {"sequence": 2, "state": "READY"},
+            ],
+            "terminal_state": "READY",
+            "signal_ready_identity": copy.deepcopy(EVIDENCE_IDENTITY),
+            "signal_ready_sequence": 1,
+            "signal_ready_sha256": ready_sha256,
+            "signal_ready_accepted_sequence": 1,
+            "signal_ready_accepted_sha256": accepted_sha256,
+            "inherited_mask": ["HUP", "INT", "TERM"],
+            "unblocked_mask": ["HUP", "INT", "TERM"],
+            "pending_signal": None,
+            "acceptance_count": 1,
+            "forward_target_pgid": None,
+            "forward_count": 0,
+            "unblock_trace_record_index": 0,
+            "first_functional_trace_record_index": 1,
+        },
+        "toolchain": {
+            "expected": [{"name": "strace_version", "value": "6.6"}],
+            "observed": [{"name": "strace_version", "value": "6.6"}],
+        },
+        "initial_fd_manifest": [],
+        "final_fd_manifest": [],
+        "sanitation_actions": [],
+        "rebinding_actions": [],
+        "live_fixture_passed": True,
+    }
+
+
+def _host_descriptor(artifact: dict[str, object]) -> dict[str, object]:
+    return {
+        **copy.deepcopy(artifact),
+        "state": "OBSERVED",
+        "collector_identity": copy.deepcopy(EVIDENCE_IDENTITY),
+        "network_namespace_inode": 81,
+        "process_count": 1,
+        "service_count": 0,
+        "listener_count": 0,
+        "internet_socket_attempt_count": 0,
+        "observation_sha256": SHA256,
+        "trusted_inspection": {
+            "gateway_status_command": [
+                "/opt/openclaw/bin/openclaw",
+                "gateway",
+                "status",
+                "--deep",
+                "--no-probe",
+                "--json",
+            ],
+            "gateway_status_exit": 0,
+            "gateway_status_sha256": SHA256,
+            "gateway_status_state": "INACTIVE",
+            "service_definitions": [],
+            "listener_command": ["/usr/bin/ss", "-H", "-ltnp"],
+            "listener_inventory": [],
+        },
+        "cause_gate": None,
+        "reason": None,
+    }
+
+
+def _refresh_offline_bundle(
+    value: dict[str, object], *, refresh_ledger_state: bool = True
+) -> None:
+    if refresh_ledger_state:
+        value["offline_evidence"]["ledger_chain_manifest"][
+            "accepted_action_state_sha256"
+        ] = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "gates": value["gates"][:24],
+                    "semantic_dds_window": value["offline_evidence"][
+                        "semantic_dds_window"
+                    ],
+                }
+            )
+        ).hexdigest()
+    descriptor_tree = copy.deepcopy(value["offline_evidence"])
+    descriptor_tree.pop("bundle_sha256", None)
+    bundle_sha256 = hashlib.sha256(canonical_json_bytes(descriptor_tree)).hexdigest()
+    value["offline_evidence"]["bundle_sha256"] = bundle_sha256
+    value["offline_evidence_bundle_sha256"] = bundle_sha256
+
+
 def make_pass_result(mode: str) -> dict[str, object]:
     invocation_role = "parent" if mode == "workstation_mujoco" else "standalone"
     value: dict[str, object] = {
@@ -212,19 +334,58 @@ def make_pass_result(mode: str) -> dict[str, object]:
         artifact = {"relative_path": "evidence/item.json", "sha256": SHA256, "size": 1}
         value["offline_evidence_bundle_sha256"] = SHA256
         value["offline_evidence"] = {
-            "trace": copy.deepcopy(artifact),
-            "bootstrap_report": copy.deepcopy(artifact),
-            "ledger_chain_manifest": copy.deepcopy(artifact),
-            "ownership_journal": copy.deepcopy(artifact),
-            "violation_journal": copy.deepcopy(artifact),
-            "host_observer_pre": copy.deepcopy(artifact),
-            "host_observer_post": copy.deepcopy(artifact),
-            "semantic_dds_window": "NOT_ENTERED",
-            "dds_begin_record_index": None,
-            "dds_end_record_index": None,
+            "trace": {
+                **copy.deepcopy(artifact),
+                "trace_state": "FULL",
+                "serialized_record_count": 3,
+                "tracee_count": 2,
+                "tracer_identity": copy.deepcopy(EVIDENCE_IDENTITY),
+                "normalizer_identity": copy.deepcopy(EVIDENCE_IDENTITY),
+                "tracer_exit_code": 0,
+                "normalizer_exit_code": 0,
+                "tool_policy_row_sha256": SHA256,
+                "compatibility_fixture_passed": True,
+                "not_started_reason": None,
+            },
+            "bootstrap_report": _bootstrap_descriptor(artifact),
+            "ledger_chain_manifest": {
+                **copy.deepcopy(artifact),
+                "accepted_generation": 1,
+                "accepted_sha256": SHA256,
+                "immutable_generation_count": 2,
+                "accepted_action_state_sha256": SHA256,
+            },
+            "ownership_journal": {
+                **copy.deepcopy(artifact),
+                "record_count": 0,
+                "head_record_sha256": None,
+            },
+            "violation_journal": {
+                **copy.deepcopy(artifact),
+                "violation_count": 0,
+                "head_record_sha256": None,
+            },
+            "host_observer_pre": _host_descriptor(artifact),
+            "host_observer_post": _host_descriptor(artifact),
+            "semantic_dds_window": "CLOSED",
+            "dds_begin_record_index": 0,
+            "dds_end_record_index": 2,
             "marker_token": "holoagent0-dds-window-v1",
             "bundle_sha256": SHA256,
         }
+        value["offline_evidence"]["ledger_chain_manifest"][
+            "accepted_action_state_sha256"
+        ] = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "gates": value["gates"][:24],
+                    "semantic_dds_window": value["offline_evidence"][
+                        "semantic_dds_window"
+                    ],
+                }
+            )
+        ).hexdigest()
+        _refresh_offline_bundle(value)
     elif mode == "workstation_mujoco":
         value["offline_reference_evidence_bundle_sha256"] = SHA256
     else:
@@ -352,6 +513,347 @@ def test_offline_bundle_digest_must_bind_the_descriptor_set(contract: ContractSe
     assert not contract.validate_result(value).ok
 
 
+def test_offline_evidence_rejects_generic_record_count_and_invalid_trace_branch(
+    contract: ContractSet,
+):
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"]["bootstrap_report"]["record_count"] = 0
+    assert not contract.validate_result(value).ok
+
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"]["trace"]["tracer_exit_code"] = None
+    _refresh_offline_bundle(value)
+    assert not contract.validate_result(value).ok
+
+
+def test_offline_evidence_cross_field_and_bundle_bindings_are_enforced(
+    contract: ContractSet,
+):
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"]["ledger_chain_manifest"]["immutable_generation_count"] = 7
+    assert not contract.validate_result(value).ok
+
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"]["host_observer_post"]["network_namespace_inode"] = 82
+    assert not contract.validate_result(value).ok
+
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"]["bootstrap_report"]["size"] = 2
+    assert not contract.validate_result(value).ok
+
+
+def test_offline_finalizer_gates_are_bound_to_evidence_state(contract: ContractSet):
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"]["violation_journal"]["violation_count"] = 1
+    value["offline_evidence"]["violation_journal"]["head_record_sha256"] = SHA256
+    _refresh_offline_bundle(value)
+    decision = contract.validate_result(value)
+    assert not decision.ok
+    assert any("network_policy" in error for error in decision.errors)
+
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"]["trace"]["tracer_exit_code"] = 42
+    _refresh_offline_bundle(value)
+    decision = contract.validate_result(value)
+    assert not decision.ok
+    assert any("trace_integrity" in error for error in decision.errors)
+
+
+def test_truthful_started_trace_integrity_failure_is_schema_valid(
+    contract: ContractSet,
+):
+    value = make_pass_result("workstation_offline")
+    trace = next(
+        gate for gate in value["gates"] if gate["id"] == "offline.trace_integrity"
+    )
+    trace.update(status="FAIL", reason="TRACE_INCOMPLETE")
+    network = next(
+        gate for gate in value["gates"] if gate["id"] == "offline.network_policy"
+    )
+    network.update(status="SKIPPED", reason="DEPENDENCY_NOT_AVAILABLE")
+    decision = ResultPolicy(contract).decide("workstation_offline", value["gates"])
+    value.update(
+        label=decision.label,
+        status=decision.status,
+        exit_class=decision.exit_class,
+        process_exit_code=decision.exit_code,
+        primary_blocking_gate=decision.primary,
+        blocking_gates=list(decision.blocking_gates),
+        qualifications=list(decision.qualifications),
+    )
+    _refresh_offline_bundle(value)
+
+    validation = contract.validate_result(value)
+    assert validation.ok, validation.errors
+
+
+def test_signal_acceptance_sequence_must_bind_the_ready_request(
+    contract: ContractSet,
+):
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"]["bootstrap_report"]["handoff"][
+        "signal_ready_accepted_sequence"
+    ] = 999
+    _refresh_offline_bundle(value)
+
+    decision = contract.validate_result(value)
+    assert not decision.ok
+    assert any("handoff" in error or "sequence" in error for error in decision.errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("gateway_status_command", ["/bin/false", "--json"]),
+        ("gateway_status_exit", 1),
+        ("gateway_status_state", "ACTIVE"),
+        ("service_definitions", ["z", "a"]),
+        ("listener_command", ["/usr/bin/ss", "-ltn"]),
+        ("listener_inventory", ["unexpected"]),
+    ],
+)
+def test_result_contract_semantically_binds_trusted_host_inspection(
+    contract: ContractSet, field, replacement
+):
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"]["host_observer_pre"]["trusted_inspection"][field] = (
+        replacement
+    )
+    _refresh_offline_bundle(value)
+
+    decision = contract.validate_result(value)
+
+    assert not decision.ok
+    assert any(
+        "inspection" in error or "listener" in error for error in decision.errors
+    )
+
+
+def test_ready_handoff_allows_immediate_post_unblock_interruption(
+    contract: ContractSet,
+):
+    value = make_pass_result("workstation_offline")
+    handoff = value["offline_evidence"]["bootstrap_report"]["handoff"]
+    handoff.update(
+        pending_signal="TERM",
+        forward_target_pgid=EVIDENCE_IDENTITY["pgid"],
+        forward_count=1,
+        first_functional_trace_record_index=None,
+    )
+    _refresh_offline_bundle(value)
+
+    decision = contract.validate_result(value)
+
+    assert decision.ok, decision.errors
+
+
+def test_ready_handoff_allows_bound_preacceptance_pending_forward(
+    contract: ContractSet,
+):
+    value = make_pass_result("workstation_offline")
+    handoff = value["offline_evidence"]["bootstrap_report"]["handoff"]
+    handoff.update(
+        event_sequence=[
+            {"sequence": 0, "state": "AWAITING_READY"},
+            {"sequence": 1, "state": "AWAITING_ACCEPTANCE"},
+            {"sequence": 2, "state": "PENDING_FORWARD"},
+            {"sequence": 3, "state": "READY"},
+        ],
+        pending_signal="TERM",
+        forward_target_pgid=EVIDENCE_IDENTITY["pgid"],
+        forward_count=1,
+        first_functional_trace_record_index=None,
+    )
+    _refresh_offline_bundle(value)
+
+    decision = contract.validate_result(value)
+
+    assert decision.ok, decision.errors
+
+
+def test_ready_handoff_rejects_noncanonical_event_order(contract: ContractSet):
+    value = make_pass_result("workstation_offline")
+    handoff = value["offline_evidence"]["bootstrap_report"]["handoff"]
+    handoff["event_sequence"] = [
+        {"sequence": 0, "state": "AWAITING_ACCEPTANCE"},
+        {"sequence": 1, "state": "AWAITING_READY"},
+        {"sequence": 2, "state": "READY"},
+    ]
+    _refresh_offline_bundle(value)
+
+    decision = contract.validate_result(value)
+
+    assert not decision.ok
+    assert any("handoff" in error or "event" in error for error in decision.errors)
+
+
+def test_failed_unaccepted_handoff_rejects_partial_ready_request(
+    contract: ContractSet,
+):
+    value = make_pass_result("workstation_offline")
+    handoff = value["offline_evidence"]["bootstrap_report"]["handoff"]
+    handoff.update(
+        event_sequence=[
+            {"sequence": 0, "state": "AWAITING_READY"},
+            {"sequence": 1, "state": "FAILED"},
+        ],
+        terminal_state="FAILED",
+        signal_ready_sequence=None,
+        signal_ready_sha256=None,
+        signal_ready_accepted_sequence=None,
+        signal_ready_accepted_sha256=None,
+        unblocked_mask=[],
+        acceptance_count=0,
+        unblock_trace_record_index=None,
+        first_functional_trace_record_index=None,
+    )
+    _refresh_offline_bundle(value)
+
+    decision = contract.validate_result(value)
+
+    assert not decision.ok
+    assert any("handoff" in error or "request" in error for error in decision.errors)
+
+
+def test_failed_accepted_handoff_requires_bound_unblock_and_forward_facts(
+    contract: ContractSet,
+):
+    value = make_pass_result("workstation_offline")
+    handoff = value["offline_evidence"]["bootstrap_report"]["handoff"]
+    handoff.update(
+        event_sequence=[
+            {"sequence": 0, "state": "AWAITING_READY"},
+            {"sequence": 1, "state": "AWAITING_ACCEPTANCE"},
+            {"sequence": 2, "state": "FAILED"},
+        ],
+        terminal_state="FAILED",
+        pending_signal="TERM",
+        forward_target_pgid=999,
+        forward_count=1,
+        first_functional_trace_record_index=None,
+    )
+    _refresh_offline_bundle(value)
+
+    decision = contract.validate_result(value)
+
+    assert not decision.ok
+    assert any("handoff" in error or "forward" in error for error in decision.errors)
+
+
+def test_contract_exposes_closed_network_violation_reason_set(contract: ContractSet):
+    reasons = contract.allowed_gate_reasons("offline.network_policy", "FAIL")
+
+    assert "UNEXPECTED_NETWORK_ATTEMPT" in reasons
+    assert "PROHIBITED_FD_TRANSFER" in reasons
+    assert "OK" not in reasons
+    with pytest.raises(ContractLoadError, match="closed policy"):
+        contract.allowed_gate_reasons("offline.network_policy", "NOT_RUN")
+
+
+def test_result_action_gates_are_bound_to_the_accepted_ledger_state(
+    contract: ContractSet,
+):
+    value = make_pass_result("workstation_offline")
+    accepted_state = {
+        "gates": value["gates"][:24],
+        "semantic_dds_window": value["offline_evidence"]["semantic_dds_window"],
+    }
+    value["offline_evidence"]["ledger_chain_manifest"][
+        "accepted_action_state_sha256"
+    ] = hashlib.sha256(canonical_json_bytes(accepted_state)).hexdigest()
+    _refresh_offline_bundle(value)
+    assert contract.validate_result(value).ok
+
+    value["gates"][0]["log_paths"] = ["tampered-after-ledger.log"]
+    _refresh_offline_bundle(value, refresh_ledger_state=False)
+    decision = contract.validate_result(value)
+    assert not decision.ok
+    assert any("ledger" in error or "accepted" in error for error in decision.errors)
+
+
+def test_preflight_pass_then_post_observer_failure_is_truthfully_representable(
+    contract: ContractSet,
+):
+    value = make_pass_result("workstation_offline")
+    postflight = next(
+        gate for gate in value["gates"] if gate["id"] == "safety.workstation_postflight"
+    )
+    postflight.update(status="FAIL", reason="POSTFLIGHT_FAILED")
+    value["offline_evidence"]["host_observer_post"].update(
+        state="NOT_RUN",
+        collector_identity=None,
+        network_namespace_inode=None,
+        process_count=0,
+        service_count=0,
+        listener_count=0,
+        internet_socket_attempt_count=0,
+        trusted_inspection=None,
+        cause_gate="safety.workstation_postflight",
+        reason="POSTFLIGHT_FAILED",
+    )
+    decision = ResultPolicy(contract).decide("workstation_offline", value["gates"])
+    value.update(
+        label=decision.label,
+        status=decision.status,
+        exit_class=decision.exit_class,
+        process_exit_code=decision.exit_code,
+        primary_blocking_gate=decision.primary,
+        blocking_gates=list(decision.blocking_gates),
+        qualifications=list(decision.qualifications),
+    )
+    value["offline_evidence"]["ledger_chain_manifest"][
+        "accepted_action_state_sha256"
+    ] = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "gates": value["gates"][:24],
+                "semantic_dds_window": value["offline_evidence"]["semantic_dds_window"],
+            }
+        )
+    ).hexdigest()
+    _refresh_offline_bundle(value)
+
+    validation = contract.validate_result(value)
+    assert validation.ok, validation.errors
+
+
+def test_bootstrap_trace_observer_and_dds_states_are_cross_bound(
+    contract: ContractSet,
+):
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"]["bootstrap_report"]["terminal_launch_state"] = (
+        "NOT_STARTED_BOOTSTRAP_FAILURE"
+    )
+    value["offline_evidence"]["bootstrap_report"]["coordinator_launch_committed"] = (
+        False
+    )
+    _refresh_offline_bundle(value)
+    assert not contract.validate_result(value).ok
+
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"]["trace"]["trace_state"] = "FINALIZER_ONLY"
+    _refresh_offline_bundle(value)
+    decision = contract.validate_result(value)
+    assert not decision.ok
+    assert any(
+        "FINALIZER_ONLY" in error or "semantic_dds_window" in error
+        for error in decision.errors
+    )
+
+
+def test_semantic_query_pass_requires_closed_dds_window(contract: ContractSet):
+    value = make_pass_result("workstation_offline")
+    value["offline_evidence"].update(
+        semantic_dds_window="NOT_ENTERED",
+        dds_begin_record_index=None,
+        dds_end_record_index=None,
+    )
+    _refresh_offline_bundle(value)
+    decision = contract.validate_result(value)
+    assert not decision.ok
+    assert any("semantic.fixture_query" in error for error in decision.errors)
+
+
 def test_pc2_rejects_workstation_only_digest_fields(contract: ContractSet):
     value = make_pass_result("pc2_inventory")
     value["trace_tool_policy_sha256"] = SHA256
@@ -442,6 +944,26 @@ def test_each_profile_accepts_a_closed_source_failure(contract: ContractSet, mod
         primary_blocking_gate="source.repository",
         blocking_gates=["source.repository"],
     )
+    if mode == "workstation_offline":
+        value["offline_evidence"].update(
+            semantic_dds_window="NOT_ENTERED",
+            dds_begin_record_index=None,
+            dds_end_record_index=None,
+        )
+        for field in ("host_observer_pre", "host_observer_post"):
+            value["offline_evidence"][field].update(
+                state="NOT_RUN",
+                collector_identity=None,
+                network_namespace_inode=None,
+                process_count=0,
+                service_count=0,
+                listener_count=0,
+                internet_socket_attempt_count=0,
+                trusted_inspection=None,
+                cause_gate="safety.workstation_preflight",
+                reason="EARLIER_BLOCKING_GATE",
+            )
+        _refresh_offline_bundle(value)
     decision = contract.validate_result(value)
     assert decision.ok, decision.errors
 
@@ -476,6 +998,8 @@ def test_closed_qualification_outcomes_are_accepted(
         process_exit_code=10,
         qualifications=[gate_id],
     )
+    if mode == "workstation_offline":
+        _refresh_offline_bundle(value)
     decision = contract.validate_result(value)
     assert decision.ok, decision.errors
 
@@ -750,7 +1274,8 @@ def test_pc2_cross_field_state_machine_rejects_contradictions(
 
 def test_closed_dds_window_requires_ordered_marker_indices(contract: ContractSet):
     value = make_pass_result("workstation_offline")
-    value["offline_evidence"]["semantic_dds_window"] = "CLOSED"
+    value["offline_evidence"]["dds_end_record_index"] = 0
+    _refresh_offline_bundle(value)
     assert not contract.validate_result(value).ok
 
 
@@ -1042,6 +1567,32 @@ def test_failure_precedence_over_interruption_materializes_valid_contract_result
         gate.update(status="NOT_RUN", reason="INTERRUPTED_BEFORE_GATE")
     blocker = next(gate for gate in value["gates"] if gate["id"] == winning_gate)
     blocker.update(status="FAIL", reason=reason)
+    if winning_gate == "offline.network_policy":
+        value["offline_evidence"]["violation_journal"].update(
+            violation_count=1, head_record_sha256=SHA256
+        )
+    else:
+        value["offline_evidence"]["trace"].update(
+            tracer_exit_code=1, compatibility_fixture_passed=False
+        )
+        network = next(
+            gate for gate in value["gates"] if gate["id"] == "offline.network_policy"
+        )
+        network.update(status="SKIPPED", reason="DEPENDENCY_NOT_AVAILABLE")
+    for field in ("host_observer_pre", "host_observer_post"):
+        value["offline_evidence"][field].update(
+            state="NOT_RUN",
+            collector_identity=None,
+            network_namespace_inode=None,
+            process_count=0,
+            service_count=0,
+            listener_count=0,
+            internet_socket_attempt_count=0,
+            trusted_inspection=None,
+            cause_gate="safety.workstation_preflight",
+            reason="INTERRUPTED_BEFORE_GATE",
+        )
+    _refresh_offline_bundle(value)
 
     decision = ResultPolicy(contract).decide(
         "workstation_offline", value["gates"], signal="TERM"

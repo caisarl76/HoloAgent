@@ -60,8 +60,10 @@ _RESUMED = re.compile(r"^<\.\.\. ([A-Za-z_][A-Za-z0-9_]*) resumed>(.*)$")
 _SIGNAL = re.compile(r"^--- (SIG[A-Z0-9]+) \{.*\} ---$")
 _EXITED = re.compile(r"^\+\+\+ exited with ([0-9]+) \+\+\+$")
 _KILLED = re.compile(r"^\+\+\+ killed by (SIG[A-Z0-9]+)(?: \(core dumped\))? \+\+\+$")
+_PENDING_EXIT = re.compile(r"^(?:exit|exit_group)\(([0-9]+)\)( +)= \?$")
 _NUMBER_TEXT = r"(?:0|[1-9][0-9]*|0x[0-9a-f]+)"
 _FD = re.compile(r"^(-?(?:0|[1-9][0-9]*))(?:<(.+)>)?$")
+_DELETED_PATH_FD = re.compile(r"^(-?(?:0|[1-9][0-9]*))<(/[^<>]+)>\(deleted\)$")
 _INTEGER = re.compile(rf"^-?{_NUMBER_TEXT}$")
 _RAW_INTEGER = re.compile(r"^(?:0|0x[0-9a-f]+)$")
 _ERRNO = re.compile(r"^(-1) ([A-Z][A-Z0-9_]*) \(([^\r\n()]*)\)$")
@@ -464,6 +466,9 @@ def _provenance(value: str) -> dict[str, object]:
 
 
 def _fd(value: str, code: str) -> dict[str, object]:
+    deleted_path = _DELETED_PATH_FD.fullmatch(value)
+    if deleted_path is not None:
+        value = f"{deleted_path.group(1)}<{deleted_path.group(2)}>"
     match = _FD.fullmatch(value)
     if match is None:
         raise _fail(code)
@@ -502,6 +507,13 @@ def _result(value: str) -> dict[str, object]:
             "errno": errno.group(2),
             "errno_text": errno.group(3),
         }
+    deleted_path = _DELETED_PATH_FD.fullmatch(value)
+    if deleted_path is not None:
+        fd = _fd(
+            f"{deleted_path.group(1)}<{deleted_path.group(2)}>",
+            "invalid-return-fd",
+        )
+        return {"value": fd["fd"], "fd": fd}
     descriptor = _FD.fullmatch(value)
     if descriptor is not None:
         fd = _fd(value, "invalid-return-fd")
@@ -933,6 +945,212 @@ def _raw_metadata(name: str, arguments: list[str]) -> dict[str, object]:
     return metadata
 
 
+def _timespec(value: str, code: str) -> dict[str, int]:
+    fields = _fields(value, code)
+    if set(fields) != {"tv_sec", "tv_nsec"}:
+        raise _fail(code)
+    seconds = _integer(fields["tv_sec"], code)
+    nanoseconds = _integer(fields["tv_nsec"], code)
+    if seconds < 0 or not 0 <= nanoseconds <= 999_999_999:
+        raise _fail(code)
+    return {"seconds": seconds, "nanoseconds": nanoseconds}
+
+
+def _broker_pselect6_wait(arguments: list[str]) -> dict[str, object]:
+    _arity(arguments, 6, "pselect6-arity")
+    nfds = _integer(arguments[0], "pselect6-nfds")
+    if nfds <= 0 or arguments[3] not in {"NULL", "[]"} or arguments[5] != "NULL":
+        raise _fail("pselect6-broker-shape")
+    read_fds = (
+        []
+        if arguments[1] in {"NULL", "[]"}
+        else [
+            _fd(value, "pselect6-read-fd")
+            for value in _vector(arguments[1], "pselect6-read-set")
+        ]
+    )
+    write_fds = (
+        []
+        if arguments[2] in {"NULL", "[]"}
+        else [
+            _fd(value, "pselect6-write-fd")
+            for value in _vector(arguments[2], "pselect6-write-set")
+        ]
+    )
+    if (len(read_fds), len(write_fds)) not in {(1, 0), (0, 1)}:
+        raise _fail("pselect6-broker-fd-set")
+    direction = "read" if read_fds else "write"
+    descriptor = (read_fds or write_fds)[0]
+    if descriptor["fd"] >= nfds:
+        raise _fail("pselect6-broker-nfds")
+    return {
+        "nfds": nfds,
+        "direction": direction,
+        "fd": descriptor,
+        "timeout": _timespec(arguments[4], "pselect6-timeout"),
+    }
+
+
+def _broker_pselect6_result(value: str, wait: dict[str, object]) -> dict[str, object]:
+    if value == "0 (Timeout)":
+        return {"value": 0, "timeout": True}
+    if _ERRNO.fullmatch(value) is not None or value.startswith("? ERESTART"):
+        return _result(value)
+    ready = re.fullmatch(
+        r"1 \((in|out) \[([0-9]+)\], left (\{tv_sec=[^{}]+, tv_nsec=[^{}]+\})\)",
+        value,
+    )
+    if ready is None:
+        raise _fail("pselect6-result")
+    direction = "read" if ready.group(1) == "in" else "write"
+    ready_fd = _integer(ready.group(2), "pselect6-ready-fd")
+    requested_fd = wait["fd"]
+    if (
+        direction != wait["direction"]
+        or type(requested_fd) is not dict
+        or ready_fd != requested_fd.get("fd")
+    ):
+        raise _fail("pselect6-ready-set")
+    timeout_left = _timespec(ready.group(3), "pselect6-timeout-left")
+    timeout = wait["timeout"]
+    if type(timeout) is not dict or (
+        timeout_left["seconds"],
+        timeout_left["nanoseconds"],
+    ) > (timeout.get("seconds"), timeout.get("nanoseconds")):
+        raise _fail("pselect6-timeout-increased")
+    return {
+        "value": 1,
+        "ready": {"direction": direction, "fd": {"fd": ready_fd}},
+        "timeout_left": timeout_left,
+    }
+
+
+def _reviewed_wait4(arguments: list[str], result: dict[str, object]) -> None:
+    """Validate the reviewed rendering without granting reap authority."""
+
+    if len(arguments) != 4:
+        raise _fail("wait4-arity")
+    waited_pid = re.fullmatch(r"([1-9][0-9]*)", arguments[0])
+    status = re.fullmatch(
+        r"\[\{WIFEXITED\(s\) && WEXITSTATUS\(s\) == ([0-9]+)\}\]",
+        arguments[1],
+    )
+    result_pid = result.get("value")
+    if (
+        waited_pid is None
+        or status is None
+        or int(status.group(1)) > 255
+        or arguments[2] != "0"
+        or arguments[3] != "NULL"
+        or type(result_pid) is not int
+        or result_pid != int(waited_pid.group(1))
+    ):
+        raise _fail("unreviewed-wait4")
+
+
+_BROKER_STAT_FIELDS = frozenset(
+    {
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_uid",
+        "st_gid",
+        "st_blksize",
+        "st_blocks",
+        "st_size",
+        "st_atime",
+        "st_atime_nsec",
+        "st_mtime",
+        "st_mtime_nsec",
+        "st_ctime",
+        "st_ctime_nsec",
+    }
+)
+
+
+def _reviewed_stat_integer(value: str, code: str) -> int:
+    observed = re.fullmatch(
+        r"(-?[0-9]+)(?: /\* [0-9]{4}-[0-9]{2}-[0-9]{2}T"
+        r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?[+-][0-9]{4} \*/)?",
+        value,
+    )
+    if observed is None:
+        raise _fail(code)
+    return int(observed.group(1))
+
+
+def _broker_fd_stat_validation(
+    name: str, arguments: list[str], result: dict[str, object]
+) -> dict[str, object]:
+    if name == "fstat":
+        _arity(arguments, 2, "broker-fstat-arity")
+        fd_text, stat_text = arguments
+    else:
+        _arity(arguments, 4, "broker-newfstatat-arity")
+        fd_text, path, stat_text, flags = arguments
+        if path != '""' or flags != "AT_EMPTY_PATH":
+            raise _fail("unreviewed-broker-newfstatat")
+    descriptor = _fd(fd_text, "broker-stat-fd")
+    provenance = descriptor.get("provenance")
+    if (
+        provenance is None
+        or provenance.get("kind") != "pipe"
+        or type(provenance.get("inode")) is not int
+        or result != {"value": 0}
+    ):
+        raise _fail("unreviewed-broker-stat")
+    fields = _fields(stat_text, "broker-stat-fields")
+    if set(fields) != _BROKER_STAT_FIELDS:
+        raise _fail("broker-stat-fields")
+    inode = _reviewed_stat_integer(fields["st_ino"], "broker-stat-inode")
+    if (
+        fields["st_mode"] != "S_IFIFO|0600"
+        or inode != provenance["inode"]
+        or _reviewed_stat_integer(fields["st_nlink"], "broker-stat-nlink") != 1
+        or _reviewed_stat_integer(fields["st_size"], "broker-stat-size") != 0
+    ):
+        raise _fail("unreviewed-broker-stat")
+    for field in _BROKER_STAT_FIELDS - {"st_dev", "st_ino", "st_mode"}:
+        _reviewed_stat_integer(fields[field], f"broker-stat-{field}")
+    if (
+        re.fullmatch(
+            r"makedev\((?:0|0x[0-9a-f]+), (?:0|0x[0-9a-f]+)\)", fields["st_dev"]
+        )
+        is None
+    ):
+        raise _fail("broker-stat-device")
+    return {
+        "operation": "fd_stat",
+        "fd": descriptor,
+        "file_type": "fifo",
+        "mode": 0o600,
+        "inode": inode,
+    }
+
+
+def _broker_readlink_validation(
+    arguments: list[str], result: dict[str, object]
+) -> dict[str, object]:
+    _arity(arguments, 3, "broker-readlink-arity")
+    path = re.fullmatch(r'"/proc/self/fd/([0-9]+)"', arguments[0])
+    target = re.fullmatch(r'"pipe:\[([0-9]+)\]"', arguments[1])
+    count = _integer(arguments[2], "broker-readlink-count")
+    if path is None or target is None or count != 4096:
+        raise _fail("unreviewed-broker-readlink")
+    fd = int(path.group(1))
+    inode = int(target.group(1))
+    expected_length = len(f"pipe:[{inode}]")
+    if result != {"value": expected_length}:
+        raise _fail("broker-readlink-result")
+    return {
+        "operation": "fd_readlink",
+        "fd": fd,
+        "target_provenance": {"kind": "pipe", "inode": inode},
+        "count": count,
+    }
+
+
 def _message_vector(
     value: str, *, allow_incomplete: bool = False
 ) -> tuple[list[dict[str, object]], int]:
@@ -1092,6 +1310,45 @@ _TRANSITION_SYSCALLS = frozenset(
         "close_range",
         "unshare",
         "pidfd_getfd",
+        "rt_sigaction",
+        "rt_sigprocmask",
+    }
+)
+
+_SIGNAL_MASK_HOW = frozenset({"SIG_BLOCK", "SIG_UNBLOCK", "SIG_SETMASK"})
+_SIGNAL_MASK_NAMES = frozenset(
+    {
+        "HUP",
+        "INT",
+        "QUIT",
+        "ILL",
+        "TRAP",
+        "ABRT",
+        "BUS",
+        "FPE",
+        "KILL",
+        "USR1",
+        "SEGV",
+        "USR2",
+        "PIPE",
+        "ALRM",
+        "TERM",
+        "STKFLT",
+        "CHLD",
+        "CONT",
+        "STOP",
+        "TSTP",
+        "TTIN",
+        "TTOU",
+        "URG",
+        "XCPU",
+        "XFSZ",
+        "VTALRM",
+        "PROF",
+        "WINCH",
+        "IO",
+        "PWR",
+        "SYS",
     }
 )
 
@@ -1121,6 +1378,78 @@ def _named_arguments(arguments: list[str], code: str) -> dict[str, str]:
             raise _fail(code)
         result[key] = value
     return result
+
+
+def _signal_mask(value: str, code: str) -> list[str] | dict[str, list[str]] | None:
+    if value == "NULL":
+        return None
+    complemented = value.startswith("~")
+    body = value[1:] if complemented else value
+    if not (body.startswith("[") and body.endswith("]")):
+        raise _fail(code)
+    inner = body[1:-1]
+    names = [] if not inner else inner.split(" ")
+    if any(
+        name not in _SIGNAL_MASK_NAMES
+        and re.fullmatch(r"RT(?:MIN|MAX|_[1-9][0-9]*)", name) is None
+        for name in names
+    ) or len(names) != len(set(names)):
+        raise _fail(code)
+    if complemented:
+        return {"complement": names}
+    return names
+
+
+def _signal_name(value: str, code: str) -> str:
+    if not value.startswith("SIG"):
+        raise _fail(code)
+    name = value[3:]
+    if (
+        name not in _SIGNAL_MASK_NAMES
+        and re.fullmatch(r"RT(?:MIN|MAX|_[1-9][0-9]*)", name) is None
+    ):
+        raise _fail(code)
+    return name
+
+
+def _signal_action(value: str, code: str) -> dict[str, object] | None:
+    if value == "NULL":
+        return None
+    if not (value.startswith("{") and value.endswith("}")):
+        raise _fail(code)
+    fields = _fields(value, code)
+    if set(fields) not in (
+        {"sa_handler", "sa_mask", "sa_flags"},
+        {"sa_handler", "sa_mask", "sa_flags", "sa_restorer"},
+    ):
+        raise _fail(code)
+    handler_value = fields["sa_handler"]
+    handler_names = {
+        "SIG_DFL": "DEFAULT",
+        "SIG_IGN": "IGNORE",
+        "SIG_ERR": "ERROR",
+    }
+    if handler_value in handler_names:
+        handler = handler_names[handler_value]
+    elif re.fullmatch(r"0x[0-9a-f]+", handler_value) is not None:
+        handler = "CUSTOM"
+    else:
+        raise _fail(code)
+    mask = _signal_mask(fields["sa_mask"], code)
+    if mask is None:
+        raise _fail(code)
+    flags = _flags(fields["sa_flags"])
+    if len(flags) != len(set(flags)):
+        raise _fail(code)
+    restorer = fields.get("sa_restorer")
+    if restorer is not None and re.fullmatch(r"0x[0-9a-f]+", restorer) is None:
+        raise _fail(code)
+    return {
+        "handler": handler,
+        "mask": mask,
+        "flags": flags,
+        "restorer": restorer is not None,
+    }
 
 
 def _transition_metadata(
@@ -1388,6 +1717,31 @@ def _transition_metadata(
         )
         if _successful(result):
             transition["created_fd"] = _returned_fd(result, "pidfd-getfd-return-fd")
+    elif name == "rt_sigprocmask":
+        _arity(arguments, 4, "rt-sigprocmask-arity")
+        how = arguments[0]
+        if how not in _SIGNAL_MASK_HOW:
+            raise _fail("rt-sigprocmask-how")
+        sigset_size = _integer(arguments[3], "rt-sigprocmask-size")
+        if sigset_size < 0:
+            raise _fail("rt-sigprocmask-size")
+        transition.update(
+            how=how,
+            mask=_signal_mask(arguments[1], "rt-sigprocmask-mask"),
+            old_mask=_signal_mask(arguments[2], "rt-sigprocmask-old-mask"),
+            sigset_size=sigset_size,
+        )
+    elif name == "rt_sigaction":
+        _arity(arguments, 4, "rt-sigaction-arity")
+        sigset_size = _integer(arguments[3], "rt-sigaction-size")
+        if sigset_size < 0:
+            raise _fail("rt-sigaction-size")
+        transition.update(
+            signal=_signal_name(arguments[0], "rt-sigaction-signal"),
+            action=_signal_action(arguments[1], "rt-sigaction-action"),
+            old_action=_signal_action(arguments[2], "rt-sigaction-old-action"),
+            sigset_size=sigset_size,
+        )
     return transition
 
 
@@ -1400,6 +1754,32 @@ def _marker_metadata(arguments: list[str]) -> dict[str, str] | None:
     return {
         "phase": "BEGIN" if marker.group(1) == "B" else "END",
         "token": marker.group(2),
+    }
+
+
+def _handoff_marker_metadata(arguments: list[str]) -> dict[str, str] | None:
+    if len(arguments) != 2 or arguments[0] != "PR_SET_NAME":
+        return None
+    marker = re.fullmatch(r'"H0([RF])([0-9a-f]{12})"\.\.\.', arguments[1])
+    if marker is None:
+        return None
+    return {
+        "phase": ("READINESS_BEGIN" if marker.group(1) == "R" else "FUNCTIONAL_BEGIN"),
+        "token": marker.group(2),
+    }
+
+
+def _handoff_name_observation_metadata(
+    arguments: list[str],
+) -> dict[str, str] | None:
+    if len(arguments) != 2 or arguments[0] != "PR_GET_NAME":
+        return None
+    observation = re.fullmatch(r'"H0([RF])([0-9a-f]{12})"', arguments[1])
+    if observation is None:
+        return None
+    return {
+        "phase": "READINESS" if observation.group(1) == "R" else "FUNCTIONAL",
+        "token": observation.group(2),
     }
 
 
@@ -1430,6 +1810,7 @@ class TraceNormalizer:
         self._buffer = bytearray()
         self._input_bytes = 0
         self._pending: dict[int, _Pending] = {}
+        self._pending_exit_group: dict[int, int] = {}
         self._records = 0
         self._entries = 0
         self._exits = 0
@@ -1481,7 +1862,7 @@ class TraceNormalizer:
         try:
             if self._buffer:
                 raise _fail("truncated-line")
-            if self._pending:
+            if self._pending or self._pending_exit_group:
                 raise _fail("pending-syscall")
             return []
         except TraceDecodeError as error:
@@ -1507,11 +1888,46 @@ class TraceNormalizer:
         if "runs in " in body and " bit mode" in body:
             raise _fail("unsupported-personality")
 
+        pending_exit_status = self._pending_exit_group.get(pid)
+        if pending_exit_status is not None:
+            exited = _EXITED.fullmatch(body)
+            if exited is None or int(exited.group(1)) != pending_exit_status:
+                raise _fail("exit-group-terminal-mismatch")
+            del self._pending_exit_group[pid]
+            return [
+                self._emit(
+                    {
+                        "kind": "exit",
+                        "pid": pid,
+                        "timestamp": timestamp,
+                        "exit_code": pending_exit_status,
+                    }
+                )
+            ]
+
+        pending_exit = _PENDING_EXIT.fullmatch(body)
+        if pending_exit is not None:
+            status = int(pending_exit.group(1))
+            if status > 255 or pid in self._pending:
+                raise _fail("unreviewed-exit-group")
+            if (
+                pid not in self._pending_exit_group
+                and len(set(self._pending) | set(self._pending_exit_group))
+                >= self.max_pending_processes
+            ):
+                raise _fail("pending-process-bound")
+            self._pending_exit_group[pid] = status
+            return []
+
         unfinished = _UNFINISHED.fullmatch(body)
         if unfinished is not None:
             if pid in self._pending:
                 raise _fail("duplicate-unfinished")
-            if len(self._pending) >= self.max_pending_processes:
+            if (
+                pid not in self._pending
+                and len(set(self._pending) | set(self._pending_exit_group))
+                >= self.max_pending_processes
+            ):
                 raise _fail("pending-process-bound")
             entry_index = self._entries
             self._entries += 1
@@ -1535,7 +1951,10 @@ class TraceNormalizer:
             result_tail = _RESULT_TAIL.fullmatch(body)
             if result_tail is None:
                 raise _fail("resumed-result-grammar")
-            combined = f"{pending.syscall}({pending.arguments_prefix}{resumed.group(2)}"
+            arguments_prefix = pending.arguments_prefix
+            if not arguments_prefix.strip() and resumed.group(2).startswith(")"):
+                arguments_prefix = ""
+            combined = f"{pending.syscall}({arguments_prefix}{resumed.group(2)}"
             return [
                 self._decode_complete(
                     pid,
@@ -1630,10 +2049,34 @@ class TraceNormalizer:
             raise _fail("unsupported-native-syscall")
         arguments = _split_arguments(arguments_text)
         marker = _marker_metadata(arguments) if name == "prctl" else None
+        handoff_marker = (
+            _handoff_marker_metadata(arguments) if name == "prctl" else None
+        )
+        handoff_name_observation = (
+            _handoff_name_observation_metadata(arguments) if name == "prctl" else None
+        )
         if "..." in body and (
-            body.count("...") != 1 or arguments_text.count("...") != 1 or marker is None
+            body.count("...") != 1
+            or arguments_text.count("...") != 1
+            or (marker is None and handoff_marker is None)
         ):
             raise _fail("abbreviated-field")
+        if (
+            name == "prctl"
+            and len(arguments) == 2
+            and arguments[0] == "PR_SET_NAME"
+            and re.match(r'"H0[RF]', arguments[1]) is not None
+            and handoff_marker is None
+        ):
+            raise _fail("unreviewed-handoff-marker")
+        if (
+            name == "prctl"
+            and len(arguments) == 2
+            and arguments[0] == "PR_GET_NAME"
+            and re.match(r'"H0[RF]', arguments[1]) is not None
+            and handoff_name_observation is None
+        ):
+            raise _fail("unreviewed-handoff-name-observation")
         timeout_left: dict[str, int] | None = None
         left = re.fullmatch(
             r"(.+) \(left \{tv_sec=([0-9]+), tv_nsec=([0-9]+)\}\)", result_text
@@ -1660,14 +2103,41 @@ class TraceNormalizer:
         }
         if marker is not None:
             record["marker"] = marker
-        if name in RAW_PAYLOAD_SYSCALLS:
+        if handoff_marker is not None:
+            record["handoff_marker"] = handoff_marker
+        if handoff_name_observation is not None:
+            record["handoff_name_observation"] = handoff_name_observation
+        wait: dict[str, object] | None = None
+        if name == "pselect6":
+            wait = _broker_pselect6_wait(arguments)
+            result = _broker_pselect6_result(result_text, wait)
+        elif name in RAW_PAYLOAD_SYSCALLS:
             result = _raw_result(result_text)
         elif name == "fcntl" and len(arguments) >= 2:
             result = _fcntl_result(arguments[1], result_text)
         else:
             result = _result(result_text)
+        if name == "wait4":
+            _reviewed_wait4(arguments, result)
+        stat_is_pipe = bool(
+            arguments and re.fullmatch(r"[0-9]+<pipe:\[[0-9]+\]>", arguments[0])
+        )
+        readlink_is_broker = bool(
+            name == "readlink"
+            and arguments
+            and (
+                re.fullmatch(r'"/proc/self/fd/[0-9]+"', arguments[0]) is not None
+                or (len(arguments) > 1 and arguments[1].startswith('"pipe:['))
+            )
+        )
+        if name in {"fstat", "newfstatat"} and stat_is_pipe:
+            record["validation"] = _broker_fd_stat_validation(name, arguments, result)
+        elif readlink_is_broker:
+            record["validation"] = _broker_readlink_validation(arguments, result)
         if timeout_left is not None:
             result["timeout_left"] = timeout_left
+        if wait is not None:
+            record["wait"] = wait
         if name in RAW_PAYLOAD_SYSCALLS:
             record.update(_raw_metadata(name, arguments))
         elif name in DECODED_ADDRESS_SYSCALLS:

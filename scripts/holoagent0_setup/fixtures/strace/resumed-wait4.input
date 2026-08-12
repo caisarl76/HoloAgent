@@ -1,0 +1,2 @@
+301   1700000054.000004 wait4(302,  <unfinished ...>
+301   1700000054.000005 <... wait4 resumed>[{WIFEXITED(s) && WEXITSTATUS(s) == 0}], 0, NULL) = 302 <0.011225>

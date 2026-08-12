@@ -1,0 +1,2 @@
+301   1700000054.000006 openat(AT_FDCWD</tmp>, "/tmp", O_RDWR|O_EXCL|O_NOFOLLOW|O_CLOEXEC|O_TMPFILE, 0600) = 6</tmp/#9351668>(deleted) <0.000016>
+301   1700000054.000007 dup2(6</tmp/#9351668>(deleted), 1<pipe:[42]>) = 1</tmp/#9351668>(deleted) <0.000008>

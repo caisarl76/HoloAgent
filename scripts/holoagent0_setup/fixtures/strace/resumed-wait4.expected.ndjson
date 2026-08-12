@@ -1,0 +1,1 @@
+{"duration":"0.011225","entry_index":0,"exit_index":0,"kind":"syscall","pid":301,"record_index":0,"result":{"value":302},"syscall":"wait4","timestamp":"1700000054.000004"}

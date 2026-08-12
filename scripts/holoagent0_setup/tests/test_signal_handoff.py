@@ -5,7 +5,10 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import os
+from pathlib import Path
 import signal
+import subprocess
+import sys
 from threading import Event, Thread
 import time
 
@@ -29,6 +32,8 @@ from holoagent0_setup.signal_handoff import (
 
 MASK = frozenset({"HUP", "INT", "TERM"})
 DISPOSITIONS = (("HUP", True), ("INT", True), ("TERM", True))
+PACKAGE_ROOT = Path(__file__).parents[1]
+REPOSITORY_ROOT = PACKAGE_ROOT.parents[1]
 
 
 class FakeSignalOperations:
@@ -76,6 +81,25 @@ def _supervisor(identity, *, forwarded=None, first_sequence=1):
         forwarder=lambda pgid, name: forwarded.append((pgid, name)),
         first_sequence=first_sequence,
     )
+
+
+def test_repeated_signals_are_recorded_but_only_first_is_pending(identity):
+    forwarded = []
+    supervisor = _supervisor(identity, forwarded=forwarded)
+
+    supervisor.collect_signal("TERM")
+    supervisor.collect_signal("HUP")
+    supervisor.collect_signal("INT")
+
+    snapshot = supervisor.snapshot()
+    assert snapshot.pending_signal == "TERM"
+    assert [event.name for event in snapshot.events] == [
+        "signal_latched",
+        "signal_repeated:HUP",
+        "signal_repeated:INT",
+    ]
+    assert snapshot.forward_count == 0
+    assert forwarded == []
 
 
 def _send_request(coordinator):
@@ -473,6 +497,45 @@ def test_unblock_operation_exception_is_normalized_and_terminal(identity):
         os.close(response_read)
     assert coordinator.snapshot().terminal_state == "FAILED"
     assert coordinator.snapshot().unblock_count == 0
+
+
+def test_default_os_operations_preserve_real_pending_signal_interruption():
+    script = """
+import os
+import signal
+import sys
+
+from holoagent0_setup.signal_handoff import (
+    SignalHandoffInterrupted,
+    _OSSignalOperations,
+)
+
+reviewed = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+signal.pthread_sigmask(signal.SIG_BLOCK, reviewed)
+
+def interrupt(signum, _frame):
+    raise SignalHandoffInterrupted(f"interrupted by {signum}")
+
+for number in reviewed:
+    signal.signal(number, interrupt)
+os.kill(os.getpid(), signal.SIGTERM)
+try:
+    _OSSignalOperations().unblock_reviewed()
+except SignalHandoffInterrupted:
+    sys.exit(0)
+sys.exit(7)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPOSITORY_ROOT,
+        env={**os.environ, "PYTHONPATH": str(PACKAGE_ROOT)},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
 
 
 def test_supervisor_finalizes_zero_and_nonzero_functional_runs(identity):

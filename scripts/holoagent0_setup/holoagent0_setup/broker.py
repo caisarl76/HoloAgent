@@ -19,6 +19,7 @@ from holoagent0_setup.atomic_io import (
     canonical_json_bytes,
 )
 from holoagent0_setup.process_identity import ProcessIdentity, ProcessIdentityError
+from holoagent0_setup.cyclone_policy import CONFIG_ROLES, EXPECTED_CONFIG_SHA256
 
 
 class BrokerProtocolError(RuntimeError):
@@ -31,6 +32,9 @@ class MessageType(str, Enum):
     LEDGER_CANDIDATE = "LEDGER_CANDIDATE"
     LEDGER_ACCEPTED = "LEDGER_ACCEPTED"
     OWNERSHIP_RECORD = "OWNERSHIP_RECORD"
+    OWNERSHIP_ACCEPTED = "OWNERSHIP_ACCEPTED"
+    PARTICIPANT_RECORD = "PARTICIPANT_RECORD"
+    PARTICIPANT_ACCEPTED = "PARTICIPANT_ACCEPTED"
 
 
 MAX_PAYLOAD_BYTES = 4096
@@ -77,6 +81,7 @@ _MESSAGE_KEYS = {
         "sequence",
         "generation",
         "ledger_sha256",
+        "request_sha256",
     },
     MessageType.OWNERSHIP_RECORD: {
         "type",
@@ -85,7 +90,56 @@ _MESSAGE_KEYS = {
         "identity",
         "role",
     },
+    MessageType.OWNERSHIP_ACCEPTED: {
+        "type",
+        "run_nonce",
+        "sequence",
+        "request_sha256",
+    },
+    MessageType.PARTICIPANT_RECORD: {
+        "type",
+        "run_nonce",
+        "sequence",
+        "identity",
+        "role",
+        "participant_index",
+        "config_digest",
+    },
+    MessageType.PARTICIPANT_ACCEPTED: {
+        "type",
+        "run_nonce",
+        "sequence",
+        "request_sha256",
+    },
 }
+
+_BROKER_CODEC_PREWARM_MESSAGE = {
+    "type": MessageType.SIGNAL_READY.value,
+    "run_nonce": "prewarm",
+    "sequence": 1,
+    "identity": {
+        "pid": 1,
+        "pgid": 1,
+        "start_time": 1,
+        "executable_path": "/prewarm",
+        "executable_sha256": "0" * 64,
+    },
+    "blocked_signals": list(_SIGNALS),
+    "dispositions": {name: True for name in _SIGNALS},
+}
+
+
+def prewarm_broker_codec() -> None:
+    """Exercise encode, decode, and validation before the readiness boundary."""
+
+    try:
+        payload = canonical_json_bytes(_BROKER_CODEC_PREWARM_MESSAGE)
+        decoded = _decode_canonical_message(payload)
+        stable = canonical_json_bytes(decoded)
+    except (BrokerProtocolError, CanonicalJSONError, RuntimeError) as error:
+        raise BrokerProtocolError("broker codec prewarm failed") from error
+    if decoded != _BROKER_CODEC_PREWARM_MESSAGE or stable != payload:
+        raise BrokerProtocolError("broker codec prewarm result is unstable")
 
 
 def write_frame(
@@ -254,12 +308,27 @@ def validate_message(
         _require_sequence(message["sequence"], "sequence")
         _require_nonnegative_integer(message["generation"], "generation")
         _require_digest(message["ledger_sha256"], "ledger_sha256")
-    else:
+        _require_digest(message["request_sha256"], "request_sha256")
+    elif message_type is MessageType.OWNERSHIP_RECORD:
         _require_sequence(message["sequence"], "sequence")
         _require_identity(message["identity"])
         role = message["role"]
         if type(role) is not str or not role or _utf8_length(role, "role") > 128:
             raise BrokerProtocolError("ownership role is invalid")
+    elif message_type is MessageType.PARTICIPANT_RECORD:
+        _require_sequence(message["sequence"], "sequence")
+        _require_identity(message["identity"])
+        index = message["participant_index"]
+        if (
+            type(index) is not int
+            or index not in range(4)
+            or message["role"] != CONFIG_ROLES[index]
+            or message["config_digest"] != EXPECTED_CONFIG_SHA256[index]
+        ):
+            raise BrokerProtocolError("participant role/config binding is invalid")
+    else:
+        _require_sequence(message["sequence"], "sequence")
+        _require_digest(message["request_sha256"], "request_sha256")
     return message
 
 

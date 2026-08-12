@@ -30,7 +30,7 @@
       },
       "parser": {
         "path": "scripts/holoagent0_setup/holoagent0_setup/trace_normalizer.py",
-        "sha256": "822523235f2ef4e8e3a18051f298acede9156cc1d2369ecefa1d8856dc089183",
+        "sha256": "eedc51d98f7f1a8b678170789c5b0ea56ecc7eb7620660cd5e30e93d4560825d",
         "digest_algorithm": "sha256",
         "review_state": "REVIEWED"
       },
@@ -83,7 +83,7 @@
       },
       "fixtures": {
         "manifest_path": "scripts/holoagent0_setup/fixtures/strace/manifest-v1.json",
-        "manifest_sha256": "2c3737088b0305eabb4afa21bfac1c573d3c0a551b72f168c8ae4bb867451a9d",
+        "manifest_sha256": "2146557a80b49a80519f75c1f586afd907ea838db238eeebff3b4f360f07eaee",
         "digest_algorithm": "sha256",
         "review_state": "REVIEWED"
       }

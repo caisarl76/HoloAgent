@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import secrets
 import stat
-from typing import Mapping
+from typing import Callable, Mapping
 
 
 @dataclass(frozen=True)
@@ -178,6 +178,7 @@ def atomic_write_json(
     relative_to: Path | None = None,
     parent_fd: int | None = None,
     expected_parent_identity: tuple[int, int] | None = None,
+    pre_publish: Callable[[Path], object] | None = None,
 ) -> ArtifactDescriptor:
     """Durably replace *path* with same-directory canonical JSON."""
 
@@ -189,6 +190,7 @@ def atomic_write_json(
         relative_to,
         parent_fd,
         expected_parent_identity,
+        pre_publish,
     )
 
 
@@ -200,6 +202,7 @@ def atomic_write_json_no_replace(
     relative_to: Path | None = None,
     parent_fd: int | None = None,
     expected_parent_identity: tuple[int, int] | None = None,
+    pre_publish: Callable[[Path], object] | None = None,
 ) -> ArtifactDescriptor:
     """Durably install canonical JSON only when *path* does not exist."""
 
@@ -211,6 +214,33 @@ def atomic_write_json_no_replace(
         relative_to,
         parent_fd,
         expected_parent_identity,
+        pre_publish,
+    )
+
+
+def atomic_write_bytes_no_replace(
+    path: Path,
+    data: bytes,
+    mode: int = 0o600,
+    *,
+    relative_to: Path | None = None,
+    parent_fd: int | None = None,
+    expected_parent_identity: tuple[int, int] | None = None,
+    pre_publish: Callable[[Path], object] | None = None,
+) -> ArtifactDescriptor:
+    """Durably install bounded opaque evidence bytes without replacement."""
+
+    if type(data) is not bytes or len(data) > _MAX_OUTPUT_BYTES:
+        raise AtomicIOError("artifact bytes are not exact or exceed the bound")
+    return _atomic_write(
+        path,
+        data,
+        mode,
+        True,
+        relative_to,
+        parent_fd,
+        expected_parent_identity,
+        pre_publish,
     )
 
 
@@ -222,7 +252,10 @@ def _atomic_write(
     relative_to: Path | None,
     parent_fd: int | None,
     expected_parent_identity: tuple[int, int] | None,
+    pre_publish: Callable[[Path], object] | None,
 ) -> ArtifactDescriptor:
+    if pre_publish is not None and not callable(pre_publish):
+        raise AtomicIOError("pre-publication verifier is not callable")
     if mode & ~0o777 or mode & 0o022:
         raise AtomicIOError("artifact mode must not grant group/other write access")
     path = Path(path)
@@ -279,6 +312,8 @@ def _atomic_write(
             inode=temporary_stat.st_ino,
             device=temporary_stat.st_dev,
         )
+        if pre_publish is not None:
+            pre_publish(resolved_parent / temporary_name)
         if no_replace:
             os.link(
                 temporary_name,

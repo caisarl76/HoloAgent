@@ -7,6 +7,9 @@ scripts/holoagent0_setup/tests/test_broker.py
 scripts/holoagent0_setup/tests/test_process_identity.py
 scripts/holoagent0_setup/tests/test_native_launchers.py
 scripts/holoagent0_setup/tests/test_signal_handoff.py
+scripts/holoagent0_setup/tests/test_evidence.py
+scripts/holoagent0_setup/tests/test_supervisor.py
+scripts/holoagent0_setup/tests/test_coordinator.py
 scripts/holoagent0_setup/tests/test_trace_normalizer.py
 scripts/holoagent0_setup/tests/test_trace_normalizer_revision3.py
 scripts/holoagent0_setup/tests/test_trace_normalizer_revision4.py

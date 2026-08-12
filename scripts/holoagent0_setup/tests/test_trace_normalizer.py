@@ -40,7 +40,7 @@ def _align_reviewed_results(source: bytes) -> bytes:
         ending = b"\n" if line.endswith(b"\n") else b""
         body = line[: -len(ending)] if ending else line
         match = re.fullmatch(rb"(.*\))( +)= (.*)", body)
-        if match is not None:
+        if match is not None and match.group(3) != b"?":
             body = (
                 match.group(1)
                 + b" " * max(1, 40 - len(match.group(1)))
@@ -91,7 +91,7 @@ def test_fixture_manifest_is_closed_canonical_digest_bound_and_complete():
     assert set(manifest) == {"$id", "schema_version", "cases", "additionalProperties"}
     assert manifest["additionalProperties"] is False
     names = [case["name"] for case in manifest["cases"]]
-    assert len(names) == len(set(names)) == 14
+    assert len(names) == len(set(names)) == 23
     declared = {"manifest-v1.json"}
     for case in manifest["cases"]:
         allowed = {

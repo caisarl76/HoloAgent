@@ -518,3 +518,43 @@ def test_secure_read_rejects_oversize_input_before_unbounded_read(tmp_path):
     target.chmod(0o600)
     with pytest.raises(AtomicIOError, match="size bound"):
         read_json_secure(target)
+
+
+def test_prepublication_verifier_runs_after_staging_before_install(tmp_path):
+    target = tmp_path / "result.json"
+    events = []
+
+    def verify(staging_path):
+        events.append(("verified", staging_path))
+        assert not target.exists()
+        assert staging_path.parent == tmp_path
+        assert staging_path.name.startswith(".result.json.tmp-")
+        assert staging_path == next(iter(tmp_path.glob(".result.json.tmp-*")))
+
+    atomic_write_json_no_replace(
+        target,
+        {"value": 1},
+        relative_to=tmp_path,
+        pre_publish=verify,
+    )
+    assert len(events) == 1
+    assert events[0][0] == "verified"
+    assert events[0][1].name.startswith(".result.json.tmp-")
+    assert target.exists()
+
+
+def test_prepublication_failure_never_installs_or_leaves_staging_file(tmp_path):
+    target = tmp_path / "result.json"
+
+    def reject(_staging_path):
+        raise RuntimeError("evidence changed")
+
+    with pytest.raises(RuntimeError, match="evidence changed"):
+        atomic_write_json_no_replace(
+            target,
+            {"value": 1},
+            relative_to=tmp_path,
+            pre_publish=reject,
+        )
+    assert not target.exists()
+    assert list(tmp_path.iterdir()) == []

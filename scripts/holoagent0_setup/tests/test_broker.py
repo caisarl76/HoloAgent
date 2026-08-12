@@ -41,6 +41,10 @@ def ready_message() -> dict[str, object]:
     }
 
 
+def test_broker_codec_prewarm_exercises_exact_encode_decode_validation_cycle():
+    assert broker_module.prewarm_broker_codec() is None
+
+
 def ledger_candidate_message() -> dict[str, object]:
     nonce = "b" * 64
     return {
@@ -108,7 +112,38 @@ def test_message_type_is_exactly_the_reviewed_closed_set():
         "LEDGER_CANDIDATE",
         "LEDGER_ACCEPTED",
         "OWNERSHIP_RECORD",
+        "OWNERSHIP_ACCEPTED",
+        "PARTICIPANT_RECORD",
+        "PARTICIPANT_ACCEPTED",
     }
+
+
+def test_participant_record_schema_is_closed_and_role_digest_bound():
+    message = {
+        "type": "PARTICIPANT_RECORD",
+        "run_nonce": "b" * 64,
+        "sequence": 2,
+        "identity": dict(IDENTITY),
+        "role": "fixture",
+        "participant_index": 0,
+        "config_digest": (
+            "103da44a684613ead128dd221cace5455ae8890322f8ef50607ea4aa53283ed1"
+        ),
+    }
+    assert broker_module.validate_message(message) == message
+
+    for field, replacement in (
+        ("role", "query_publisher"),
+        ("participant_index", 1),
+        ("config_digest", "f" * 64),
+    ):
+        invalid = dict(message)
+        invalid[field] = replacement
+        with pytest.raises(BrokerProtocolError, match="participant"):
+            broker_module.validate_message(invalid)
+
+    with pytest.raises(BrokerProtocolError, match="keys"):
+        broker_module.validate_message({**message, "extra": False})
 
 
 def test_canonical_frame_round_trip_over_anonymous_pipe():

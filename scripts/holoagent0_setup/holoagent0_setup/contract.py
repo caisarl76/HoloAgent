@@ -19,6 +19,8 @@ import re
 from typing import Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
+from .atomic_io import canonical_json_bytes
+
 
 _SCHEMA_FILES = {
     "agentos-plan-v1",
@@ -172,6 +174,22 @@ class ContractSet:
 
         rows = self._policies["holoagent0-trace-tool-v1"]["rows"]
         return tuple(copy.deepcopy(row) for row in rows)
+
+    def allowed_gate_reasons(self, gate_id: str, status: str) -> tuple[str, ...]:
+        """Return the closed, reviewed reason set for one exact gate outcome."""
+
+        if type(gate_id) is not str or type(status) is not str:
+            raise ContractLoadError("gate reason lookup is invalid")
+        mappings = self._policies["holoagent0-reason-codes-v1"]["gate_status_reasons"]
+        gate = mappings.get(gate_id)
+        if not isinstance(gate, dict) or status not in gate:
+            raise ContractLoadError("gate reason lookup is outside the closed policy")
+        reasons = gate[status]
+        if not isinstance(reasons, list) or any(
+            type(reason) is not str for reason in reasons
+        ):
+            raise ContractLoadError("gate reason policy is invalid")
+        return tuple(reasons)
 
     def _validate_contract_files(self) -> None:
         for name, expected_id in _EXPECTED_SCHEMA_IDS.items():
@@ -802,6 +820,38 @@ def _mode_evidence_errors(mode: str, value: Mapping[str, object]) -> Iterable[st
         if isinstance(evidence, dict) and evidence.get("bundle_sha256") != top_digest:
             yield "$.offline_evidence.bundle_sha256: must equal the top-level bundle digest"
         if isinstance(evidence, dict):
+            descriptor_tree = copy.deepcopy(evidence)
+            recorded_bundle = descriptor_tree.pop("bundle_sha256", None)
+            try:
+                computed_bundle = hashlib.sha256(
+                    canonical_json_bytes(descriptor_tree)
+                ).hexdigest()
+            except (TypeError, ValueError):
+                computed_bundle = None
+            if recorded_bundle != computed_bundle:
+                yield "$.offline_evidence.bundle_sha256: descriptor bundle digest mismatch"
+            ledger = evidence.get("ledger_chain_manifest")
+            if isinstance(ledger, dict):
+                accepted = ledger.get("accepted_generation")
+                count = ledger.get("immutable_generation_count")
+                if (
+                    isinstance(accepted, bool)
+                    or not isinstance(accepted, int)
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count != accepted + 1
+                ):
+                    yield "$.offline_evidence.ledger_chain_manifest: generation count must close the accepted head"
+            pre = evidence.get("host_observer_pre")
+            post = evidence.get("host_observer_post")
+            if (
+                isinstance(pre, dict)
+                and isinstance(post, dict)
+                and pre.get("state") == post.get("state") == "OBSERVED"
+                and pre.get("network_namespace_inode")
+                != post.get("network_namespace_inode")
+            ):
+                yield "$.offline_evidence.host_observer_post: host network namespace changed"
             window = evidence.get("semantic_dds_window")
             begin = evidence.get("dds_begin_record_index")
             end = evidence.get("dds_end_record_index")
@@ -812,13 +862,395 @@ def _mode_evidence_errors(mode: str, value: Mapping[str, object]) -> Iterable[st
                 or isinstance(begin, bool)
                 or not isinstance(end, int)
                 or isinstance(end, bool)
-                or begin > end
+                or begin >= end
             ):
                 yield "$.offline_evidence: CLOSED requires ordered DDS marker indices"
+            trace = evidence.get("trace")
+            if (
+                window == "CLOSED"
+                and isinstance(trace, dict)
+                and isinstance(end, int)
+                and not isinstance(end, bool)
+                and (
+                    isinstance(trace.get("serialized_record_count"), bool)
+                    or not isinstance(trace.get("serialized_record_count"), int)
+                    or end >= trace["serialized_record_count"]
+                )
+            ):
+                yield "$.offline_evidence: DDS marker indices exceed the trace record set"
+            yield from _offline_evidence_cross_binding_errors(value, evidence)
     elif mode == "workstation_mujoco":
         for field in ("offline_evidence", "offline_evidence_bundle_sha256"):
             if field in value:
                 yield f"$.{field}: child-only evidence is forbidden in the MuJoCo parent"
+
+
+def _offline_evidence_cross_binding_errors(
+    value: Mapping[str, object], evidence: Mapping[str, object]
+) -> Iterable[str]:
+    gates = value.get("gates")
+    if not isinstance(gates, list):
+        return
+    gates_by_id = {
+        gate.get("id"): gate
+        for gate in gates
+        if isinstance(gate, dict) and isinstance(gate.get("id"), str)
+    }
+    trace = evidence.get("trace")
+    bootstrap = evidence.get("bootstrap_report")
+    violations = evidence.get("violation_journal")
+    pre = evidence.get("host_observer_pre")
+    post = evidence.get("host_observer_post")
+    if not all(
+        isinstance(item, dict) for item in (trace, bootstrap, violations, pre, post)
+    ):
+        return
+
+    yield from _trusted_host_inspection_errors("pre", pre)
+    yield from _trusted_host_inspection_errors("post", post)
+    openclaw_status = gates_by_id.get("openclaw.preexisting", {}).get("status")
+    pre_inspection = pre.get("trusted_inspection")
+    if (
+        openclaw_status == "PASS"
+        and isinstance(pre_inspection, dict)
+        and (
+            pre_inspection.get("gateway_status_state") != "INACTIVE"
+            or bool(pre_inspection.get("service_definitions"))
+        )
+    ):
+        yield "$.gates[openclaw.preexisting]: PASS contradicts trusted host inspection"
+
+    trace_status = gates_by_id.get("offline.trace_integrity", {}).get("status")
+    trace_healthy = (
+        trace.get("trace_state") in {"FULL", "FINALIZER_ONLY"}
+        and trace.get("tracer_exit_code") == 0
+        and trace.get("normalizer_exit_code") == 0
+        and trace.get("compatibility_fixture_passed") is True
+        and trace.get("not_started_reason") is None
+    )
+    if trace_status == "PASS" and not trace_healthy:
+        yield "$.gates[offline.trace_integrity]: PASS requires a healthy started trace"
+    # A structurally complete trace may still fail marker, lifecycle, descendant,
+    # or decoded-policy integrity.  Those defects are evaluated from the closed
+    # trace and are not reducible to process exit codes in this descriptor.
+
+    violation_count = violations.get("violation_count")
+    network_status = gates_by_id.get("offline.network_policy", {}).get("status")
+    if network_status == "PASS" and (violation_count != 0 or trace_status != "PASS"):
+        yield "$.gates[offline.network_policy]: PASS requires trace PASS and zero violations"
+    if network_status == "FAIL" and violation_count == 0:
+        yield "$.gates[offline.network_policy]: FAIL requires a bound violation"
+    if network_status == "SKIPPED" and (violation_count != 0 or trace_status != "FAIL"):
+        yield "$.gates[offline.network_policy]: SKIPPED requires trace FAIL and zero violations"
+
+    launch_state = bootstrap.get("terminal_launch_state")
+    committed = bootstrap.get("coordinator_launch_committed")
+    trace_state = trace.get("trace_state")
+    window = evidence.get("semantic_dds_window")
+    begin = evidence.get("dds_begin_record_index")
+    end = evidence.get("dds_end_record_index")
+    handoff = bootstrap.get("handoff")
+    if isinstance(handoff, dict):
+        yield from _handoff_history_errors(handoff, bootstrap.get("first_signal"))
+        trace_count = trace.get("serialized_record_count")
+        for field in (
+            "unblock_trace_record_index",
+            "first_functional_trace_record_index",
+        ):
+            index = handoff.get(field)
+            if (
+                isinstance(index, int)
+                and not isinstance(index, bool)
+                and (
+                    not isinstance(trace_count, int)
+                    or isinstance(trace_count, bool)
+                    or index >= trace_count
+                )
+            ):
+                yield f"$.offline_evidence.bootstrap_report.handoff.{field}: exceeds trace record set"
+    expected_committed = launch_state == "COORDINATOR_LAUNCH_COMMITTED"
+    if committed is not expected_committed:
+        yield "$.offline_evidence.bootstrap_report: launch state/commit flag disagree"
+    if expected_committed:
+        if trace_state != "FULL":
+            yield "$.offline_evidence.trace: committed launch requires FULL trace state"
+        if not isinstance(handoff, dict) or handoff.get("terminal_state") not in {
+            "READY",
+            "FAILED",
+        }:
+            yield "$.offline_evidence.bootstrap_report: committed launch lacks terminal handoff"
+        elif handoff.get("terminal_state") == "READY":
+            identity = handoff.get("signal_ready_identity")
+            unblock = handoff.get("unblock_trace_record_index")
+            functional = handoff.get("first_functional_trace_record_index")
+            if (
+                handoff.get("acceptance_count") != 1
+                or handoff.get("unblocked_mask") != ["HUP", "INT", "TERM"]
+                or handoff.get("signal_ready_accepted_sequence")
+                != handoff.get("signal_ready_sequence")
+                or not isinstance(unblock, int)
+                or isinstance(unblock, bool)
+                or (functional is None and handoff.get("pending_signal") is None)
+                or (
+                    functional is not None
+                    and (
+                        not isinstance(functional, int)
+                        or isinstance(functional, bool)
+                        or functional <= unblock
+                    )
+                )
+                or bootstrap.get("live_fixture_passed") is not True
+            ):
+                yield "$.offline_evidence.bootstrap_report: committed READY handoff is unbound"
+            yield from _handoff_forward_errors(handoff, identity)
+        elif handoff.get("terminal_state") == "FAILED":
+            identity = handoff.get("signal_ready_identity")
+            acceptance = handoff.get("acceptance_count")
+            unblock = handoff.get("unblock_trace_record_index")
+            functional = handoff.get("first_functional_trace_record_index")
+            unblocked = handoff.get("unblocked_mask")
+            if acceptance == 1:
+                remained_blocked = (
+                    unblocked == [] and unblock is None and functional is None
+                )
+                unblocked_before_failure = (
+                    unblocked == ["HUP", "INT", "TERM"]
+                    and isinstance(unblock, int)
+                    and not isinstance(unblock, bool)
+                    and (
+                        functional is None
+                        or (
+                            isinstance(functional, int)
+                            and not isinstance(functional, bool)
+                            and functional > unblock
+                        )
+                    )
+                )
+                if (
+                    not isinstance(identity, dict)
+                    or handoff.get("signal_ready_accepted_sequence")
+                    != handoff.get("signal_ready_sequence")
+                    or not (remained_blocked or unblocked_before_failure)
+                ):
+                    yield "$.offline_evidence.bootstrap_report: accepted FAILED handoff is unbound"
+                yield from _handoff_forward_errors(handoff, identity)
+            elif acceptance == 0 and (
+                handoff.get("signal_ready_accepted_sequence") is not None
+                or handoff.get("signal_ready_accepted_sha256") is not None
+                or unblocked != []
+                or unblock is not None
+                or functional is not None
+                or handoff.get("forward_count") != 0
+                or handoff.get("forward_target_pgid") is not None
+            ):
+                yield "$.offline_evidence.bootstrap_report: unaccepted FAILED handoff contains accepted activity"
+    elif launch_state == "PRE_COORDINATOR_INTERRUPTED":
+        if trace_state != "FINALIZER_ONLY":
+            yield "$.offline_evidence.trace: pre-coordinator interruption requires FINALIZER_ONLY"
+        if pre.get("state") != "NOT_RUN" or post.get("state") != "NOT_RUN":
+            yield "$.offline_evidence: pre-coordinator interruption forbids host observation"
+    elif launch_state == "FINALIZER_ONLY_BOOTSTRAP_FAILURE":
+        if trace_state != "FINALIZER_ONLY":
+            yield "$.offline_evidence.trace: finalizer-only bootstrap requires FINALIZER_ONLY"
+    elif launch_state == "NOT_STARTED_BOOTSTRAP_FAILURE":
+        if trace_state != "NOT_STARTED":
+            yield "$.offline_evidence.trace: not-started bootstrap requires NOT_STARTED"
+
+    if trace_state in {"FINALIZER_ONLY", "NOT_STARTED"} and (
+        window != "NOT_ENTERED" or begin is not None or end is not None
+    ):
+        yield "$.offline_evidence: FINALIZER_ONLY/NOT_STARTED requires DDS NOT_ENTERED"
+
+    query_status = gates_by_id.get("semantic.fixture_query", {}).get("status")
+    if query_status == "PASS" and window != "CLOSED":
+        yield "$.gates[semantic.fixture_query]: PASS requires a CLOSED DDS window"
+
+    preflight_status = gates_by_id.get("safety.workstation_preflight", {}).get("status")
+    if preflight_status == "NOT_RUN" and (
+        pre.get("state") != "NOT_RUN" or post.get("state") != "NOT_RUN"
+    ):
+        yield "$.gates[safety.workstation_preflight]: NOT_RUN forbids host observations"
+
+    postflight_status = gates_by_id.get("safety.workstation_postflight", {}).get(
+        "status"
+    )
+    valid_nonaction_observers = (
+        launch_state == "PRE_COORDINATOR_INTERRUPTED" or preflight_status != "PASS"
+    ) and pre.get("state") == post.get("state") == "NOT_RUN"
+    if (
+        postflight_status == "PASS"
+        and not valid_nonaction_observers
+        and (pre.get("state") != "OBSERVED" or post.get("state") != "OBSERVED")
+    ):
+        yield "$.gates[safety.workstation_postflight]: PASS requires pre/post host observations"
+    if postflight_status == "FAIL":
+        for phase, observer in (("pre", pre), ("post", post)):
+            if observer.get("state") == "NOT_RUN" and (
+                observer.get("cause_gate") != "safety.workstation_postflight"
+                or observer.get("reason") != "POSTFLIGHT_FAILED"
+            ):
+                yield f"$.offline_evidence.host_observer_{phase}: postflight failure cause is invalid"
+
+    accepted_state_sha256 = evidence.get("ledger_chain_manifest", {}).get(
+        "accepted_action_state_sha256"
+    )
+    action_state = {
+        "gates": copy.deepcopy(gates[:24]),
+        "semantic_dds_window": window,
+    }
+    observed_state_sha256 = hashlib.sha256(
+        canonical_json_bytes(action_state)
+    ).hexdigest()
+    if accepted_state_sha256 != observed_state_sha256:
+        yield "$.offline_evidence.ledger_chain_manifest: accepted ledger action state differs from result gates"
+
+
+def _handoff_forward_errors(
+    handoff: Mapping[str, object], identity: object
+) -> Iterable[str]:
+    forward = handoff.get("forward_count")
+    target = handoff.get("forward_target_pgid")
+    pending = handoff.get("pending_signal")
+    if forward == 1 and (
+        not isinstance(identity, dict)
+        or target != identity.get("pgid")
+        or pending not in {"HUP", "INT", "TERM"}
+    ):
+        yield "$.offline_evidence.bootstrap_report: forwarded signal differs from accepted handoff identity"
+    if forward == 0 and target is not None:
+        yield "$.offline_evidence.bootstrap_report: unforwarded handoff has a target PGID"
+
+
+def _handoff_history_errors(
+    handoff: Mapping[str, object], first_signal: object
+) -> Iterable[str]:
+    events = handoff.get("event_sequence")
+    if not isinstance(events, list):
+        yield "$.offline_evidence.bootstrap_report.handoff: event history is invalid"
+        return
+    states: list[object] = []
+    for index, event in enumerate(events):
+        if (
+            not isinstance(event, dict)
+            or event.get("sequence") != index
+            or not isinstance(event.get("state"), str)
+        ):
+            yield "$.offline_evidence.bootstrap_report.handoff: event history is invalid"
+            return
+        states.append(event["state"])
+    terminal = handoff.get("terminal_state")
+    pending = handoff.get("pending_signal")
+    if handoff.get("inherited_mask") != ["HUP", "INT", "TERM"]:
+        yield "$.offline_evidence.bootstrap_report.handoff: inherited mask is invalid"
+    if terminal == "READY":
+        allowed = {
+            ("AWAITING_READY", "AWAITING_ACCEPTANCE", "READY"),
+            (
+                "AWAITING_READY",
+                "AWAITING_ACCEPTANCE",
+                "PENDING_FORWARD",
+                "READY",
+            ),
+        }
+        if tuple(states) not in allowed or (
+            "PENDING_FORWARD" in states and pending is None
+        ):
+            yield "$.offline_evidence.bootstrap_report.handoff: READY event history is invalid"
+    elif terminal == "FAILED":
+        allowed = {
+            ("AWAITING_READY", "FAILED"),
+            ("AWAITING_READY", "PENDING_FORWARD", "FAILED"),
+            ("AWAITING_READY", "AWAITING_ACCEPTANCE", "FAILED"),
+            (
+                "AWAITING_READY",
+                "AWAITING_ACCEPTANCE",
+                "PENDING_FORWARD",
+                "FAILED",
+            ),
+        }
+        if tuple(states) not in allowed or (
+            "PENDING_FORWARD" in states and pending is None
+        ):
+            yield "$.offline_evidence.bootstrap_report.handoff: FAILED event history is invalid"
+        request_items = (
+            handoff.get("signal_ready_identity"),
+            handoff.get("signal_ready_sequence"),
+            handoff.get("signal_ready_sha256"),
+        )
+        request_present = all(item is not None for item in request_items)
+        if request_present != ("AWAITING_ACCEPTANCE" in states) or (
+            not request_present and any(item is not None for item in request_items)
+        ):
+            yield "$.offline_evidence.bootstrap_report.handoff: FAILED ready request is partial or unbound"
+    elif terminal == "NOT_APPLICABLE":
+        inactive_fields = (
+            handoff.get("signal_ready_identity"),
+            handoff.get("signal_ready_sequence"),
+            handoff.get("signal_ready_sha256"),
+            handoff.get("signal_ready_accepted_sequence"),
+            handoff.get("signal_ready_accepted_sha256"),
+            handoff.get("forward_target_pgid"),
+            handoff.get("unblock_trace_record_index"),
+            handoff.get("first_functional_trace_record_index"),
+        )
+        if (
+            states
+            or any(item is not None for item in inactive_fields)
+            or handoff.get("unblocked_mask") != []
+            or handoff.get("acceptance_count") != 0
+            or handoff.get("forward_count") != 0
+            or pending != first_signal
+        ):
+            yield "$.offline_evidence.bootstrap_report.handoff: NOT_APPLICABLE history is invalid"
+
+
+def _trusted_host_inspection_errors(
+    phase: str, observer: Mapping[str, object]
+) -> Iterable[str]:
+    inspection = observer.get("trusted_inspection")
+    path = f"$.offline_evidence.host_observer_{phase}.trusted_inspection"
+    if observer.get("state") == "NOT_RUN":
+        if inspection is not None:
+            yield f"{path}: NOT_RUN must not contain trusted inspection evidence"
+        return
+    if not isinstance(inspection, dict):
+        yield f"{path}: OBSERVED requires trusted inspection evidence"
+        return
+    gateway = inspection.get("gateway_status_command")
+    listener = inspection.get("listener_command")
+    definitions = inspection.get("service_definitions")
+    listener_inventory = inspection.get("listener_inventory")
+    if (
+        gateway
+        != [
+            gateway[0] if isinstance(gateway, list) and gateway else "",
+            "gateway",
+            "status",
+            "--deep",
+            "--no-probe",
+            "--json",
+        ]
+        or not isinstance(gateway[0], str)
+        or not gateway[0].startswith("/")
+        or inspection.get("gateway_status_exit") != 0
+        or not isinstance(inspection.get("gateway_status_sha256"), str)
+        or not _SHA256_PATTERN.fullmatch(inspection["gateway_status_sha256"])
+        or inspection.get("gateway_status_state") not in {"INACTIVE", "ACTIVE"}
+        or listener
+        != [
+            listener[0] if isinstance(listener, list) and listener else "",
+            "-H",
+            "-ltnp",
+        ]
+        or not isinstance(listener[0], str)
+        or not listener[0].startswith("/")
+        or not isinstance(definitions, list)
+        or definitions != sorted(set(definitions))
+        or not isinstance(listener_inventory, list)
+        or listener_inventory != sorted(set(listener_inventory))
+        or observer.get("listener_count") != len(listener_inventory)
+    ):
+        yield f"{path}: exact command/output evidence is invalid"
 
 
 def _conditional_status_errors(

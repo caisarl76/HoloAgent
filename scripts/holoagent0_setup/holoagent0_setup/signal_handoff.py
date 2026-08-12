@@ -23,6 +23,10 @@ class SignalHandoffError(RuntimeError):
     """A role-local signal-readiness transition failed closed."""
 
 
+class SignalHandoffInterrupted(RuntimeError):
+    """A reviewed signal handler interrupted the OS-unblock transition."""
+
+
 _SIGNAL_SET = frozenset({"HUP", "INT", "TERM"})
 _SIGNAL_ORDER = ("HUP", "INT", "TERM")
 _SIGNAL_NUMBERS = {
@@ -169,6 +173,7 @@ class TraceUnblockEvidence:
     unblock_trace_record_index: int
     first_functional_trace_record_index: int | None
     functional_count: int
+    delivered_signal: str | None = None
 
     def __post_init__(self) -> None:
         _require_nonce(self.run_nonce)
@@ -189,6 +194,16 @@ class TraceUnblockEvidence:
             raise SignalHandoffError("first functional trace index is invalid")
         if type(self.functional_count) is not int or self.functional_count < 0:
             raise SignalHandoffError("trace functional count is invalid")
+        if self.delivered_signal is not None and self.delivered_signal not in {
+            "HUP",
+            "INT",
+            "TERM",
+        }:
+            raise SignalHandoffError("trace delivered signal is invalid")
+        if self.functional_count > 0 and self.delivered_signal is not None:
+            raise SignalHandoffError(
+                "progressed trace cannot claim interruption delivery"
+            )
 
 
 @dataclass(frozen=True)
@@ -247,6 +262,8 @@ class _OSSignalOperations:
     def unblock_reviewed(self) -> None:
         try:
             signal.pthread_sigmask(signal.SIG_UNBLOCK, set(_SIGNAL_NUMBERS.values()))
+        except SignalHandoffInterrupted:
+            raise
         except (OSError, RuntimeError, ValueError) as error:
             raise SignalHandoffError("could not unblock reviewed signals") from error
 
@@ -290,6 +307,14 @@ class CoordinatorSignalHandoff:
         self._events: list[HandoffEvent] = []
         self._state_version = 0
         self._transition: str | None = None
+
+    @property
+    def run_nonce(self) -> str:
+        return self._run_nonce
+
+    @property
+    def identity(self) -> ProcessIdentity:
+        return self._identity
 
     def send_ready(
         self,
@@ -382,6 +407,14 @@ class CoordinatorSignalHandoff:
             version = self._state_version
         try:
             self._signal_operations.unblock_reviewed()
+        except SignalHandoffInterrupted:
+            with self._lock:
+                self._require_transition_unchanged_locked(transition, version)
+                self._unblock_count = 1
+                self._state = "LIVE_READY"
+                self._event("signals_unblocked")
+                self._finish_transition_locked(transition)
+            raise
         except Exception as error:
             with self._lock:
                 if self._terminal_state is None:
@@ -678,6 +711,7 @@ class SupervisorSignalHandoff:
                 return
             self._require_transition_idle()
             if self._pending_signal is not None:
+                self._event(f"signal_repeated:{signal_name}")
                 return
             self._pending_signal = signal_name
             self._event("signal_latched")

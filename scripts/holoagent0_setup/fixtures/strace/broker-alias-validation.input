@@ -1,0 +1,8 @@
+401   1700000061.000001 fcntl(4<pipe:[37390019]>, F_DUPFD_CLOEXEC, 0) = 3<pipe:[37390019]> <0.000005>
+401   1700000061.000002 fstat(3<pipe:[37390019]>, {st_dev=makedev(0, 0xe), st_ino=37390019, st_mode=S_IFIFO|0600, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=0, st_size=0, st_atime=1700000061, st_atime_nsec=1, st_mtime=1700000061, st_mtime_nsec=1, st_ctime=1700000061, st_ctime_nsec=1}) = 0 <0.000004>
+401   1700000061.000003 readlink("/proc/self/fd/3", "pipe:[37390019]", 4096) = 15 <0.000011>
+401   1700000061.000004 fcntl(3<pipe:[37390019]>, F_GETFL) = 0x1 (flags O_WRONLY) <0.000052>
+401   1700000061.000005 fcntl(14<pipe:[37635049]>, F_DUPFD_CLOEXEC, 0) = 15<pipe:[37635049]> <0.000005>
+401   1700000061.000006 newfstatat(15<pipe:[37635049]>, "", {st_dev=makedev(0, 0xe), st_ino=37635049, st_mode=S_IFIFO|0600, st_nlink=1, st_uid=1000, st_gid=1000, st_blksize=4096, st_blocks=0, st_size=0, st_atime=1700000061, st_atime_nsec=1, st_mtime=1700000061, st_mtime_nsec=1, st_ctime=1700000061, st_ctime_nsec=1}, AT_EMPTY_PATH) = 0 <0.000004>
+401   1700000061.000007 readlink("/proc/self/fd/15", "pipe:[37635049]", 4096) = 15 <0.000009>
+401   1700000061.000008 fcntl(15<pipe:[37635049]>, F_GETFL) = 0 (flags O_RDONLY) <0.000004>

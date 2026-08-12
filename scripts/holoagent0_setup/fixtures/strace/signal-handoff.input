@@ -1,0 +1,10 @@
+401   1700000060.000001 prctl(PR_SET_NAME, "H0R666666666666"...) = 0 <0.000001>
+401   1700000060.000002 prctl(PR_GET_NAME, "H0R666666666666") = 0 <0.000001>
+401   1700000060.000003 rt_sigprocmask(SIG_BLOCK, [], [HUP INT TERM], 8) = 0 <0.000001>
+401   1700000060.000004 rt_sigaction(SIGHUP, {sa_handler=0x1234, sa_mask=[], sa_flags=SA_RESTORER|SA_ONSTACK, sa_restorer=0x5678}, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=0}, 8) = 0 <0.000001>
+401   1700000060.000005 rt_sigaction(SIGINT, {sa_handler=0x1234, sa_mask=[], sa_flags=SA_RESTORER|SA_ONSTACK, sa_restorer=0x5678}, {sa_handler=0x1234, sa_mask=[], sa_flags=SA_RESTORER|SA_ONSTACK, sa_restorer=0x5678}, 8) = 0 <0.000001>
+401   1700000060.000006 rt_sigaction(SIGTERM, {sa_handler=0x1234, sa_mask=[], sa_flags=SA_RESTORER|SA_ONSTACK, sa_restorer=0x5678}, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=0}, 8) = 0 <0.000001>
+401   1700000060.000007 rt_sigprocmask(SIG_UNBLOCK, [HUP INT TERM], [HUP INT TERM], 8) = 0 <0.000001>
+401   1700000060.000008 rt_sigprocmask(SIG_BLOCK, [], [], 8) = 0 <0.000001>
+401   1700000060.000009 prctl(PR_GET_NAME, "H0R666666666666") = 0 <0.000001>
+401   1700000060.000010 prctl(PR_SET_NAME, "H0F666666666666"...) = 0 <0.000001>

@@ -1,0 +1,2 @@
+{"duration":"0.000001","entry_index":1,"exit_index":0,"kind":"syscall","pid":202,"record_index":0,"result":{"value":202},"syscall":"getpid","timestamp":"1700000054.000002"}
+{"duration":"0.000010","entry_index":0,"exit_index":1,"kind":"syscall","pid":201,"record_index":1,"result":{"value":202},"syscall":"vfork","timestamp":"1700000054.000001","transition":{"child_pid":202,"fd_table":"copied","operation":"vfork"}}

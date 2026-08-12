@@ -1,0 +1,3 @@
+301   1700000055.000001 pselect6(4, NULL, [3<pipe:[301]>], NULL, {tv_sec=0, tv_nsec=974051000}, NULL) = 1 (out [3], left {tv_sec=0, tv_nsec=974049637}) <0.000008>
+302   1700000055.000002 pselect6(4, [3<pipe:[302]>], NULL, NULL, {tv_sec=0, tv_nsec=998087000}, NULL) = 1 (in [3], left {tv_sec=0, tv_nsec=998085776}) <0.000006>
+303   1700000055.000003 pselect6(4, [3<pipe:[303]>], NULL, NULL, {tv_sec=0, tv_nsec=1}, NULL) = 0 (Timeout) <0.000005>
