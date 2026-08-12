@@ -4,7 +4,8 @@
   "type": "object",
   "required": [
     "schema_version", "schema_sha256", "run_id", "started_at", "ended_at",
-    "hostname", "architecture", "status", "reason", "pins", "registry",
+    "hostname", "architecture", "status", "reason", "provisioning_mode",
+    "lineage", "quarantine_device", "quarantine_mount_id", "pins", "registry",
     "package", "payload", "installer", "target_prefix", "configuration",
     "before_observation", "after_observation"
   ],
@@ -18,37 +19,83 @@
     "architecture": {"type": "string", "minLength": 1, "maxLength": 64},
     "status": {"type": "string", "enum": ["PASS", "FAIL"]},
     "reason": {"type": "string", "enum": ["OK", "PREEXISTING_OPENCLAW", "INSTALLER_PIN_MISMATCH", "REGISTRY_INTEGRITY_MISMATCH", "INSTALLED_PAYLOAD_MISMATCH", "OPENCLAW_VERSION_MISMATCH", "OPENCLAW_CONFIG_MISMATCH", "OPENCLAW_CONFIG_INVALID", "OPENCLAW_LINT_FINDING", "TOOL_RUNTIME_ERROR", "ATOMIC_WRITE_FAILED"]},
+    "provisioning_mode": {"type": "string", "enum": ["FRESH_INSTALL", "VERIFIED_EXISTING_PREFIX"]},
+    "lineage": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/lineage"}]},
+    "quarantine_device": {"type": "integer", "minimum": 0},
+    "quarantine_mount_id": {"type": "integer", "minimum": 1},
     "pins": {"$ref": "#/$defs/pins"},
-    "registry": {"$ref": "#/$defs/registry"},
-    "package": {"$ref": "#/$defs/package"},
-    "payload": {"$ref": "#/$defs/payload"},
-    "installer": {"$ref": "#/$defs/installer"},
+    "registry": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/registry"}]},
+    "package": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/package"}]},
+    "payload": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/payload"}]},
+    "installer": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/installer"}]},
     "target_prefix": {"$ref": "#/$defs/manifest"},
     "configuration": {"$ref": "#/$defs/configuration"},
     "before_observation": {"$ref": "#/$defs/observation"},
-    "after_observation": {"$ref": "#/$defs/observation"}
+    "after_observation": {"$ref": "#/$defs/observationEvidence"}
   },
   "additionalProperties": false,
   "oneOf": [
-    {"properties": {"status": {"const": "PASS"}, "reason": {"const": "OK"}}, "required": ["status", "reason"]},
+    {
+      "properties": {
+        "status": {"const": "PASS"},
+        "reason": {"const": "OK"},
+        "registry": {"$ref": "#/$defs/registry"},
+        "package": {"$ref": "#/$defs/package"},
+        "payload": {"$ref": "#/$defs/payload"},
+        "installer": {"$ref": "#/$defs/installer"},
+        "configuration": {"$ref": "#/$defs/cleanConfiguration"},
+        "before_observation": {"$ref": "#/$defs/emptyObservation"},
+        "after_observation": {"$ref": "#/$defs/emptyObservation"}
+      },
+      "required": ["status", "reason", "provisioning_mode", "lineage", "quarantine_device", "quarantine_mount_id", "registry", "package", "payload", "installer", "after_observation"],
+      "oneOf": [
+        {
+          "properties": {
+            "provisioning_mode": {"const": "FRESH_INSTALL"},
+            "lineage": {"type": "null"},
+            "installer": {"$ref": "#/$defs/freshInstaller"}
+          }
+        },
+        {
+          "properties": {
+            "provisioning_mode": {"const": "VERIFIED_EXISTING_PREFIX"},
+            "lineage": {"$ref": "#/$defs/lineage"},
+            "installer": {"$ref": "#/$defs/existingInstaller"}
+          }
+        }
+      ]
+    },
     {"properties": {"status": {"const": "FAIL"}, "reason": {"enum": ["PREEXISTING_OPENCLAW", "INSTALLER_PIN_MISMATCH", "REGISTRY_INTEGRITY_MISMATCH", "INSTALLED_PAYLOAD_MISMATCH", "OPENCLAW_VERSION_MISMATCH", "OPENCLAW_CONFIG_MISMATCH", "OPENCLAW_CONFIG_INVALID", "OPENCLAW_LINT_FINDING", "TOOL_RUNTIME_ERROR", "ATOMIC_WRITE_FAILED"]}}, "required": ["status", "reason"]}
   ],
   "$defs": {
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "nullableSha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]},
+    "lineage": {
+      "type": "object",
+      "required": ["parent_record_path", "parent_record_sha256", "parent_run_id", "parent_schema_sha256", "parent_target_prefix_sha256"],
+      "properties": {
+        "parent_record_path": {"type": "string", "pattern": "^/", "minLength": 2, "maxLength": 4096},
+        "parent_record_sha256": {"$ref": "#/$defs/sha256"},
+        "parent_run_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "parent_schema_sha256": {"$ref": "#/$defs/sha256"},
+        "parent_target_prefix_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
     "pins": {
       "type": "object",
-      "required": ["package_name", "package_version", "node_version", "node_tarball_sha256", "npm_version", "installer_path", "installer_sha256", "registry_document_url", "configuration_template_path", "configuration_template_sha256"],
+      "required": ["package_name", "package_version", "node_version", "node_tarball_sha256", "npm_version", "installer_path", "installer_sha256", "registry_document_url", "configuration_template_path", "configuration_template_git_blob", "configuration_template_sha256"],
       "properties": {
         "package_name": {"const": "openclaw"},
         "package_version": {"const": "2026.7.1-2"},
         "node_version": {"const": "24.15.0"},
         "node_tarball_sha256": {"const": "472655581fb851559730c48763e0c9d3bc25975c59d518003fc0849d3e4ba0f6"},
-        "npm_version": {"type": "string", "minLength": 1, "maxLength": 64},
+        "npm_version": {"type": ["string", "null"], "minLength": 1, "maxLength": 64},
         "installer_path": {"const": "https://openclaw.ai/install-cli.sh"},
         "installer_sha256": {"const": "21b2b0fc74bd0876bfa6d4268cb28e2b11325204eebd529963d121a2a3126ca1"},
         "registry_document_url": {"const": "https://registry.npmjs.org/openclaw/2026.7.1-2"},
         "configuration_template_path": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "configuration_template_git_blob": {"const": "28a976724026d615fd21a79d701f8987b28a4f98"},
         "configuration_template_sha256": {"$ref": "#/$defs/sha256"}
       },
       "additionalProperties": false
@@ -83,17 +130,39 @@
     },
     "installer": {
       "type": "object",
-      "required": ["node_path", "node_sha256", "npm_cli_path", "npm_cli_sha256", "openclaw_cli_path", "openclaw_cli_sha256", "argv"],
+      "required": ["node_path", "node_sha256", "npm_cli_path", "npm_cli_sha256", "driver_path", "driver_sha256", "openclaw_cli_path", "openclaw_cli_sha256", "argv"],
       "properties": {
         "node_path": {"type": "string", "minLength": 1, "maxLength": 4096},
         "node_sha256": {"$ref": "#/$defs/sha256"},
         "npm_cli_path": {"type": "string", "minLength": 1, "maxLength": 4096},
         "npm_cli_sha256": {"$ref": "#/$defs/sha256"},
+        "driver_path": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "driver_sha256": {"const": "a8480748009b3f070d5d456eb8297896a7fe28b41f58015a17013dce4059a672"},
         "openclaw_cli_path": {"type": ["string", "null"], "maxLength": 4096},
         "openclaw_cli_sha256": {"$ref": "#/$defs/nullableSha256"},
         "argv": {"type": "array", "minItems": 1, "items": {"type": "string", "maxLength": 4096}}
       },
       "additionalProperties": false
+    },
+    "freshInstaller": {
+      "allOf": [
+        {"$ref": "#/$defs/installer"},
+        {"properties": {"argv": {"type": "array", "minItems": 13, "maxItems": 13, "prefixItems": [
+          {"const": "/usr/bin/bash"}, {"const": "--noprofile"}, {"const": "--norc"},
+          {"type": "string", "pattern": "^/proc/self/fd/[0-9]+$"}, {"type": "string", "pattern": "^[0-9]+$"},
+          {"const": "--prefix"}, {"type": "string", "pattern": "^/"}, {"const": "--version"},
+          {"type": "string", "pattern": "^file:/"}, {"const": "--node-version"}, {"const": "24.15.0"},
+          {"const": "--no-onboard"}, {"const": "--json"}
+        ], "items": false}}}
+      ]
+    },
+    "existingInstaller": {
+      "allOf": [
+        {"$ref": "#/$defs/installer"},
+        {"properties": {"argv": {"type": "array", "minItems": 3, "maxItems": 3, "prefixItems": [
+          {"const": "verify-existing-prefix"}, {"type": "string", "pattern": "^/"}, {"type": "string", "pattern": "^/"}
+        ], "items": false}}}
+      ]
     },
     "manifestEntry": {
       "type": "object",
@@ -112,6 +181,12 @@
       "required": ["template_sha256", "installed_sha256", "valid", "lint_findings"],
       "properties": {"template_sha256": {"$ref": "#/$defs/sha256"}, "installed_sha256": {"$ref": "#/$defs/nullableSha256"}, "valid": {"type": "boolean"}, "lint_findings": {"type": "array", "items": {"type": "string", "maxLength": 512}}},
       "additionalProperties": false
+    },
+    "cleanConfiguration": {
+      "allOf": [
+        {"$ref": "#/$defs/configuration"},
+        {"properties": {"valid": {"const": true}, "lint_findings": {"type": "array", "maxItems": 0}}}
+      ]
     },
     "process": {
       "type": "object",
@@ -136,6 +211,24 @@
       "required": ["processes", "services", "listeners"],
       "properties": {"processes": {"type": "array", "items": {"$ref": "#/$defs/process"}}, "services": {"type": "array", "items": {"$ref": "#/$defs/service"}}, "listeners": {"type": "array", "items": {"$ref": "#/$defs/listener"}}},
       "additionalProperties": false
+    },
+    "emptyObservation": {
+      "allOf": [
+        {"$ref": "#/$defs/observation"},
+        {"properties": {"processes": {"type": "array", "maxItems": 0}, "services": {"type": "array", "maxItems": 0}, "listeners": {"type": "array", "maxItems": 0}}}
+      ]
+    },
+    "unavailableObservation": {
+      "type": "object",
+      "required": ["state", "reason"],
+      "properties": {"state": {"const": "UNAVAILABLE"}, "reason": {"const": "TOOL_RUNTIME_ERROR"}},
+      "additionalProperties": false
+    },
+    "observationEvidence": {
+      "oneOf": [
+        {"$ref": "#/$defs/observation"},
+        {"$ref": "#/$defs/unavailableObservation"}
+      ]
     }
   }
 }

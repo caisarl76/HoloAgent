@@ -954,13 +954,33 @@ package spec:
 --no-onboard --json
 ```
 
-The pinned installer passes that value to npm as
-`openclaw@file:/absolute/path/...tgz`; it must not be invoked with the registry
-version string, a tag, or `latest`. Thus npm's OpenClaw package input is the
-already verified artifact rather than a second registry resolution. The
-installer output and installed `package.json` must still report version
-`2026.7.1-2`. An upstream digest or integrity change requires a reviewed pin
-update. Installation does not start or refresh a gateway.
+The parent reads the exact installer through one `O_NOFOLLOW` descriptor,
+verifies its SHA-256, and copies those bytes into a Linux memfd sealed against
+write, growth, shrink, and further seal changes. It does the same for the
+tracked driver, executes that sealed driver through `/proc/self/fd/<n>`, and
+passes both descriptors explicitly to the child. The sealed driver verifies every
+required installer seal and
+the installer SHA-256 before sourcing `/proc/self/fd/<n>` with
+`OPENCLAW_INSTALL_CLI_SH_NO_RUN=1`, then closes the descriptor. The driver
+invokes only the installer's `parse_args` and
+`install_openclaw` functions after validating the exact arguments, preinstalled
+Node/npm paths, local `file:` tarball, and no-onboard posture. It must never call
+the installer `main`, `install_node`, `ensure_git`, npm-prefix repair, gateway
+refresh/status, or onboarding paths. The reviewed subset passes the verified
+value to npm as `openclaw@file:/absolute/path/...tgz`; it must not use the
+registry version string, a tag, or `latest`.
+The package path is a mode-`0400` regular file inside the mode-`0700`
+provisioner-owned download directory and its SRI/SHA-256 are rechecked
+immediately before launch. It remains a pathname because the pinned npm parser
+classifies `/proc/self/fd/<n>` as a directory rather than a tarball.
+Npm user/global configuration is disabled and its cache is an owned mode-`0700`
+directory inside the provisioning run, so installation does not mutate the
+caller's default npm state.
+The installed `package.json` and
+subsequent isolated CLI version check must still report `2026.7.1-2`, and the
+preinstalled Node/npm bytes remain bound to the saved Node tarball. An upstream
+installer, driver, package, or integrity change requires a reviewed pin update.
+Installation does not start, inspect through an RPC probe, or refresh a gateway.
 
 Before accepting the prefix, provisioning builds two canonical OpenClaw
 payload manifests. The expected manifest comes from the verified tarball after

@@ -1053,6 +1053,7 @@ git commit -m "feat: add deterministic offline AgentOS plans"
 
 **Files:**
 - Create: `scripts/holoagent0_setup/provision_openclaw.sh`
+- Create: `scripts/holoagent0_setup/openclaw_install_driver.sh`
 - Create: `scripts/holoagent0_setup/config/openclaw-local-v1.json`
 - Create: `scripts/holoagent0_setup/holoagent0_setup/openclaw_gate.py`
 - Test: `scripts/holoagent0_setup/tests/test_openclaw_provisioning.py`
@@ -1080,7 +1081,7 @@ Expected: FAIL because provisioning and lifecycle adapters are missing.
 
 - [ ] **Step 3: Implement exact artifact and configuration flow**
 
-Pin Node, installer digest, `openclaw@2026.7.1-2`, registry `dist.integrity`, tarball SHA-512, installed canonical payload manifest, local prefix, provisioning schema digest, and minimal loopback configuration. Refuse mutation if a service/process/listener exists. Use only `openclaw gateway status --deep --no-probe --json`, `config validate`, and the two approved `doctor --lint --json` invocations; never start a gateway in the offline profile.
+Pin Node, installer digest, `openclaw@2026.7.1-2`, registry `dist.integrity`, tarball SHA-512, installed canonical payload manifest, local prefix, provisioning schema digest, and minimal loopback configuration. Refuse mutation if a service/process/listener exists. Identity-safely read and hash the exact installer and tracked driver, copy each into a write/grow/shrink/seal-locked Linux memfd, execute the sealed driver through `/proc/self/fd/<n>`, and explicitly pass both descriptors to the child. The driver rechecks all installer seals and the digest, sources `/proc/self/fd/<n>` under `OPENCLAW_INSTALL_CLI_SH_NO_RUN=1`, closes the installer FD, and invokes only the argument parser and validated `install_openclaw` subset with the preinstalled verified Node/npm and local `file:` tarball. Because the pinned npm parser treats `/proc/self/fd/<n>` as a directory, the tarball remains a mode-`0400` file in the mode-`0700` owned download directory and is SRI/SHA-256 reverified immediately before launch. Disable npm user/global configuration and place its cache in an owned mode-`0700` directory inside the run. The installer `main`, `install_node`, `ensure_git`, npm-prefix repair, refresh/status, and onboarding paths are forbidden. Use only `openclaw gateway status --deep --no-probe --json`, `config validate`, and the two approved `doctor --lint --json` invocations after install; never start a gateway in the offline profile.
 
 Expose the optional authenticated loopback smoke action as a separate CLI subcommand with PID/PGID/start-time/executable ownership and guaranteed cleanup, but cover it only with fake-listener tests in this plan. A live smoke invocation remains separately authorized and is never called by provisioning or `workstation_offline`.
 
@@ -1098,20 +1099,23 @@ The literal pins are installer SHA-256 `21b2b0fc74bd0876bfa6d4268cb28e2b11325204
 ```
 
 ```bash
-npm view "openclaw@2026.7.1-2" dist.integrity --json
-npm pack "openclaw@2026.7.1-2" --pack-destination "${verified_dir}"
-PYTHONPATH=scripts/holoagent0_setup python3 -m holoagent0_setup.openclaw_gate \
-  verify-sri --tarball "${tarball}" --integrity "${expected_integrity}"
-"${verified_installer}" --prefix "${HOME}/.openclaw" \
-  --version "file:${tarball}" --node-version 24.15.0 --no-onboard --json
-OPENCLAW_CONFIG_PATH="${HOME}/.openclaw-holoagent0/openclaw.json" \
-  openclaw config validate --json
-OPENCLAW_CONFIG_PATH="${HOME}/.openclaw-holoagent0/openclaw.json" \
-  openclaw doctor --lint --only core/doctor/gateway-config \
-  --severity-min warning --json
-OPENCLAW_CONFIG_PATH="${HOME}/.openclaw-holoagent0/openclaw.json" \
-  openclaw doctor --lint --severity-min error --json
+test -f "${run_dir}/downloads/registry.json"
+test -f "${run_dir}/downloads/openclaw.tgz"
+test -f "${run_dir}/downloads/install-cli.sh"
+test -f "${run_dir}/downloads/node-v24.15.0-linux-x64.tar.xz"
+package_root="$(pwd -P)/scripts/holoagent0_setup"
+/usr/bin/python3.10 -I -S -c \
+  'import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_module("holoagent0_setup.openclaw_gate",run_name="__main__",alter_sys=True)' \
+  "${package_root}" verify-record \
+  --record "${run_dir}/openclaw-provisioning-v1.json" \
+  --prefix "${openclaw_prefix}" \
+  --configuration-root "${openclaw_configuration_root}"
 ```
+
+The separately authorized provisioner saves those four response artifacts first,
+validates their exact pins, then invokes only the sealed tracked driver subset over
+the saved mode-`0400` tarball.  This executable verification example is intentionally
+offline: it neither queries npm nor runs the upstream installer entry point.
 
 - [ ] **Step 4: Run provisioner dry-run and gate tests**
 

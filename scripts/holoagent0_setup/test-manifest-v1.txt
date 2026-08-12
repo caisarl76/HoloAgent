@@ -25,4 +25,6 @@ scripts/holoagent0_setup/tests/test_strace_provisioner_revision10.py
 scripts/holoagent0_setup/tests/test_strace_provisioner_revision11.py
 scripts/holoagent0_setup/tests/test_strace_provisioner_revision12.py
 scripts/holoagent0_setup/tests/test_strace_provisioner_revision13.py
+scripts/holoagent0_setup/tests/test_openclaw_provisioning.py
+scripts/holoagent0_setup/tests/test_openclaw_gate.py
 scripts/holoagent0_setup/tests/test_agentos_gate.py

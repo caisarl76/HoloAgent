@@ -1284,6 +1284,9 @@ def test_openclaw_schema_contains_exact_reviewed_pins(contract: ContractSet):
     pins = definitions["pins"]["properties"]
     assert pins["package_version"]["const"] == "2026.7.1-2"
     assert pins["node_version"]["const"] == "24.15.0"
+    assert pins["configuration_template_git_blob"]["const"] == (
+        "28a976724026d615fd21a79d701f8987b28a4f98"
+    )
     assert pins["installer_sha256"]["const"] == (
         "21b2b0fc74bd0876bfa6d4268cb28e2b11325204eebd529963d121a2a3126ca1"
     )
