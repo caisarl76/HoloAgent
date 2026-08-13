@@ -1092,11 +1092,17 @@ socket evidence. Gateway status behavior is documented at
 
 ### 4. Pinned OVO/FSR-VLN Validation
 
-The source gate reuses immutable semantic recovery commit
-`f164095abb0045a69c0b8eb23683063be3deaa38` and the exact build-driven 74-path
-manifest from `2026-07-22-holoagent-mujoco-first-design.md`. Every tracked path
-must match its blob at that commit. The rule remains build-driven: it does not
-restore every file missing from the old snapshot.
+The source gate uses the exact build-driven 74-path manifest from
+`2026-07-22-holoagent-mujoco-first-design.md` with closed mixed provenance.
+Seventy-three paths must match immutable semantic recovery commit
+`f164095abb0045a69c0b8eb23683063be3deaa38`. The sole reviewed override is the
+documentation-only `nav_agent/README.md`, which must match commit
+`d862782b3661e2f2cf155d6e006f11c27063a6b0` and blob
+`291eea5e1969497760c5c48c62a4a04623a09eb6` with Git mode `100644` so the
+later MuJoCo/PC2 handoff links remain available. The verifier rejects a
+missing, additional, or changed override, including mode drift. The rule
+remains build-driven: it does not restore every file
+missing from the old snapshot.
 
 The implementation also adds a tracked Stage 0 verifier. The clean feature
 branch must not depend on the main worktree's untracked

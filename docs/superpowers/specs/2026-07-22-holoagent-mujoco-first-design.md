@@ -129,8 +129,13 @@ whose poses are explicitly aligned to `sim_map`; it is outside this milestone.
 
 ### 1. Semantic Source Recovery
 
-Restore the exact 74-path, build-driven manifest from immutable commit
-`f164095abb0045a69c0b8eb23683063be3deaa38`:
+Restore the exact 74-path, build-driven manifest with closed mixed
+provenance: 73 paths use immutable recovery commit
+`f164095abb0045a69c0b8eb23683063be3deaa38`; the documentation-only
+`nav_agent/README.md` uses reviewed commit
+`d862782b3661e2f2cf155d6e006f11c27063a6b0` and blob
+`291eea5e1969497760c5c48c62a4a04623a09eb6` with Git mode `100644` so its
+later MuJoCo/PC2 handoff links are preserved. No other override is permitted:
 
 ```text
 fsr_vln/checkpoints
@@ -384,7 +389,10 @@ timeout.
 ### Stage 0: Software and Semantic Recovery
 
 - The durable recovery branch resolves to the pinned commit.
-- All 74 restored paths match their saved Git blobs.
+- All 74 restored paths match their saved Git blobs: 73 from
+  `f164095abb0045a69c0b8eb23683063be3deaa38` and only
+  `nav_agent/README.md` from
+  `d862782b3661e2f2cf155d6e006f11c27063a6b0`.
 - The checkpoint symlink resolves to both required checkpoint files.
 - Skill registry validation passes.
 - Semantic workspace builds cleanly in `/tmp`.
