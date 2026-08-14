@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import ast
+from contextlib import ExitStack
 from dataclasses import dataclass
 import importlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import signal
+import socket
+import subprocess
+import sys
 from threading import current_thread, main_thread
 import time
 from typing import Callable, Mapping
+from unittest.mock import patch
 
 
 REQUIRED_IMPORTS = ("aiohttp", "loguru", "pyaudio", "pydub", "websockets")
@@ -22,6 +28,12 @@ REQUIRED_PROVIDER_VARIABLES = (
     "CHATBOT_TTS_APP_KEY",
     "CHATBOT_TTS_ACCESS_KEY",
 )
+PYPROJECT_MAX_BYTES = 16 * 1024
+CONFIGURATION_MAX_BYTES = 64 * 1024
+DEFAULT_READINESS_TIMEOUT_SECONDS = 5.0
+MAX_READINESS_TIMEOUT_SECONDS = 30.0
+_CREDENTIAL_MINIMUM_LENGTH = 4
+_CREDENTIAL_PLACEHOLDERS = frozenset({"changeme", "placeholder", "xxxx"})
 _CONFIG_ROOT_KEYS = {
     "audio_device",
     "asr",
@@ -69,6 +81,47 @@ class OfflineStartupSideEffectAttempt(RuntimeError):
     """A configuration-only startup attempted a prohibited operation."""
 
 
+class ChatbotReadinessTimeout(TimeoutError):
+    """The single reviewed chatbot readiness deadline expired."""
+
+
+class _WholeReadinessDeadline:
+    def __init__(self, timeout_seconds: float) -> None:
+        if (
+            type(timeout_seconds) is not float
+            or timeout_seconds < 0.01
+            or timeout_seconds > MAX_READINESS_TIMEOUT_SECONDS
+            or current_thread() is not main_thread()
+        ):
+            raise ValueError("chatbot readiness bound is invalid")
+        self._timeout_seconds = timeout_seconds
+        self._started = 0.0
+        self._previous_handler: object = signal.SIG_DFL
+
+    def __enter__(self) -> "_WholeReadinessDeadline":
+        previous_delay, previous_interval = signal.getitimer(signal.ITIMER_REAL)
+        if previous_delay != 0.0 or previous_interval != 0.0:
+            raise RuntimeError("chatbot readiness alarm is unavailable")
+        self._previous_handler = signal.getsignal(signal.SIGALRM)
+        self._started = time.monotonic()
+        signal.signal(signal.SIGALRM, self._timed_out)
+        signal.setitimer(signal.ITIMER_REAL, self._timeout_seconds)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, self._previous_handler)
+        if (
+            exc_type is None
+            and time.monotonic() - self._started > self._timeout_seconds
+        ):
+            raise ChatbotReadinessTimeout("chatbot readiness timed out")
+
+    @staticmethod
+    def _timed_out(_signum: int, _frame: object) -> None:
+        raise ChatbotReadinessTimeout("chatbot readiness timed out")
+
+
 class StartupSideEffectSpies:
     """Value-blind spies: only the closed operation kind is retained."""
 
@@ -91,6 +144,258 @@ class StartupSideEffectSpies:
 
     def microphone(self, *_args: object, **_kwargs: object) -> None:
         self._attempt("microphone")
+
+
+class _PythonOfflineSideEffectGuard:
+    """Block cached and direct Python process/network entry points."""
+
+    _NETWORK_SOCKET_METHODS = (
+        "connect",
+        "connect_ex",
+        "send",
+        "sendall",
+        "sendto",
+        "sendmsg",
+        "sendfile",
+    )
+    _NETWORK_MODULE_FUNCTIONS = (
+        "create_connection",
+        "getaddrinfo",
+        "gethostbyaddr",
+        "gethostbyname",
+        "gethostbyname_ex",
+    )
+    _SUBPROCESS_FUNCTIONS = (
+        "Popen",
+        "run",
+        "call",
+        "check_call",
+        "check_output",
+    )
+    _AUDIT_NETWORK_EVENTS = frozenset(
+        {
+            "socket.__new__",
+            "socket.bind",
+            "socket.connect",
+            "socket.sendmsg",
+            "socket.sendto",
+            "socket.getaddrinfo",
+            "socket.gethostbyaddr",
+            "socket.gethostbyname",
+            "socket.gethostbyname_ex",
+            "socket.gethostname",
+        }
+    )
+    _AUDIT_PROCESS_EVENTS = frozenset(
+        {
+            "os.exec",
+            "os.fork",
+            "os.forkpty",
+            "os.posix_spawn",
+            "os.spawn",
+            "os.system",
+            "subprocess.Popen",
+        }
+    )
+    _active_guard: "_PythonOfflineSideEffectGuard | None" = None
+    _audit_hook_installed = False
+
+    def __init__(self) -> None:
+        self.network_attempts: list[str] = []
+        self.process_attempts: list[str] = []
+        self._stack: ExitStack | None = None
+
+    def __enter__(self) -> "_PythonOfflineSideEffectGuard":
+        if self._stack is not None or type(self)._active_guard is not None:
+            raise RuntimeError("Python side-effect guard is already active")
+        stack = ExitStack()
+        self._stack = stack
+        try:
+            if not type(self)._audit_hook_installed:
+                sys.addaudithook(type(self)._audit_hook)
+                type(self)._audit_hook_installed = True
+            type(self)._active_guard = self
+            for name in self._NETWORK_SOCKET_METHODS:
+                if hasattr(socket.socket, name):
+                    stack.enter_context(
+                        patch.object(
+                            socket.socket,
+                            name,
+                            self._blocked("network", f"socket.socket.{name}"),
+                        )
+                    )
+            stack.enter_context(
+                patch.object(
+                    socket,
+                    "socket",
+                    self._blocked("network", "socket.socket"),
+                )
+            )
+            for name in self._NETWORK_MODULE_FUNCTIONS:
+                if hasattr(socket, name):
+                    stack.enter_context(
+                        patch.object(
+                            socket,
+                            name,
+                            self._blocked("network", f"socket.{name}"),
+                        )
+                    )
+            for name in self._SUBPROCESS_FUNCTIONS:
+                stack.enter_context(
+                    patch.object(
+                        subprocess,
+                        name,
+                        self._blocked("process", f"subprocess.{name}"),
+                    )
+                )
+            for name in dir(os):
+                if name in {"fork", "forkpty", "system"} or name.startswith(
+                    ("exec", "spawn", "posix_spawn")
+                ):
+                    candidate = getattr(os, name)
+                    if callable(candidate):
+                        stack.enter_context(
+                            patch.object(
+                                os,
+                                name,
+                                self._blocked("process", f"os.{name}"),
+                            )
+                        )
+            stack.enter_context(
+                patch.object(
+                    multiprocessing.Process,
+                    "start",
+                    self._blocked("process", "multiprocessing.Process.start"),
+                )
+            )
+        except BaseException:
+            if type(self)._active_guard is self:
+                type(self)._active_guard = None
+            stack.close()
+            self._stack = None
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        stack = self._stack
+        if stack is None:
+            raise RuntimeError("Python side-effect guard is not active")
+        self._stack = None
+        try:
+            stack.close()
+        finally:
+            if type(self)._active_guard is self:
+                type(self)._active_guard = None
+
+    @classmethod
+    def _audit_hook(cls, event: str, _arguments: tuple[object, ...]) -> None:
+        guard = cls._active_guard
+        if guard is None:
+            return
+        if event in cls._AUDIT_NETWORK_EVENTS:
+            guard._reject("network", f"audit:{event}")
+        if event in cls._AUDIT_PROCESS_EVENTS:
+            guard._reject("process", f"audit:{event}")
+
+    def _blocked(self, category: str, operation: str):
+        def blocked(*_args: object, **_kwargs: object) -> None:
+            self._reject(category, operation)
+
+        return blocked
+
+    def _reject(self, category: str, operation: str) -> None:
+        inventory = {
+            "network": self.network_attempts,
+            "process": self.process_attempts,
+        }.get(category)
+        if inventory is None:
+            raise RuntimeError("offline side-effect category is invalid")
+        inventory.append(operation)
+        raise OfflineStartupSideEffectAttempt(category)
+
+
+class ChatbotOfflineSideEffectGuard:
+    """Block process, network, and loaded chatbot stream entry points."""
+
+    _AUDIO_DEVICE_METHODS = (
+        "start_streams",
+        "restart_input_stream",
+        "_open_input_stream",
+        "_open_output_stream",
+        "_start_arecord",
+        "_start_aplay",
+    )
+
+    def __init__(self) -> None:
+        self._offline_guard = _PythonOfflineSideEffectGuard()
+        self.microphone_attempts: list[str] = []
+        self._stack: ExitStack | None = None
+
+    @property
+    def process_attempts(self) -> tuple[str, ...]:
+        return tuple(self._offline_guard.process_attempts)
+
+    @property
+    def network_attempts(self) -> tuple[str, ...]:
+        return tuple(self._offline_guard.network_attempts)
+
+    def __enter__(self) -> "ChatbotOfflineSideEffectGuard":
+        if self._stack is not None:
+            raise RuntimeError("chatbot side-effect guard is already active")
+        stack = ExitStack()
+        self._stack = stack
+        try:
+            stack.enter_context(self._offline_guard)
+            pyaudio_module = sys.modules.get("pyaudio")
+            pyaudio_owner = (
+                None
+                if pyaudio_module is None
+                else getattr(pyaudio_module, "PyAudio", None)
+            )
+            if pyaudio_owner is not None and hasattr(pyaudio_owner, "open"):
+                stack.enter_context(
+                    patch.object(
+                        pyaudio_owner,
+                        "open",
+                        self._blocked_microphone("pyaudio.PyAudio.open"),
+                    )
+                )
+            for module_name, module in tuple(sys.modules.items()):
+                if not module_name.endswith("audio_device") or module is None:
+                    continue
+                owner = getattr(module, "AudioDevice", None)
+                if owner is None:
+                    continue
+                for method_name in self._AUDIO_DEVICE_METHODS:
+                    if hasattr(owner, method_name):
+                        stack.enter_context(
+                            patch.object(
+                                owner,
+                                method_name,
+                                self._blocked_microphone(
+                                    f"{module_name}.AudioDevice.{method_name}"
+                                ),
+                            )
+                        )
+        except BaseException:
+            stack.close()
+            self._stack = None
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        stack = self._stack
+        if stack is None:
+            raise RuntimeError("chatbot side-effect guard is not active")
+        self._stack = None
+        stack.close()
+
+    def _blocked_microphone(self, operation: str):
+        def blocked(*_args: object, **_kwargs: object) -> None:
+            self.microphone_attempts.append(operation)
+            raise OfflineStartupSideEffectAttempt("microphone")
+
+        return blocked
 
 
 def classify_external_readiness(*, credentials: bool, audio: bool) -> ExternalReadiness:
@@ -169,8 +474,45 @@ def _failure_after_configuration(
     )
 
 
+def _dependency_gate(
+    importability: tuple[tuple[str, bool], ...], *, passed: bool
+) -> dict[str, object]:
+    return _gate(
+        "chatbot.dependencies",
+        "PASS" if passed else "FAIL",
+        "OK" if passed else "CHATBOT_DEPENDENCY_MISSING",
+        role="required",
+        measurements=tuple(
+            _measurement(f"{name}_importable", available)
+            for name, available in importability
+        ),
+    )
+
+
+def _configuration_gate(
+    guard: ChatbotOfflineSideEffectGuard,
+    *,
+    passed: bool,
+) -> dict[str, object]:
+    return _gate(
+        "chatbot.configuration",
+        "PASS" if passed else "FAIL",
+        "OK" if passed else "CHATBOT_CONFIG_INVALID",
+        role="required",
+        measurements=_side_effect_measurements(guard),
+    )
+
+
+def _read_bounded_text(path: Path, max_bytes: int) -> str:
+    with Path(path).open("rb") as stream:
+        payload = stream.read(max_bytes + 1)
+    if len(payload) > max_bytes:
+        raise ValueError("chatbot input exceeds byte bound")
+    return payload.decode("utf-8", errors="strict")
+
+
 def _declared_dependencies(pyproject_path: Path) -> frozenset[str]:
-    text = Path(pyproject_path).read_text(encoding="utf-8")
+    text = _read_bounded_text(pyproject_path, PYPROJECT_MAX_BYTES)
     project_marker = "[project]\n"
     if project_marker not in text:
         raise ValueError("chatbot project table is missing")
@@ -217,7 +559,7 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _load_configuration(configuration_path: Path) -> dict[str, object]:
     document = json.loads(
-        Path(configuration_path).read_text(encoding="utf-8"),
+        _read_bounded_text(configuration_path, CONFIGURATION_MAX_BYTES),
         object_pairs_hook=_unique_json_object,
         parse_constant=lambda _token: (_ for _ in ()).throw(
             ValueError("non-JSON chatbot configuration value")
@@ -297,36 +639,13 @@ def validate_configuration_startup(
         raise ValueError("chatbot hooks are invalid")
 
 
-def _bounded_startup(
+def _configuration_startup(
     checker: Callable[[Mapping[str, object], StartupSideEffectSpies], None],
     configuration: Mapping[str, object],
     spies: StartupSideEffectSpies,
-    timeout_seconds: float,
 ) -> None:
-    if (
-        type(timeout_seconds) is not float
-        or timeout_seconds <= 0.0
-        or timeout_seconds > 5.0
-        or current_thread() is not main_thread()
-    ):
-        raise ValueError("chatbot startup bound is invalid")
-    previous_delay, previous_interval = signal.getitimer(signal.ITIMER_REAL)
-    if previous_delay != 0.0 or previous_interval != 0.0:
-        raise RuntimeError("chatbot startup alarm is unavailable")
-    previous_handler = signal.getsignal(signal.SIGALRM)
-
-    def timed_out(_signum: int, _frame: object) -> None:
-        raise TimeoutError("chatbot startup timed out")
-
-    started = time.monotonic()
-    signal.signal(signal.SIGALRM, timed_out)
-    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-    try:
-        checker(configuration, spies)
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        signal.signal(signal.SIGALRM, previous_handler)
-    if time.monotonic() - started > timeout_seconds or spies.attempted_kinds:
+    checker(configuration, spies)
+    if spies.attempted_kinds:
         raise OfflineStartupSideEffectAttempt("configuration startup rejected")
 
 
@@ -391,15 +710,35 @@ def _credential_presence(
     presence: list[tuple[str, bool]] = []
     for name in REQUIRED_PROVIDER_VARIABLES:
         try:
+            value = environment[name] if name in environment else None
+            stripped = value.strip() if type(value) is str else ""
             present = (
-                name in environment
-                and type(environment[name]) is str
-                and bool(environment[name])
+                len(stripped) >= _CREDENTIAL_MINIMUM_LENGTH
+                and stripped.casefold() not in _CREDENTIAL_PLACEHOLDERS
             )
         except Exception:
             present = False
         presence.append((name, present))
     return tuple(presence)
+
+
+def _side_effect_measurements(
+    guard: ChatbotOfflineSideEffectGuard,
+) -> tuple[dict[str, object], ...]:
+    return (
+        _measurement(
+            "process_spawn_attempted",
+            bool(guard.process_attempts),
+        ),
+        _measurement(
+            "network_attempted",
+            bool(guard.network_attempts),
+        ),
+        _measurement(
+            "microphone_attempted",
+            bool(guard.microphone_attempts),
+        ),
+    )
 
 
 def run_chatbot_gates(
@@ -412,115 +751,85 @@ def run_chatbot_gates(
         [Mapping[str, object], StartupSideEffectSpies], None
     ] = validate_configuration_startup,
     environment: Mapping[str, str] | None = None,
-    startup_timeout_seconds: float = 1.0,
+    startup_timeout_seconds: float = DEFAULT_READINESS_TIMEOUT_SECONDS,
 ) -> ChatbotGateResult:
     """Return the fixed four chatbot gates without live speech or API access."""
 
     importability: list[tuple[str, bool]] = []
-    declarations_valid = False
-    try:
-        declared = _declared_dependencies(pyproject_path)
-        declarations_valid = set(REQUIRED_IMPORTS).issubset(declared)
-    except Exception:
-        declarations_valid = False
-    for name in REQUIRED_IMPORTS:
-        try:
-            available = dependency_probe(name)
-            importability.append((name, available is True))
-        except Exception:
-            importability.append((name, False))
-    dependencies_ok = (
-        declarations_valid
-        and len(importability) == len(REQUIRED_IMPORTS)
-        and all(available for _, available in importability)
-    )
-    dependency_gate = _gate(
-        "chatbot.dependencies",
-        "PASS" if dependencies_ok else "FAIL",
-        "OK" if dependencies_ok else "CHATBOT_DEPENDENCY_MISSING",
-        role="required",
-        measurements=tuple(
-            _measurement(f"{name}_importable", available)
-            for name, available in importability
-        ),
-    )
-    if not dependencies_ok:
-        return _failure_after_dependencies(dependency_gate)
-
+    dependency_gate = _dependency_gate((), passed=False)
     spies = StartupSideEffectSpies()
+    guard = ChatbotOfflineSideEffectGuard()
+    stage = "dependencies"
     try:
-        configuration = _load_configuration(configuration_path)
-        validate_configuration_startup(configuration, StartupSideEffectSpies())
-        _bounded_startup(
-            startup_checker,
-            configuration,
-            spies,
-            startup_timeout_seconds,
-        )
-        inventory = _normalize_inventory(audio_enumerator())
-    except Exception:
-        configuration_gate = _gate(
-            "chatbot.configuration",
-            "FAIL",
-            "CHATBOT_CONFIG_INVALID",
-            role="required",
-            measurements=(
-                _measurement(
-                    "process_spawn_attempted",
-                    "process_spawn" in spies.attempted_kinds,
-                ),
-                _measurement("network_attempted", "network" in spies.attempted_kinds),
-                _measurement(
-                    "microphone_attempted", "microphone" in spies.attempted_kinds
-                ),
-            ),
-        )
-        return _failure_after_configuration(dependency_gate, configuration_gate)
+        with _WholeReadinessDeadline(startup_timeout_seconds):
+            declared = _declared_dependencies(pyproject_path)
+            declarations_valid = set(REQUIRED_IMPORTS).issubset(declared)
+            for name in REQUIRED_IMPORTS:
+                try:
+                    available = dependency_probe(name)
+                except ChatbotReadinessTimeout:
+                    raise
+                except Exception:
+                    available = False
+                importability.append((name, available is True))
+            dependencies_ok = declarations_valid and all(
+                available for _, available in importability
+            )
+            dependency_gate = _dependency_gate(
+                tuple(importability), passed=dependencies_ok
+            )
+            if not dependencies_ok:
+                return _failure_after_dependencies(dependency_gate)
 
-    configuration_gate = _gate(
-        "chatbot.configuration",
-        "PASS",
-        "OK",
-        role="required",
-        measurements=(
-            _measurement("process_spawn_attempted", False),
-            _measurement("network_attempted", False),
-            _measurement("microphone_attempted", False),
-        ),
-    )
-    source_environment = os.environ if environment is None else environment
-    credential_presence = _credential_presence(source_environment)
-    credentials = all(present for _, present in credential_presence)
-    audio = inventory.input_count > 0 and inventory.output_count > 0
-    credential_gate = _gate(
-        "chatbot.credentials",
-        "PASS" if credentials else "QUALIFIED",
-        "OK" if credentials else "CREDENTIALS_MISSING",
-        role="qualification",
-        measurements=tuple(
-            _measurement(f"{name}_present", present)
-            for name, present in credential_presence
-        ),
-    )
-    audio_gate = _gate(
-        "chatbot.audio_hardware",
-        "PASS" if audio else "QUALIFIED",
-        "OK" if audio else "AUDIO_HARDWARE_MISSING",
-        role="qualification",
-        measurements=(
-            _measurement("audio_input_device_count", inventory.input_count),
-            _measurement("audio_output_device_count", inventory.output_count),
-            _measurement("audio_stream_opened", False),
-        ),
-    )
-    decision = classify_external_readiness(credentials=credentials, audio=audio)
-    return ChatbotGateResult(
-        gates=(
+            stage = "configuration"
+            with guard:
+                configuration = _load_configuration(configuration_path)
+                validate_configuration_startup(configuration, StartupSideEffectSpies())
+                _configuration_startup(startup_checker, configuration, spies)
+                inventory = _normalize_inventory(audio_enumerator())
+
+            configuration_gate = _configuration_gate(guard, passed=True)
+            source_environment = os.environ if environment is None else environment
+            credential_presence = _credential_presence(source_environment)
+            credentials = all(present for _, present in credential_presence)
+            audio = inventory.input_count > 0 and inventory.output_count > 0
+            credential_gate = _gate(
+                "chatbot.credentials",
+                "PASS" if credentials else "QUALIFIED",
+                "OK" if credentials else "CREDENTIALS_MISSING",
+                role="qualification",
+                measurements=tuple(
+                    _measurement(f"{name}_present", present)
+                    for name, present in credential_presence
+                ),
+            )
+            audio_gate = _gate(
+                "chatbot.audio_hardware",
+                "PASS" if audio else "QUALIFIED",
+                "OK" if audio else "AUDIO_HARDWARE_MISSING",
+                role="qualification",
+                measurements=(
+                    _measurement("audio_input_device_count", inventory.input_count),
+                    _measurement("audio_output_device_count", inventory.output_count),
+                    _measurement("audio_stream_opened", False),
+                ),
+            )
+            decision = classify_external_readiness(credentials=credentials, audio=audio)
+            return ChatbotGateResult(
+                gates=(
+                    dependency_gate,
+                    configuration_gate,
+                    credential_gate,
+                    audio_gate,
+                ),
+                label=decision.label,
+                exit_code=decision.exit_code,
+            )
+    except Exception:
+        if stage == "dependencies":
+            dependency_gate = _dependency_gate(tuple(importability), passed=False)
+            return _failure_after_dependencies(dependency_gate)
+        return _failure_after_configuration(
             dependency_gate,
-            configuration_gate,
-            credential_gate,
-            audio_gate,
-        ),
-        label=decision.label,
-        exit_code=decision.exit_code,
-    )
+            _configuration_gate(guard, passed=False),
+        )

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from holoagent0_setup.skills_gate import (
     EXPECTED_SKILLS,
     SkillCommandResult,
@@ -26,13 +28,9 @@ class FakeRunner:
         if self._results:
             return self._results.pop(0)
         if command[-1].endswith("validate_skills.py"):
-            stdout = "HoloAgent skill validation passed.\n" + "".join(
-                f"- {name}\n" for name in EXPECTED_SKILLS
-            )
+            stdout = _validator_output()
         elif command[-1].endswith("list_skills.py"):
-            stdout = "HoloAgent skills:\n" + "".join(
-                f"- {name}\n" for name in EXPECTED_SKILLS
-            )
+            stdout = _list_output()
         else:
             stdout = "dry-run request only\n"
         return SkillCommandResult(0, stdout, "")
@@ -40,6 +38,20 @@ class FakeRunner:
 
 def _statuses(result):
     return [(gate["id"], gate["status"], gate["reason"]) for gate in result.gates]
+
+
+def _validator_output():
+    return (
+        "HoloAgent skill validation passed.\n"
+        + "".join(f"- {name}\n" for name in EXPECTED_SKILLS)
+        + "\nWarnings:\n- workflow: missing recommended directory scripts/\n"
+    )
+
+
+def _list_output(inventory=EXPECTED_SKILLS):
+    return "HoloAgent skills:\n" + "".join(
+        f"- {name}\n  readme: yes\n" for name in inventory
+    )
 
 
 def test_skills_gate_validates_all_five_and_only_executes_pinned_dry_runs():
@@ -103,8 +115,8 @@ def test_skills_gate_rejects_a_tracked_digest_mismatch_before_any_command():
 def test_skills_gate_rejects_registry_output_that_does_not_name_exact_five():
     runner = FakeRunner(
         [
-            SkillCommandResult(0, "HoloAgent skill validation passed.\n", ""),
-            SkillCommandResult(0, "HoloAgent skills:\n- arm-skill\n", ""),
+            SkillCommandResult(0, _validator_output(), ""),
+            SkillCommandResult(0, _list_output(("arm-skill",)), ""),
         ]
     )
 
@@ -119,11 +131,39 @@ def test_skills_gate_rejects_registry_output_that_does_not_name_exact_five():
 
 
 def test_skills_gate_rejects_an_unreviewed_sixth_registry_entry():
-    registry = "".join(f"- {name}\n" for name in (*EXPECTED_SKILLS, "rogue-skill"))
     runner = FakeRunner(
         [
-            SkillCommandResult(0, registry, ""),
-            SkillCommandResult(0, registry, ""),
+            SkillCommandResult(0, _validator_output(), ""),
+            SkillCommandResult(
+                0,
+                _list_output((*EXPECTED_SKILLS, "rogue-skill")),
+                "",
+            ),
+        ]
+    )
+
+    result = run_skills_gates(repository_root=REPOSITORY_ROOT, runner=runner)
+
+    assert _statuses(result) == [
+        ("skills.registry", "FAIL", "PLAN_INVALID"),
+        ("skills.dry_run", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+    ]
+    assert result.exit_code == 1
+
+
+@pytest.mark.parametrize(
+    "inventory",
+    [
+        (*EXPECTED_SKILLS, "unexpected_skill"),
+        (*EXPECTED_SKILLS, "Unexpected-Skill"),
+        (*EXPECTED_SKILLS, EXPECTED_SKILLS[-1]),
+    ],
+)
+def test_skills_gate_rejects_every_unclosed_or_duplicate_list_entry(inventory):
+    runner = FakeRunner(
+        [
+            SkillCommandResult(0, _validator_output(), ""),
+            SkillCommandResult(0, _list_output(inventory), ""),
         ]
     )
 
@@ -138,11 +178,10 @@ def test_skills_gate_rejects_an_unreviewed_sixth_registry_entry():
 
 def test_skills_gate_maps_dry_run_failure_without_persisting_child_output():
     secret = "credential-shaped-value-must-not-escape"
-    registry = "".join(f"- {name}\n" for name in EXPECTED_SKILLS)
     runner = FakeRunner(
         [
-            SkillCommandResult(0, registry, ""),
-            SkillCommandResult(0, registry, ""),
+            SkillCommandResult(0, _validator_output(), ""),
+            SkillCommandResult(0, _list_output(), ""),
             SkillCommandResult(3, secret, secret),
         ]
     )
@@ -158,11 +197,10 @@ def test_skills_gate_maps_dry_run_failure_without_persisting_child_output():
 
 
 def test_skills_gate_fails_closed_on_any_reported_side_effect_attempt():
-    registry = "".join(f"- {name}\n" for name in EXPECTED_SKILLS)
     runner = FakeRunner(
         [
-            SkillCommandResult(0, registry, ""),
-            SkillCommandResult(0, registry, ""),
+            SkillCommandResult(0, _validator_output(), ""),
+            SkillCommandResult(0, _list_output(), ""),
             SkillCommandResult(
                 0,
                 "dry-run request only",
@@ -182,11 +220,10 @@ def test_skills_gate_fails_closed_on_any_reported_side_effect_attempt():
 
 
 def test_skills_gate_rejects_a_remaining_command_process_group():
-    registry = "".join(f"- {name}\n" for name in EXPECTED_SKILLS)
     runner = FakeRunner(
         [
-            SkillCommandResult(0, registry, ""),
-            SkillCommandResult(0, registry, ""),
+            SkillCommandResult(0, _validator_output(), ""),
+            SkillCommandResult(0, _list_output(), ""),
             SkillCommandResult(
                 0,
                 "dry-run request only",

@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
-import re
 from typing import Callable, Protocol
 
 from .openclaw_gate import LocalCommandRunner
@@ -174,13 +173,24 @@ def _run_command(
     return _command_result(value)
 
 
-def _reported_skills(output: str) -> tuple[str, ...]:
-    names = {
-        line[2:]
-        for line in output.splitlines()
-        if line.startswith("- ") and re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", line[2:])
-    }
-    return tuple(sorted(names))
+def _list_inventory(output: str) -> tuple[str, ...] | None:
+    lines = output.splitlines()
+    if not lines or lines[0] != "HoloAgent skills:":
+        return None
+    names: list[str] = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        if line.startswith("- "):
+            name = line[2:]
+            if not name:
+                return None
+            names.append(name)
+            continue
+        if line.startswith("  ") and names:
+            continue
+        return None
+    return tuple(names)
 
 
 def _registry_commands(repository_root: Path) -> tuple[tuple[str, ...], ...]:
@@ -283,10 +293,7 @@ def run_skills_gates(
             not result.side_effect_attempted and not result.remaining_process_group
             for result in registry_results
         )
-        and all(
-            _reported_skills(result.stdout) == EXPECTED_SKILLS
-            for result in registry_results
-        )
+        and _list_inventory(registry_results[1].stdout) == EXPECTED_SKILLS
     )
     if not registry_valid:
         return SkillsGateResult(
