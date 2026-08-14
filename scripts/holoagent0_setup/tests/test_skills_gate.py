@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -118,6 +119,43 @@ def _digest(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _record_skill_descriptors(monkeypatch):
+    repository_descriptors = []
+    memfd_descriptors = []
+    real_open = os.open
+    real_memfd_create = os.memfd_create
+
+    def open_reviewed_script(path, flags):
+        descriptor = real_open(path, flags)
+        repository_descriptors.append(descriptor)
+        return descriptor
+
+    def create_skill_memfd(name, flags):
+        descriptor = real_memfd_create(name, flags)
+        memfd_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(
+        skills_gate,
+        "_open_reviewed_skill_script",
+        open_reviewed_script,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        skills_gate,
+        "_create_skill_memfd",
+        create_skill_memfd,
+        raising=False,
+    )
+    return repository_descriptors, memfd_descriptors
+
+
+def _assert_descriptors_closed(*descriptor_groups):
+    for descriptor in {item for group in descriptor_groups for item in group}:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 def test_verified_skill_descriptor_survives_a_path_swap(tmp_path):
     script = tmp_path / "reviewed.py"
     replacement = tmp_path / "replacement.py"
@@ -142,6 +180,334 @@ def test_verified_skill_descriptor_survives_a_path_swap(tmp_path):
 
     assert result.exit_code == 0
     assert result.stdout == "reviewed-bytes\n"
+
+
+def test_sealed_skill_snapshot_survives_in_place_inode_mutation(tmp_path):
+    script = tmp_path / "reviewed.py"
+    reviewed_content = b'print("reviewed-original")\n'
+    script.write_bytes(reviewed_content)
+
+    class MutateThenRun:
+        def run(self, command, *, environment, pass_fds=()):
+            script.write_text('print("mutated-in-place")\n', encoding="utf-8")
+            return LocalCommandRunner(timeout_seconds=2.0).run(
+                command,
+                environment=environment,
+                pass_fds=pass_fds,
+            )
+
+    result = skills_gate._run_command(
+        MutateThenRun(),
+        _direct_command(script),
+        expected_script_digest=_digest(reviewed_content),
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "reviewed-original\n"
+
+
+def test_skill_runner_receives_only_a_fully_sealed_memfd(tmp_path):
+    script = tmp_path / "reviewed.py"
+    content = b'print("sealed")\n'
+    script.write_bytes(content)
+
+    class InspectSealedRunner:
+        def run(self, command, *, environment, pass_fds=()):
+            descriptor = pass_fds[0]
+            observed = fcntl.fcntl(descriptor, fcntl.F_GET_SEALS)
+            required = (
+                fcntl.F_SEAL_WRITE
+                | fcntl.F_SEAL_GROW
+                | fcntl.F_SEAL_SHRINK
+                | fcntl.F_SEAL_SEAL
+            )
+            assert observed & required == required
+            assert os.readlink(f"/proc/self/fd/{descriptor}").startswith("/memfd:")
+            with pytest.raises(OSError):
+                os.write(descriptor, b"mutation")
+            return LocalCommandRunner(timeout_seconds=2.0).run(
+                command,
+                environment=environment,
+                pass_fds=pass_fds,
+            )
+
+    result = skills_gate._run_command(
+        InspectSealedRunner(),
+        _direct_command(script),
+        expected_script_digest=_digest(content),
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "sealed\n"
+
+
+def test_sealed_skill_execution_blocks_when_memfd_create_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    script = tmp_path / "reviewed.py"
+    content = b'print("must-not-run")\n'
+    script.write_bytes(content)
+    repository_descriptors = []
+    real_open = os.open
+
+    def open_reviewed_script(path, flags):
+        descriptor = real_open(path, flags)
+        repository_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(
+        skills_gate,
+        "_open_reviewed_skill_script",
+        open_reviewed_script,
+        raising=False,
+    )
+    monkeypatch.delattr(os, "memfd_create")
+
+    with pytest.raises(OSError, match="memfd"):
+        skills_gate._run_command(
+            FakeRunner(),
+            _direct_command(script),
+            expected_script_digest=_digest(content),
+        )
+
+    _assert_descriptors_closed(repository_descriptors)
+
+
+@pytest.mark.parametrize(
+    ("module", "attribute"),
+    [
+        (os, "MFD_ALLOW_SEALING"),
+        (os, "MFD_CLOEXEC"),
+        (fcntl, "F_ADD_SEALS"),
+        (fcntl, "F_GET_SEALS"),
+        (fcntl, "F_SEAL_WRITE"),
+        (fcntl, "F_SEAL_GROW"),
+        (fcntl, "F_SEAL_SHRINK"),
+        (fcntl, "F_SEAL_SEAL"),
+    ],
+)
+def test_sealed_skill_execution_blocks_when_a_required_constant_is_unavailable(
+    tmp_path,
+    monkeypatch,
+    module,
+    attribute,
+):
+    script = tmp_path / "reviewed.py"
+    content = b'print("must-not-run")\n'
+    script.write_bytes(content)
+    monkeypatch.delattr(module, attribute)
+
+    with pytest.raises(OSError, match="memfd sealing is unavailable"):
+        skills_gate._run_command(
+            FakeRunner(),
+            _direct_command(script),
+            expected_script_digest=_digest(content),
+        )
+
+
+def test_skill_execution_closes_descriptors_when_memfd_create_fails(
+    tmp_path,
+    monkeypatch,
+):
+    script = tmp_path / "reviewed.py"
+    content = b'print("must-not-run")\n'
+    script.write_bytes(content)
+    repository_descriptors = []
+    real_open = os.open
+
+    def open_reviewed_script(path, flags):
+        descriptor = real_open(path, flags)
+        repository_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(
+        skills_gate,
+        "_open_reviewed_skill_script",
+        open_reviewed_script,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        skills_gate,
+        "_create_skill_memfd",
+        lambda *_args: (_ for _ in ()).throw(OSError("memfd create failed")),
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="memfd create failed"):
+        skills_gate._run_command(
+            FakeRunner(),
+            _direct_command(script),
+            expected_script_digest=_digest(content),
+        )
+
+    _assert_descriptors_closed(repository_descriptors)
+
+
+def test_skill_execution_closes_descriptors_when_memfd_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    script = tmp_path / "reviewed.py"
+    content = b'print("must-not-run")\n'
+    script.write_bytes(content)
+    repository_descriptors, memfd_descriptors = _record_skill_descriptors(monkeypatch)
+    monkeypatch.setattr(
+        skills_gate,
+        "_write_skill_memfd",
+        lambda *_args: (_ for _ in ()).throw(OSError("memfd write failed")),
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="memfd write failed"):
+        skills_gate._run_command(
+            FakeRunner(),
+            _direct_command(script),
+            expected_script_digest=_digest(content),
+        )
+
+    _assert_descriptors_closed(repository_descriptors, memfd_descriptors)
+
+
+def test_skill_execution_closes_descriptors_when_add_seals_fails(
+    tmp_path,
+    monkeypatch,
+):
+    script = tmp_path / "reviewed.py"
+    content = b'print("must-not-run")\n'
+    script.write_bytes(content)
+    repository_descriptors, memfd_descriptors = _record_skill_descriptors(monkeypatch)
+    real_fcntl = fcntl.fcntl
+
+    def fail_add_seals(descriptor, operation, argument=0):
+        if operation == fcntl.F_ADD_SEALS:
+            raise OSError("add seals failed")
+        return real_fcntl(descriptor, operation, argument)
+
+    monkeypatch.setattr(fcntl, "fcntl", fail_add_seals)
+
+    with pytest.raises(OSError, match="add seals failed"):
+        skills_gate._run_command(
+            FakeRunner(),
+            _direct_command(script),
+            expected_script_digest=_digest(content),
+        )
+
+    _assert_descriptors_closed(repository_descriptors, memfd_descriptors)
+
+
+def test_skill_execution_closes_descriptors_on_incomplete_seal_mask(
+    tmp_path,
+    monkeypatch,
+):
+    script = tmp_path / "reviewed.py"
+    content = b'print("must-not-run")\n'
+    script.write_bytes(content)
+    repository_descriptors, memfd_descriptors = _record_skill_descriptors(monkeypatch)
+    real_fcntl = fcntl.fcntl
+
+    def omit_write_seal(descriptor, operation, argument=0):
+        if operation == fcntl.F_GET_SEALS:
+            return fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+        return real_fcntl(descriptor, operation, argument)
+
+    monkeypatch.setattr(fcntl, "fcntl", omit_write_seal)
+
+    with pytest.raises(OSError, match="snapshot is incomplete"):
+        skills_gate._run_command(
+            FakeRunner(),
+            _direct_command(script),
+            expected_script_digest=_digest(content),
+        )
+
+    _assert_descriptors_closed(repository_descriptors, memfd_descriptors)
+
+
+@pytest.mark.parametrize("runner_raises", [False, True])
+def test_skill_repository_and_memfd_descriptors_close_after_runner(
+    tmp_path,
+    monkeypatch,
+    runner_raises,
+):
+    script = tmp_path / "reviewed.py"
+    content = b'print("reviewed")\n'
+    script.write_bytes(content)
+    repository_descriptors, memfd_descriptors = _record_skill_descriptors(monkeypatch)
+
+    class ClosureRunner:
+        def run(self, _command, *, environment, pass_fds=()):
+            assert len(repository_descriptors) == 1
+            assert len(memfd_descriptors) == 1
+            assert pass_fds == (memfd_descriptors[0],)
+            repository_target = Path(
+                f"/proc/self/fd/{repository_descriptors[0]}"
+            ).resolve()
+            assert repository_target != script.resolve()
+            os.fstat(memfd_descriptors[0])
+            if runner_raises:
+                raise RuntimeError("runner failed")
+            return SkillCommandResult(0, "reviewed\n", "")
+
+    if runner_raises:
+        with pytest.raises(RuntimeError, match="runner failed"):
+            skills_gate._run_command(
+                ClosureRunner(),
+                _direct_command(script),
+                expected_script_digest=_digest(content),
+            )
+    else:
+        result = skills_gate._run_command(
+            ClosureRunner(),
+            _direct_command(script),
+            expected_script_digest=_digest(content),
+        )
+        assert result.stdout == "reviewed\n"
+
+    _assert_descriptors_closed(repository_descriptors, memfd_descriptors)
+
+
+@pytest.mark.parametrize("failed_descriptor", ["repository", "memfd"])
+def test_skill_descriptor_close_failure_is_blocking(
+    tmp_path,
+    monkeypatch,
+    failed_descriptor,
+):
+    script = tmp_path / "reviewed.py"
+    content = b'print("reviewed")\n'
+    script.write_bytes(content)
+    repository_descriptors, memfd_descriptors = _record_skill_descriptors(monkeypatch)
+    real_close = os.close
+    failed = False
+
+    def fail_selected_close(descriptor):
+        nonlocal failed
+        should_fail = (
+            failed_descriptor == "repository"
+            and descriptor in repository_descriptors
+            or failed_descriptor == "memfd"
+            and descriptor in memfd_descriptors
+        )
+        real_close(descriptor)
+        if should_fail and not failed:
+            failed = True
+            raise OSError(f"{failed_descriptor} close failed")
+
+    monkeypatch.setattr(
+        skills_gate,
+        "_close_skill_descriptor",
+        fail_selected_close,
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match=rf"{failed_descriptor} close failed"):
+        skills_gate._run_command(
+            FakeRunner(),
+            _direct_command(script),
+            expected_script_digest=_digest(content),
+        )
+
+    assert failed is True
+    _assert_descriptors_closed(repository_descriptors, memfd_descriptors)
 
 
 def test_verified_skill_descriptor_rejects_a_symlink(tmp_path):

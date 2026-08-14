@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -58,6 +59,9 @@ _PINNED_REPOSITORY_FILES = {
     ),
 }
 _OUTPUT_LIMIT_BYTES = 1024 * 1024
+REQUIRED_SKILL_MEMFD_SEALS = (
+    fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+)
 
 
 @dataclass(frozen=True)
@@ -161,6 +165,84 @@ def _command_result(value: object) -> SkillCommandResult:
     return result
 
 
+def _open_reviewed_skill_script(path: str, flags: int) -> int:
+    return os.open(path, flags)
+
+
+def _create_skill_memfd(name: str, flags: int) -> int:
+    creator = getattr(os, "memfd_create", None)
+    if not callable(creator):
+        raise OSError("memfd creation is unavailable")
+    descriptor = creator(name, flags)
+    if type(descriptor) is not int or descriptor < 3:
+        raise OSError("invalid skill memfd descriptor")
+    return descriptor
+
+
+def _skill_memfd_name(script_path: str) -> str:
+    path = Path(script_path)
+    if not path.is_absolute() or "\0" in script_path:
+        raise OSError("invalid reviewed skill path")
+    name = f"../../{script_path.removeprefix('/')}"
+    if len(name.encode("utf-8")) > 249:
+        raise OSError("reviewed skill path is too long for a memfd")
+    return name
+
+
+def _write_skill_memfd(descriptor: int, payload: bytes) -> None:
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if type(written) is not int or written <= 0 or written > len(remaining):
+            raise OSError("incomplete skill memfd write")
+        remaining = remaining[written:]
+
+
+def _close_skill_descriptor(descriptor: int) -> None:
+    os.close(descriptor)
+
+
+def _skill_memfd_parameters() -> tuple[int, int, int, int]:
+    required = (
+        (os, "MFD_ALLOW_SEALING"),
+        (os, "MFD_CLOEXEC"),
+        (fcntl, "F_ADD_SEALS"),
+        (fcntl, "F_GET_SEALS"),
+        (fcntl, "F_SEAL_WRITE"),
+        (fcntl, "F_SEAL_GROW"),
+        (fcntl, "F_SEAL_SHRINK"),
+        (fcntl, "F_SEAL_SEAL"),
+    )
+    values = []
+    for module, name in required:
+        value = getattr(module, name, None)
+        if type(value) is not int:
+            raise OSError("memfd sealing is unavailable")
+        values.append(value)
+    (
+        allow_sealing,
+        close_on_exec,
+        add_seals,
+        get_seals,
+        seal_write,
+        seal_grow,
+        seal_shrink,
+        seal_seal,
+    ) = values
+    seal_mask = seal_write | seal_grow | seal_shrink | seal_seal
+    if seal_mask != REQUIRED_SKILL_MEMFD_SEALS:
+        raise OSError("memfd sealing constants changed")
+    return allow_sealing | close_on_exec, add_seals, get_seals, seal_mask
+
+
+def _descriptor_sha256(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    for chunk in iter(lambda: os.read(descriptor, 1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _run_command(
     runner: SkillCommandRunner,
     command: tuple[str, ...],
@@ -184,19 +266,22 @@ def _run_command(
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if type(no_follow) is not int:
         raise OSError("no-follow script opening is unavailable")
-    descriptor = os.open(
+    repository_descriptor = _open_reviewed_skill_script(
         command[3],
         os.O_RDONLY | os.O_CLOEXEC | no_follow,
     )
+    memfd_descriptor = None
     try:
-        before = os.fstat(descriptor)
-        if descriptor < 3 or not stat.S_ISREG(before.st_mode):
+        before = os.fstat(repository_descriptor)
+        if repository_descriptor < 3 or not stat.S_ISREG(before.st_mode):
             raise OSError("reviewed skill script is not a regular file")
         digest = hashlib.sha256()
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        for chunk in iter(lambda: os.read(descriptor, 1024 * 1024), b""):
+        payload_parts = []
+        os.lseek(repository_descriptor, 0, os.SEEK_SET)
+        for chunk in iter(lambda: os.read(repository_descriptor, 1024 * 1024), b""):
             digest.update(chunk)
-        after = os.fstat(descriptor)
+            payload_parts.append(chunk)
+        after = os.fstat(repository_descriptor)
         stable_fields = (
             "st_dev",
             "st_ino",
@@ -212,20 +297,54 @@ def _run_command(
             raise OSError("reviewed skill script changed during verification")
         if digest.hexdigest() != expected_script_digest:
             raise OSError("reviewed skill script digest mismatch")
-        os.lseek(descriptor, 0, os.SEEK_SET)
+        payload = b"".join(payload_parts)
+        flags, add_seals, get_seals, required_seals = _skill_memfd_parameters()
+        memfd_descriptor = _create_skill_memfd(_skill_memfd_name(command[3]), flags)
+        _write_skill_memfd(memfd_descriptor, payload)
+        if _descriptor_sha256(memfd_descriptor) != expected_script_digest:
+            raise OSError("sealed skill snapshot digest mismatch")
+        fcntl.fcntl(memfd_descriptor, add_seals, required_seals)
+        observed_seals = fcntl.fcntl(memfd_descriptor, get_seals)
+        if (
+            type(observed_seals) is not int
+            or observed_seals & required_seals != required_seals
+        ):
+            raise OSError("sealed skill snapshot is incomplete")
+        os.lseek(memfd_descriptor, 0, os.SEEK_SET)
+
+        descriptor_to_close = repository_descriptor
+        repository_descriptor = None
+        _close_skill_descriptor(descriptor_to_close)
         verified_command = (
             *command[:3],
-            f"/proc/self/fd/{descriptor}",
+            f"/proc/self/fd/{memfd_descriptor}",
             *command[4:],
         )
         value = runner.run(
             verified_command,
             environment={"PATH": "/usr/bin:/bin"},
-            pass_fds=(descriptor,),
+            pass_fds=(memfd_descriptor,),
         )
         return _command_result(value)
     finally:
-        os.close(descriptor)
+        cleanup_error = None
+        if repository_descriptor is not None:
+            descriptor_to_close = repository_descriptor
+            repository_descriptor = None
+            try:
+                _close_skill_descriptor(descriptor_to_close)
+            except BaseException as error:
+                cleanup_error = error
+        if memfd_descriptor is not None:
+            descriptor_to_close = memfd_descriptor
+            memfd_descriptor = None
+            try:
+                _close_skill_descriptor(descriptor_to_close)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 def _list_inventory(output: str) -> tuple[str, ...] | None:
