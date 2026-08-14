@@ -789,6 +789,52 @@ def test_waitid_none_then_dead_root_is_reobserved_before_classification(
     assert process.wait_calls == 1
 
 
+@pytest.mark.parametrize("dead_state", ["Z", "X"])
+def test_waitid_none_dead_root_cannot_transition_back_to_live(monkeypatch, dead_state):
+    process = _MockSpawnedChatbotChild()
+    identity = chatbot_gate._OwnedChildIdentity(process.pid, process.pid, 123)
+    wait_observations = iter((None, None))
+    group_observations = iter(
+        (
+            (_process_record(process.pid, process.pid, dead_state, 123),),
+            (_process_record(process.pid, process.pid, "S", 123),),
+        )
+    )
+    waitid_calls = []
+    killpg_calls = []
+
+    def waitid(idtype, pid, options):
+        waitid_calls.append((idtype, pid, options))
+        return next(wait_observations)
+
+    def wait(timeout=None):
+        assert timeout == 1.0
+        process.wait_calls += 1
+        process.returncode = 0
+        return 0
+
+    def killpg(pgid, signum):
+        killpg_calls.append((pgid, signum))
+        if signum == 0:
+            raise ProcessLookupError(errno.ESRCH, "group absent")
+
+    process.wait = wait
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(
+        chatbot_gate,
+        "_enumerate_process_group",
+        lambda _pgid: next(group_observations),
+    )
+
+    with pytest.raises(chatbot_gate.ChatbotChildContainmentError):
+        chatbot_gate._finalize_owned_child(process, identity, None)
+
+    assert killpg_calls == [(process.pid, 0)]
+    assert len(waitid_calls) == 2
+    assert process.wait_calls == 1
+
+
 def test_unreaped_saved_wait_status_rejects_live_proc_record_immediately(monkeypatch):
     process = _MockSpawnedChatbotChild()
     identity = chatbot_gate._OwnedChildIdentity(process.pid, process.pid, 123)

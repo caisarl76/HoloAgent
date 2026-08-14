@@ -2002,6 +2002,7 @@ def _observe_owned_group_coherently(
     deadline: float,
 ) -> tuple[_ChildWaitStatus | None, tuple[_ProcessRecord, ...]]:
     immediate_retry_available = True
+    dead_root_observed = False
     while True:
         if wait_status is None:
             wait_status = _observe_owned_root_exit(identity)
@@ -2015,7 +2016,12 @@ def _observe_owned_group_coherently(
                 )
             return wait_status, records
         if not root_is_dead:
+            if dead_root_observed:
+                raise ChatbotChildContainmentError(
+                    "chatbot child process state reversed after exit"
+                )
             return wait_status, records
+        dead_root_observed = True
         if immediate_retry_available:
             immediate_retry_available = False
             continue
