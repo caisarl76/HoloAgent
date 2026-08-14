@@ -260,17 +260,6 @@ def _assert_process_group_absent(pgid):
         os.killpg(pgid, 0)
 
 
-def _assert_process_group_eventually_absent(pgid, timeout_seconds=10.0):
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.01)
-    _assert_process_group_absent(pgid)
-
-
 class _MockSpawnedChatbotChild:
     def __init__(self, *, wait_fails=False):
         self.pid = 43210
@@ -716,37 +705,46 @@ def test_chatbot_rejects_success_until_residual_owned_process_group_is_empty(
     descendant_path = tmp_path / "escaped-descendant.py"
     descendant_path.write_text(
         "import time\n"
-        "time.sleep(0.3)\n"
+        "time.sleep(1.0)\n"
         f"open({str(marker_path)!r},'w').write('escaped')\n",
         encoding="utf-8",
     )
     payload = _passing_child_result_bytes()
     command = _write_child_fixture(
         tmp_path,
-        "import os,subprocess,sys\n"
+        "import os,signal,subprocess,sys,time\n"
         f"open({str(pid_path)!r},'w').write(str(os.getpid()))\n"
         "sys.stdin.buffer.read()\n"
-        f"subprocess.Popen([sys.executable,{str(descendant_path)!r}])\n"
-        f"sys.stdout.buffer.write({payload!r})\n",
+        "descendant=None\n"
+        "def cleanup(_signum,_frame):\n"
+        "    if descendant is not None:\n"
+        "        try:\n"
+        "            descendant.terminate()\n"
+        "        except ProcessLookupError:\n"
+        "            pass\n"
+        "        try:\n"
+        "            descendant.wait(timeout=0.5)\n"
+        "        except subprocess.TimeoutExpired:\n"
+        "            descendant.kill()\n"
+        "            descendant.wait(timeout=0.5)\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM,cleanup)\n"
+        f"descendant=subprocess.Popen([sys.executable,{str(descendant_path)!r}])\n"
+        f"sys.stdout.buffer.write({payload!r})\n"
+        "sys.stdout.buffer.flush()\n"
+        "time.sleep(2.0)\n",
     )
 
-    result = None
-    containment_unproven = False
-    try:
-        result = chatbot_gate._run_owned_chatbot_child(
-            command=command,
-            control=_child_control_bytes(),
-            timeout_seconds=0.5,
-        )
-    except chatbot_gate.ChatbotChildContainmentError:
-        containment_unproven = True
-    time.sleep(0.4)
+    result = chatbot_gate._run_owned_chatbot_child(
+        command=command,
+        control=_child_control_bytes(),
+        timeout_seconds=0.5,
+    )
+    time.sleep(0.6)
 
-    assert containment_unproven or result is not None
-    if result is not None:
-        _assert_closed_child_failure(result)
+    _assert_closed_child_failure(result)
     assert marker_path.exists() is False
-    _assert_process_group_eventually_absent(int(pid_path.read_text(encoding="utf-8")))
+    _assert_process_group_absent(int(pid_path.read_text(encoding="utf-8")))
 
 
 @pytest.mark.parametrize(
