@@ -1184,6 +1184,20 @@ offline profile. It cannot affect `PASS_HOLOAGENT0_OFFLINE`.
 The real-building pose is never sent to the MuJoCo `sim_map` stack. Stage 4
 continues to use only its prevalidated simulator-native fixture.
 
+### 4.5 HoloAgent Skill Script Immutability
+
+The skills gate never executes a regular repository file descriptor directly.
+It opens the reviewed script with `O_NOFOLLOW`, reads and hashes its stable
+regular-file bytes, copies those bytes into a private `memfd` created with
+`MFD_ALLOW_SEALING`, and applies `F_SEAL_WRITE`, `F_SEAL_GROW`,
+`F_SEAL_SHRINK`, and `F_SEAL_SEAL`. The gate verifies the complete seal mask
+with `F_GET_SEALS`, rewinds the sealed descriptor, and closes the repository
+descriptor before invoking the runner. The isolated Python command receives
+only the sealed descriptor through `/proc/self/fd/<fd>`. Missing `memfd` or
+seal support, an incomplete seal mask, a copy/hash mismatch, or descriptor
+cleanup failure is blocking. Repository pathname replacement or in-place inode
+mutation after verification therefore cannot change the executed bytes.
+
 ### 5. Chatbot Environment and Classification
 
 The chatbot environment uses Python 3.10 and the dependencies declared in
@@ -1195,6 +1209,29 @@ The chatbot environment uses Python 3.10 and the dependencies declared in
   without opening a stream or recording device names;
 - presence, never value, of required provider variable names;
 - bounded configuration-check startup with no microphone or network action.
+
+The public chatbot adapter runs the complete probe in a fresh `exec` of the
+exact pinned Python 3.10 interpreter, never in the coordinator process or a
+fork-only child. The child starts in a disposable owned session/process group.
+Its closed, canonical, bounded stdin control document contains only schema,
+repository configuration paths, and timeout metadata; provider credentials
+remain inherited environment state and never enter argv or the control/result
+documents. The child-only core emits one closed, canonical, bounded gate result
+to a private mode-`0600` temporary file. Stderr is discarded.
+
+The parent binds the child root PID, PGID, and Linux process start time before
+accepting any progress. It owns the monotonic deadline and polls the output-file
+size while the child runs, so oversized output cannot consume unbounded memory
+or storage. On success, functional failure, side-effect violation, timeout,
+malformed output, signal, or transport error, the parent terminates and kills
+owned group members as needed, reaps the root, and requires the final process
+group probe to fail with `ESRCH`. Child evidence is parsed and accepted only
+after that proof. Any identity ambiguity, residual group, cleanup timeout,
+noncanonical or oversized transport, nonzero child exit, or schema defect is a
+blocking dependency/harness failure with no child evidence. A fresh `exec`
+also prevents pre-existing coordinator threads or cached Python callables from
+crossing the production boundary; Task 13 trace/seccomp enforcement remains
+defense in depth.
 
 Dependency/import or JSON-configuration failure is blocking
 `FAIL_CHATBOT`. External readiness is classified separately:
