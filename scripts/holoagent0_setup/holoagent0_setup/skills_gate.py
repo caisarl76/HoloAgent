@@ -248,6 +248,7 @@ def _run_command(
     command: tuple[str, ...],
     *,
     expected_script_digest: str,
+    _snapshot_hook: Callable[[str, int], None] | None = None,
 ) -> SkillCommandResult:
     if (
         type(command) is not tuple
@@ -261,6 +262,8 @@ def _run_command(
         or any(
             character not in "0123456789abcdef" for character in expected_script_digest
         )
+        or _snapshot_hook is not None
+        and not callable(_snapshot_hook)
     ):
         raise ValueError("unreviewed skill command")
     no_follow = getattr(os, "O_NOFOLLOW", None)
@@ -275,11 +278,9 @@ def _run_command(
         before = os.fstat(repository_descriptor)
         if repository_descriptor < 3 or not stat.S_ISREG(before.st_mode):
             raise OSError("reviewed skill script is not a regular file")
-        digest = hashlib.sha256()
         payload_parts = []
         os.lseek(repository_descriptor, 0, os.SEEK_SET)
         for chunk in iter(lambda: os.read(repository_descriptor, 1024 * 1024), b""):
-            digest.update(chunk)
             payload_parts.append(chunk)
         after = os.fstat(repository_descriptor)
         stable_fields = (
@@ -295,14 +296,12 @@ def _run_command(
             getattr(before, field) != getattr(after, field) for field in stable_fields
         ):
             raise OSError("reviewed skill script changed during verification")
-        if digest.hexdigest() != expected_script_digest:
-            raise OSError("reviewed skill script digest mismatch")
         payload = b"".join(payload_parts)
         flags, add_seals, get_seals, required_seals = _skill_memfd_parameters()
         memfd_descriptor = _create_skill_memfd(_skill_memfd_name(command[3]), flags)
         _write_skill_memfd(memfd_descriptor, payload)
-        if _descriptor_sha256(memfd_descriptor) != expected_script_digest:
-            raise OSError("sealed skill snapshot digest mismatch")
+        if _snapshot_hook is not None:
+            _snapshot_hook("before_seal", memfd_descriptor)
         fcntl.fcntl(memfd_descriptor, add_seals, required_seals)
         observed_seals = fcntl.fcntl(memfd_descriptor, get_seals)
         if (
@@ -310,7 +309,11 @@ def _run_command(
             or observed_seals & required_seals != required_seals
         ):
             raise OSError("sealed skill snapshot is incomplete")
+        if _descriptor_sha256(memfd_descriptor) != expected_script_digest:
+            raise OSError("sealed skill snapshot digest mismatch")
         os.lseek(memfd_descriptor, 0, os.SEEK_SET)
+        if _snapshot_hook is not None:
+            _snapshot_hook("after_seal", memfd_descriptor)
 
         descriptor_to_close = repository_descriptor
         repository_descriptor = None

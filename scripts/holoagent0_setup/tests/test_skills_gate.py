@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import os
@@ -239,6 +240,108 @@ def test_skill_runner_receives_only_a_fully_sealed_memfd(tmp_path):
 
     assert result.exit_code == 0
     assert result.stdout == "sealed\n"
+
+
+def test_before_seal_mutation_is_sealed_then_rejected(tmp_path, monkeypatch):
+    script = tmp_path / "reviewed.py"
+    content = b'print("reviewed")\n'
+    script.write_bytes(content)
+    events = []
+    real_fcntl = fcntl.fcntl
+
+    def record_seals(descriptor, operation, argument=0):
+        if operation == fcntl.F_ADD_SEALS:
+            events.append("add_seals")
+        elif operation == fcntl.F_GET_SEALS:
+            events.append("get_seals")
+        return real_fcntl(descriptor, operation, argument)
+
+    def mutate_snapshot(stage, descriptor):
+        events.append(stage)
+        if stage == "before_seal":
+            assert os.pwrite(descriptor, b"X", 0) == 1
+
+    monkeypatch.setattr(fcntl, "fcntl", record_seals)
+    runner = FakeRunner()
+
+    with pytest.raises(OSError, match="sealed skill snapshot digest mismatch"):
+        skills_gate._run_command(
+            runner,
+            _direct_command(script),
+            expected_script_digest=_digest(content),
+            _snapshot_hook=mutate_snapshot,
+        )
+
+    assert events == ["before_seal", "add_seals", "get_seals"]
+    assert runner.commands == []
+
+
+def test_skill_snapshot_is_sealed_before_hash(tmp_path, monkeypatch):
+    script = tmp_path / "reviewed.py"
+    content = b'print("reviewed")\n'
+    script.write_bytes(content)
+    events = []
+    real_fcntl = fcntl.fcntl
+    real_descriptor_sha256 = skills_gate._descriptor_sha256
+
+    def record_seals(descriptor, operation, argument=0):
+        if operation == fcntl.F_ADD_SEALS:
+            events.append("add_seals")
+        elif operation == fcntl.F_GET_SEALS:
+            events.append("get_seals")
+        return real_fcntl(descriptor, operation, argument)
+
+    def record_hash(descriptor):
+        events.append("hash")
+        return real_descriptor_sha256(descriptor)
+
+    def record_boundary(stage, _descriptor):
+        events.append(stage)
+
+    monkeypatch.setattr(fcntl, "fcntl", record_seals)
+    monkeypatch.setattr(skills_gate, "_descriptor_sha256", record_hash)
+
+    skills_gate._run_command(
+        FakeRunner(),
+        _direct_command(script),
+        expected_script_digest=_digest(content),
+        _snapshot_hook=record_boundary,
+    )
+
+    assert events == [
+        "before_seal",
+        "add_seals",
+        "get_seals",
+        "hash",
+        "after_seal",
+    ]
+
+
+def test_after_seal_mutation_fails_and_original_snapshot_executes(tmp_path):
+    script = tmp_path / "reviewed.py"
+    content = b'print("reviewed-original")\n'
+    script.write_bytes(content)
+    observed_errno = None
+
+    def try_mutation(stage, descriptor):
+        nonlocal observed_errno
+        if stage != "after_seal":
+            return
+        try:
+            os.pwrite(descriptor, b"X", 0)
+        except OSError as error:
+            observed_errno = error.errno
+
+    result = skills_gate._run_command(
+        LocalCommandRunner(timeout_seconds=2.0),
+        _direct_command(script),
+        expected_script_digest=_digest(content),
+        _snapshot_hook=try_mutation,
+    )
+
+    assert observed_errno == errno.EPERM
+    assert result.exit_code == 0
+    assert result.stdout == "reviewed-original\n"
 
 
 def test_sealed_skill_execution_blocks_when_memfd_create_is_unavailable(
