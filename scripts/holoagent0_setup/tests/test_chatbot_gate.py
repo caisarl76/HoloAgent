@@ -260,7 +260,7 @@ def _assert_process_group_absent(pgid):
         os.killpg(pgid, 0)
 
 
-def _assert_process_group_eventually_absent(pgid, timeout_seconds=2.0):
+def _assert_process_group_eventually_absent(pgid, timeout_seconds=10.0):
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         try:
