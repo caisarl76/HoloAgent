@@ -672,6 +672,164 @@ def test_chatbot_guard_blocks_loaded_audio_device_stream_method(monkeypatch):
     assert secret not in repr(result)
 
 
+@pytest.mark.parametrize(
+    ("operation", "expected_measurement"),
+    [
+        ("cached_process", "process_spawn_attempted"),
+        ("direct_socket", "network_attempted"),
+    ],
+)
+def test_chatbot_guard_classifies_dependency_side_effect_as_configuration_failure(
+    operation, expected_measurement
+):
+    secret = "/definitely-missing-dependency-provider-secret"
+    cached_popen = subprocess.Popen
+    calls = []
+
+    def dependency_probe(name):
+        calls.append(name)
+        if operation == "cached_process":
+            cached_popen([secret])
+        else:
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()
+        return True
+
+    result = run_chatbot_gates(
+        pyproject_path=PYPROJECT,
+        configuration_path=CONFIG,
+        dependency_probe=dependency_probe,
+        audio_enumerator=lambda: calls.append("audio"),
+        startup_checker=lambda *_args: calls.append("startup"),
+        environment={name: secret for name in REQUIRED_PROVIDER_VARIABLES},
+    )
+
+    assert _statuses(result) == [
+        ("chatbot.dependencies", "PASS", "OK"),
+        ("chatbot.configuration", "FAIL", "CHATBOT_CONFIG_INVALID"),
+        ("chatbot.credentials", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+        ("chatbot.audio_hardware", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+    ]
+    assert result.gates[0]["measurements"] == [
+        {"name": f"{name}_importable", "value": True, "unit": None}
+        for name in REQUIRED_IMPORTS
+    ]
+    assert _configuration_measurements(result) == {
+        "process_spawn_attempted": expected_measurement == "process_spawn_attempted",
+        "network_attempted": expected_measurement == "network_attempted",
+        "microphone_attempted": False,
+    }
+    assert (result.label, result.exit_code) == ("FAIL_CHATBOT", 1)
+    assert calls == [REQUIRED_IMPORTS[0]]
+    assert secret not in repr(result)
+
+
+def test_chatbot_guard_detects_dependency_side_effect_even_when_probe_catches_it():
+    secret = "/definitely-missing-caught-provider-secret"
+    cached_popen = subprocess.Popen
+    calls = []
+
+    def dependency_probe(name):
+        calls.append(name)
+        try:
+            cached_popen([secret])
+        except Exception:
+            return True
+        raise AssertionError("guarded process constructor did not raise")
+
+    result = run_chatbot_gates(
+        pyproject_path=PYPROJECT,
+        configuration_path=CONFIG,
+        dependency_probe=dependency_probe,
+        audio_enumerator=lambda: calls.append("audio"),
+        startup_checker=lambda *_args: calls.append("startup"),
+        environment={name: secret for name in REQUIRED_PROVIDER_VARIABLES},
+    )
+
+    assert _statuses(result)[:2] == [
+        ("chatbot.dependencies", "PASS", "OK"),
+        ("chatbot.configuration", "FAIL", "CHATBOT_CONFIG_INVALID"),
+    ]
+    assert all(row["value"] is True for row in result.gates[0]["measurements"])
+    assert _configuration_measurements(result)["process_spawn_attempted"] is True
+    assert calls == [REQUIRED_IMPORTS[0]]
+    assert secret not in repr(result)
+
+
+@pytest.mark.parametrize("import_style", ["standard", "importlib", "cached"])
+@pytest.mark.parametrize("module_kind", ["pyaudio", "audio_device"])
+def test_chatbot_guard_blocks_late_imported_audio_stream_entry_points(
+    tmp_path, monkeypatch, request, import_style, module_kind
+):
+    secret = "late-audio-provider-secret-must-not-escape"
+    if module_kind == "pyaudio":
+        module_name = "pyaudio"
+        module_path = tmp_path / "pyaudio.py"
+        side_effect_name = "OPENED"
+        module_path.write_text(
+            "OPENED = []\n"
+            "class PyAudio:\n"
+            "    def open(self, *_args, **_kwargs):\n"
+            "        OPENED.append(True)\n",
+            encoding="utf-8",
+        )
+    else:
+        package = tmp_path / "fixture_chatbot_audio"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        module_name = "fixture_chatbot_audio.audio_device"
+        module_path = package / "audio_device.py"
+        side_effect_name = "STARTED"
+        module_path.write_text(
+            "STARTED = []\n"
+            "class AudioDevice:\n"
+            "    def start_streams(self, *_args, **_kwargs):\n"
+            "        STARTED.append(True)\n",
+            encoding="utf-8",
+        )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    request.addfinalizer(lambda: sys.modules.pop(module_name, None))
+    if module_kind == "audio_device":
+        request.addfinalizer(lambda: sys.modules.pop("fixture_chatbot_audio", None))
+    cached_importer = importlib.import_module
+
+    def startup_checker(_configuration, _spies):
+        if import_style == "standard":
+            module = builtins.__import__(module_name, fromlist=("*",))
+        elif import_style == "importlib":
+            module = importlib.import_module(module_name)
+        else:
+            module = cached_importer(module_name)
+        if module_kind == "pyaudio":
+            module.PyAudio().open(secret)
+        else:
+            module.AudioDevice().start_streams(secret)
+
+    result = run_chatbot_gates(
+        pyproject_path=PYPROJECT,
+        configuration_path=CONFIG,
+        dependency_probe=DependencyProbe(),
+        audio_enumerator=lambda: _devices(audio=True),
+        startup_checker=startup_checker,
+        environment={name: secret for name in REQUIRED_PROVIDER_VARIABLES},
+    )
+
+    measurements = _configuration_measurements(result)
+    imported = sys.modules[module_name]
+    assert _statuses(result)[1] == (
+        "chatbot.configuration",
+        "FAIL",
+        "CHATBOT_CONFIG_INVALID",
+    )
+    assert measurements == {
+        "process_spawn_attempted": False,
+        "network_attempted": False,
+        "microphone_attempted": True,
+    }
+    assert getattr(imported, side_effect_name) == []
+    assert secret not in repr(result)
+
+
 def test_audio_inventory_never_opens_a_stream_and_records_no_device_names():
     calls = []
 

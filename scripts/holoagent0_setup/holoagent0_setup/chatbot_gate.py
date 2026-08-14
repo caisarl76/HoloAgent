@@ -315,7 +315,7 @@ class _PythonOfflineSideEffectGuard:
 
 
 class ChatbotOfflineSideEffectGuard:
-    """Block process, network, and loaded chatbot stream entry points."""
+    """Block process, network, and reviewed chatbot stream entry points."""
 
     _AUDIO_DEVICE_METHODS = (
         "start_streams",
@@ -329,6 +329,7 @@ class ChatbotOfflineSideEffectGuard:
     def __init__(self) -> None:
         self._offline_guard = _PythonOfflineSideEffectGuard()
         self.microphone_attempts: list[str] = []
+        self._patched_audio_entries: set[tuple[int, str]] = set()
         self._stack: ExitStack | None = None
 
     @property
@@ -339,6 +340,12 @@ class ChatbotOfflineSideEffectGuard:
     def network_attempts(self) -> tuple[str, ...]:
         return tuple(self._offline_guard.network_attempts)
 
+    @property
+    def side_effect_attempted(self) -> bool:
+        return bool(
+            self.process_attempts or self.network_attempts or self.microphone_attempts
+        )
+
     def __enter__(self) -> "ChatbotOfflineSideEffectGuard":
         if self._stack is not None:
             raise RuntimeError("chatbot side-effect guard is already active")
@@ -346,37 +353,17 @@ class ChatbotOfflineSideEffectGuard:
         self._stack = stack
         try:
             stack.enter_context(self._offline_guard)
-            pyaudio_module = sys.modules.get("pyaudio")
-            pyaudio_owner = (
-                None
-                if pyaudio_module is None
-                else getattr(pyaudio_module, "PyAudio", None)
-            )
-            if pyaudio_owner is not None and hasattr(pyaudio_owner, "open"):
-                stack.enter_context(
-                    patch.object(
-                        pyaudio_owner,
-                        "open",
-                        self._blocked_microphone("pyaudio.PyAudio.open"),
-                    )
+            bootstrap = getattr(importlib, "_bootstrap")
+            original_find_and_load = bootstrap._find_and_load
+            stack.enter_context(
+                patch.object(
+                    bootstrap,
+                    "_find_and_load",
+                    self._guarded_find_and_load(original_find_and_load),
                 )
+            )
             for module_name, module in tuple(sys.modules.items()):
-                if not module_name.endswith("audio_device") or module is None:
-                    continue
-                owner = getattr(module, "AudioDevice", None)
-                if owner is None:
-                    continue
-                for method_name in self._AUDIO_DEVICE_METHODS:
-                    if hasattr(owner, method_name):
-                        stack.enter_context(
-                            patch.object(
-                                owner,
-                                method_name,
-                                self._blocked_microphone(
-                                    f"{module_name}.AudioDevice.{method_name}"
-                                ),
-                            )
-                        )
+                self._patch_loaded_audio_module(module_name, module)
         except BaseException:
             stack.close()
             self._stack = None
@@ -396,6 +383,52 @@ class ChatbotOfflineSideEffectGuard:
             raise OfflineStartupSideEffectAttempt("microphone")
 
         return blocked
+
+    def _guarded_find_and_load(self, original_find_and_load):
+        def guarded(module_name: str, import_function: object):
+            module = original_find_and_load(module_name, import_function)
+            self._patch_loaded_audio_module(module_name, module)
+            return module
+
+        return guarded
+
+    def _patch_loaded_audio_module(
+        self, module_name: str, module: object | None
+    ) -> None:
+        stack = self._stack
+        if stack is None or module is None:
+            return
+        if module_name == "pyaudio":
+            owner = getattr(module, "PyAudio", None)
+            self._patch_audio_method(stack, owner, "open", "pyaudio.PyAudio.open")
+            return
+        if not module_name.endswith("audio_device"):
+            return
+        owner = getattr(module, "AudioDevice", None)
+        for method_name in self._AUDIO_DEVICE_METHODS:
+            self._patch_audio_method(
+                stack,
+                owner,
+                method_name,
+                f"{module_name}.AudioDevice.{method_name}",
+            )
+
+    def _patch_audio_method(
+        self,
+        stack: ExitStack,
+        owner: object | None,
+        method_name: str,
+        operation: str,
+    ) -> None:
+        if owner is None or not hasattr(owner, method_name):
+            return
+        identity = (id(owner), method_name)
+        if identity in self._patched_audio_entries:
+            return
+        stack.enter_context(
+            patch.object(owner, method_name, self._blocked_microphone(operation))
+        )
+        self._patched_audio_entries.add(identity)
 
 
 def classify_external_readiness(*, credentials: bool, audio: bool) -> ExternalReadiness:
@@ -760,8 +793,9 @@ def run_chatbot_gates(
     spies = StartupSideEffectSpies()
     guard = ChatbotOfflineSideEffectGuard()
     stage = "dependencies"
+    declarations_valid = False
     try:
-        with _WholeReadinessDeadline(startup_timeout_seconds):
+        with _WholeReadinessDeadline(startup_timeout_seconds), guard:
             declared = _declared_dependencies(pyproject_path)
             declarations_valid = set(REQUIRED_IMPORTS).issubset(declared)
             for name in REQUIRED_IMPORTS:
@@ -769,9 +803,15 @@ def run_chatbot_gates(
                     available = dependency_probe(name)
                 except ChatbotReadinessTimeout:
                     raise
+                except OfflineStartupSideEffectAttempt:
+                    raise
                 except Exception:
                     available = False
                 importability.append((name, available is True))
+                if guard.side_effect_attempted:
+                    raise OfflineStartupSideEffectAttempt(
+                        "dependency side effect rejected"
+                    )
             dependencies_ok = declarations_valid and all(
                 available for _, available in importability
             )
@@ -782,11 +822,10 @@ def run_chatbot_gates(
                 return _failure_after_dependencies(dependency_gate)
 
             stage = "configuration"
-            with guard:
-                configuration = _load_configuration(configuration_path)
-                validate_configuration_startup(configuration, StartupSideEffectSpies())
-                _configuration_startup(startup_checker, configuration, spies)
-                inventory = _normalize_inventory(audio_enumerator())
+            configuration = _load_configuration(configuration_path)
+            validate_configuration_startup(configuration, StartupSideEffectSpies())
+            _configuration_startup(startup_checker, configuration, spies)
+            inventory = _normalize_inventory(audio_enumerator())
 
             configuration_gate = _configuration_gate(guard, passed=True)
             source_environment = os.environ if environment is None else environment
@@ -825,6 +864,26 @@ def run_chatbot_gates(
                 label=decision.label,
                 exit_code=decision.exit_code,
             )
+    except OfflineStartupSideEffectAttempt:
+        if (
+            stage == "dependencies"
+            and declarations_valid
+            and guard.side_effect_attempted
+        ):
+            dependency_gate = _dependency_gate(
+                tuple((name, True) for name in REQUIRED_IMPORTS), passed=True
+            )
+            return _failure_after_configuration(
+                dependency_gate,
+                _configuration_gate(guard, passed=False),
+            )
+        if stage == "dependencies":
+            dependency_gate = _dependency_gate(tuple(importability), passed=False)
+            return _failure_after_dependencies(dependency_gate)
+        return _failure_after_configuration(
+            dependency_gate,
+            _configuration_gate(guard, passed=False),
+        )
     except Exception:
         if stage == "dependencies":
             dependency_gate = _dependency_gate(tuple(importability), passed=False)
