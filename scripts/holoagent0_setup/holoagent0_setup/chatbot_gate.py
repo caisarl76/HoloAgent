@@ -6,15 +6,19 @@ import ast
 import _thread
 from contextlib import ExitStack
 from dataclasses import dataclass
+import errno
+import hashlib
 import importlib
 import json
 import multiprocessing
 import os
 from pathlib import Path
+import resource
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 from threading import current_thread, main_thread
 import time
@@ -42,6 +46,17 @@ PYPROJECT_MAX_BYTES = 16 * 1024
 CONFIGURATION_MAX_BYTES = 64 * 1024
 DEFAULT_READINESS_TIMEOUT_SECONDS = 5.0
 MAX_READINESS_TIMEOUT_SECONDS = 30.0
+PYTHON_EXECUTABLE = Path("/usr/bin/python3.10")
+PYTHON_EXECUTABLE_SHA256 = (
+    "7d51cd6b48b521277f5caa4610a82126e315fa2be4df069823a8b1eeb5bd4a86"
+)
+CHATBOT_CHILD_CONTROL_SCHEMA = "holoagent0.chatbot-child-control.v1"
+CHATBOT_CHILD_CONTROL_MAX_BYTES = 4 * 1024
+CHATBOT_CHILD_RESULT_MAX_BYTES = 64 * 1024
+CHATBOT_CHILD_POLL_SECONDS = 0.01
+CHATBOT_CHILD_TERM_GRACE_SECONDS = 0.25
+CHATBOT_CHILD_KILL_GRACE_SECONDS = 1.0
+_CHATBOT_CHILD_ENTRY = Path(__file__).resolve().parents[1] / "chatbot_child.py"
 _CREDENTIAL_MINIMUM_LENGTH = 4
 _CREDENTIAL_PLACEHOLDERS = frozenset({"changeme", "placeholder", "xxxx"})
 _CONFIG_ROOT_KEYS = {
@@ -90,6 +105,13 @@ class ChatbotGateResult:
     gates: tuple[dict[str, object], ...]
     label: str
     exit_code: int
+
+
+@dataclass(frozen=True)
+class _OwnedChildIdentity:
+    pid: int
+    pgid: int
+    start_time_ticks: int
 
 
 class OfflineStartupSideEffectAttempt(RuntimeError):
@@ -894,7 +916,7 @@ def _side_effect_measurements(
     )
 
 
-def run_chatbot_gates(
+def _run_chatbot_gates_core(
     *,
     pyproject_path: Path,
     configuration_path: Path,
@@ -1035,3 +1057,584 @@ def run_chatbot_gates(
             dependency_gate,
             _configuration_gate(guard, passed=False),
         )
+
+
+def _closed_child_failure() -> ChatbotGateResult:
+    return _failure_after_dependencies(_dependency_gate((), passed=False))
+
+
+def _canonical_json_bytes(document: object) -> bytes:
+    return (
+        json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _valid_readiness_timeout(timeout_seconds: object) -> bool:
+    return (
+        type(timeout_seconds) is float
+        and 0.01 <= timeout_seconds <= MAX_READINESS_TIMEOUT_SECONDS
+    )
+
+
+def _encode_chatbot_child_control(
+    *,
+    pyproject_path: Path,
+    configuration_path: Path,
+    timeout_seconds: float,
+) -> bytes:
+    if not _valid_readiness_timeout(timeout_seconds):
+        raise ValueError("chatbot child timeout is invalid")
+    paths = (Path(pyproject_path), Path(configuration_path))
+    if any(not path.is_absolute() for path in paths):
+        raise ValueError("chatbot child paths must be absolute")
+    document = {
+        "configuration_path": str(paths[1]),
+        "pyproject_path": str(paths[0]),
+        "schema_version": CHATBOT_CHILD_CONTROL_SCHEMA,
+        "timeout_seconds": timeout_seconds,
+    }
+    payload = _canonical_json_bytes(document)
+    if len(payload) > CHATBOT_CHILD_CONTROL_MAX_BYTES:
+        raise ValueError("chatbot child control exceeds bound")
+    return payload
+
+
+def _decode_chatbot_child_control(payload: bytes) -> tuple[Path, Path, float]:
+    if (
+        type(payload) is not bytes
+        or not payload
+        or len(payload) > CHATBOT_CHILD_CONTROL_MAX_BYTES
+    ):
+        raise ValueError("chatbot child control is invalid")
+    document = json.loads(
+        payload.decode("utf-8"),
+        parse_constant=lambda _token: (_ for _ in ()).throw(
+            ValueError("chatbot child control constant is invalid")
+        ),
+    )
+    if (
+        type(document) is not dict
+        or set(document)
+        != {
+            "schema_version",
+            "pyproject_path",
+            "configuration_path",
+            "timeout_seconds",
+        }
+        or document["schema_version"] != CHATBOT_CHILD_CONTROL_SCHEMA
+        or type(document["pyproject_path"]) is not str
+        or type(document["configuration_path"]) is not str
+        or not _valid_readiness_timeout(document["timeout_seconds"])
+        or _canonical_json_bytes(document) != payload
+    ):
+        raise ValueError("chatbot child control is not closed")
+    pyproject_path = Path(document["pyproject_path"])
+    configuration_path = Path(document["configuration_path"])
+    if (
+        not pyproject_path.is_absolute()
+        or not configuration_path.is_absolute()
+        or "\0" in str(pyproject_path)
+        or "\0" in str(configuration_path)
+    ):
+        raise ValueError("chatbot child control paths are invalid")
+    return pyproject_path, configuration_path, document["timeout_seconds"]
+
+
+def _chatbot_result_document(result: ChatbotGateResult) -> dict[str, object]:
+    return {
+        "exit_code": result.exit_code,
+        "gates": list(result.gates),
+        "label": result.label,
+    }
+
+
+def _encode_chatbot_child_result(result: ChatbotGateResult) -> bytes:
+    payload = _canonical_json_bytes(_chatbot_result_document(result))
+    if len(payload) > CHATBOT_CHILD_RESULT_MAX_BYTES:
+        raise ValueError("chatbot child result exceeds bound")
+    return payload
+
+
+def _measurement_rows(
+    gate: dict[str, object], expected_names: tuple[str, ...]
+) -> tuple[dict[str, object], ...]:
+    measurements = gate["measurements"]
+    if type(measurements) is not list or len(measurements) != len(expected_names):
+        raise ValueError("chatbot child measurements are invalid")
+    rows = tuple(measurements)
+    for row, expected_name in zip(rows, expected_names, strict=True):
+        if (
+            type(row) is not dict
+            or set(row) != {"name", "value", "unit"}
+            or row["name"] != expected_name
+            or row["unit"] is not None
+        ):
+            raise ValueError("chatbot child measurement is not closed")
+    return rows
+
+
+def _validate_child_gate_shape(
+    gate: object, gate_id: str, role: str
+) -> dict[str, object]:
+    if (
+        type(gate) is not dict
+        or set(gate)
+        != {
+            "id",
+            "status",
+            "role",
+            "reason",
+            "measurements",
+            "thresholds",
+            "log_paths",
+            "child_command_exit_code",
+        }
+        or gate["id"] != gate_id
+        or gate["role"] != role
+        or gate["thresholds"] != []
+        or gate["log_paths"] != []
+        or gate["child_command_exit_code"] is not None
+    ):
+        raise ValueError("chatbot child gate is not closed")
+    return gate
+
+
+def _validate_dependency_child_gate(gate: dict[str, object]) -> None:
+    status_reason = (gate["status"], gate["reason"])
+    if status_reason not in {
+        ("PASS", "OK"),
+        ("FAIL", "CHATBOT_DEPENDENCY_MISSING"),
+    }:
+        raise ValueError("chatbot dependency child gate is invalid")
+    measurements = gate["measurements"]
+    if type(measurements) is not list:
+        raise ValueError("chatbot dependency measurements are invalid")
+    names = tuple(
+        row.get("name") if type(row) is dict else None for row in measurements
+    )
+    import_names = tuple(f"{name}_importable" for name in REQUIRED_IMPORTS)
+    import_count = 0
+    while (
+        import_count < len(names) and names[import_count] == import_names[import_count]
+    ):
+        import_count += 1
+    remaining_names = names[import_count:]
+    side_effect_names = (
+        "process_spawn_attempted",
+        "network_attempted",
+        "microphone_attempted",
+    )
+    if remaining_names not in {(), side_effect_names}:
+        raise ValueError("chatbot dependency evidence names are invalid")
+    for row in measurements:
+        if (
+            type(row) is not dict
+            or set(row) != {"name", "value", "unit"}
+            or type(row["value"]) is not bool
+            or row["unit"] is not None
+        ):
+            raise ValueError("chatbot dependency evidence is invalid")
+    if gate["status"] == "PASS" and (
+        import_count != len(REQUIRED_IMPORTS)
+        or remaining_names
+        or not all(row["value"] for row in measurements)
+    ):
+        raise ValueError("chatbot dependency pass evidence is incomplete")
+
+
+def _decode_chatbot_child_result(payload: bytes) -> ChatbotGateResult:
+    if (
+        type(payload) is not bytes
+        or not payload
+        or len(payload) > CHATBOT_CHILD_RESULT_MAX_BYTES
+    ):
+        raise ValueError("chatbot child result is invalid")
+    document = json.loads(
+        payload.decode("utf-8"),
+        parse_constant=lambda _token: (_ for _ in ()).throw(
+            ValueError("chatbot child result constant is invalid")
+        ),
+    )
+    if (
+        type(document) is not dict
+        or set(document) != {"exit_code", "gates", "label"}
+        or _canonical_json_bytes(document) != payload
+        or type(document["gates"]) is not list
+        or len(document["gates"]) != 4
+    ):
+        raise ValueError("chatbot child result is not closed")
+    dependency = _validate_child_gate_shape(
+        document["gates"][0], "chatbot.dependencies", "required"
+    )
+    configuration = _validate_child_gate_shape(
+        document["gates"][1], "chatbot.configuration", "required"
+    )
+    credentials = _validate_child_gate_shape(
+        document["gates"][2], "chatbot.credentials", "qualification"
+    )
+    audio = _validate_child_gate_shape(
+        document["gates"][3], "chatbot.audio_hardware", "qualification"
+    )
+    _validate_dependency_child_gate(dependency)
+    side_effect_names = (
+        "process_spawn_attempted",
+        "network_attempted",
+        "microphone_attempted",
+    )
+    if configuration["status"] == "NOT_RUN":
+        if configuration["reason"] != "EARLIER_BLOCKING_GATE":
+            raise ValueError("chatbot configuration child gate is invalid")
+        _measurement_rows(configuration, ())
+    else:
+        if (configuration["status"], configuration["reason"]) not in {
+            ("PASS", "OK"),
+            ("FAIL", "CHATBOT_CONFIG_INVALID"),
+        }:
+            raise ValueError("chatbot configuration child gate is invalid")
+        rows = _measurement_rows(configuration, side_effect_names)
+        if any(type(row["value"]) is not bool for row in rows):
+            raise ValueError("chatbot configuration evidence is invalid")
+        if configuration["status"] == "PASS" and any(row["value"] for row in rows):
+            raise ValueError("chatbot configuration pass evidence is inconsistent")
+    later_not_run = configuration["status"] in {"NOT_RUN", "FAIL"}
+    if dependency["status"] == "PASS" and configuration["status"] == "NOT_RUN":
+        raise ValueError("chatbot dependency pass cannot skip configuration")
+    if later_not_run:
+        for gate in (credentials, audio):
+            if (gate["status"], gate["reason"]) != (
+                "NOT_RUN",
+                "EARLIER_BLOCKING_GATE",
+            ):
+                raise ValueError("chatbot later child gate is invalid")
+            _measurement_rows(gate, ())
+        expected_label = "FAIL_CHATBOT"
+        expected_exit = 1
+    else:
+        credential_rows = _measurement_rows(
+            credentials,
+            tuple(f"{name}_present" for name in REQUIRED_PROVIDER_VARIABLES),
+        )
+        if any(type(row["value"]) is not bool for row in credential_rows):
+            raise ValueError("chatbot credential child evidence is invalid")
+        credentials_present = all(row["value"] for row in credential_rows)
+        if (credentials["status"], credentials["reason"]) != (
+            ("PASS", "OK")
+            if credentials_present
+            else ("QUALIFIED", "CREDENTIALS_MISSING")
+        ):
+            raise ValueError("chatbot credential child gate is inconsistent")
+        audio_rows = _measurement_rows(
+            audio,
+            (
+                "audio_input_device_count",
+                "audio_output_device_count",
+                "matching_full_duplex_device_count",
+                "configured_full_duplex_device_present",
+                "audio_stream_opened",
+            ),
+        )
+        if (
+            any(
+                type(row["value"]) is not int or row["value"] < 0
+                for row in audio_rows[:3]
+            )
+            or type(audio_rows[3]["value"]) is not bool
+            or audio_rows[4]["value"] is not False
+        ):
+            raise ValueError("chatbot audio child evidence is invalid")
+        audio_present = audio_rows[3]["value"]
+        input_count, output_count, matching_count = (
+            row["value"] for row in audio_rows[:3]
+        )
+        if (
+            matching_count > input_count
+            or matching_count > output_count
+            or audio_present is not (matching_count > 0)
+        ):
+            raise ValueError("chatbot audio child evidence is inconsistent")
+        if (audio["status"], audio["reason"]) != (
+            ("PASS", "OK") if audio_present else ("QUALIFIED", "AUDIO_HARDWARE_MISSING")
+        ):
+            raise ValueError("chatbot audio child gate is inconsistent")
+        decision = classify_external_readiness(
+            credentials=credentials_present,
+            audio=audio_present,
+        )
+        expected_label = decision.label
+        expected_exit = decision.exit_code
+    if dependency["status"] == "FAIL":
+        if configuration["status"] != "NOT_RUN":
+            raise ValueError("chatbot dependency failure did not stop later gates")
+        expected_label = "FAIL_CHATBOT"
+        expected_exit = 1
+    if document["label"] != expected_label or document["exit_code"] != expected_exit:
+        raise ValueError("chatbot child result decision is inconsistent")
+    return ChatbotGateResult(
+        gates=tuple(document["gates"]),
+        label=document["label"],
+        exit_code=document["exit_code"],
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_process_start_time(pid: int) -> int:
+    payload = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    closing_parenthesis = payload.rfind(")")
+    fields = payload[closing_parenthesis + 2 :].split()
+    if closing_parenthesis < 1 or len(fields) < 20:
+        raise OSError("chatbot child process identity is invalid")
+    value = int(fields[19])
+    if value <= 0:
+        raise OSError("chatbot child process start time is invalid")
+    return value
+
+
+def _bind_owned_child(process: subprocess.Popen[bytes]) -> _OwnedChildIdentity:
+    pid = process.pid
+    pgid = os.getpgid(pid)
+    identity = _OwnedChildIdentity(pid, pgid, _read_process_start_time(pid))
+    if pid <= 1 or pgid != pid:
+        raise OSError("chatbot child process group is not owned")
+    return identity
+
+
+def _root_identity_matches(identity: _OwnedChildIdentity) -> bool:
+    try:
+        return (
+            os.getpgid(identity.pid) == identity.pgid
+            and _read_process_start_time(identity.pid) == identity.start_time_ticks
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError as error:
+        if error.errno != errno.ESRCH:
+            raise
+        return False
+    return True
+
+
+def _signal_owned_group(
+    identity: _OwnedChildIdentity,
+    process: subprocess.Popen[bytes],
+    signum: int,
+) -> None:
+    if process.poll() is None and not _root_identity_matches(identity):
+        raise OSError("chatbot child root identity changed")
+    os.killpg(identity.pgid, signum)
+
+
+def _wait_for_owned_cleanup(
+    identity: _OwnedChildIdentity,
+    process: subprocess.Popen[bytes],
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        process.poll()
+        if process.returncode is not None and not _process_group_exists(identity.pgid):
+            return True
+        time.sleep(CHATBOT_CHILD_POLL_SECONDS)
+    return False
+
+
+def _cleanup_owned_child(
+    identity: _OwnedChildIdentity,
+    process: subprocess.Popen[bytes],
+) -> tuple[bool, bool]:
+    residual_group = process.poll() is not None and _process_group_exists(identity.pgid)
+    needs_termination = process.returncode is None or residual_group
+    try:
+        if needs_termination:
+            _signal_owned_group(identity, process, signal.SIGTERM)
+            if not _wait_for_owned_cleanup(
+                identity,
+                process,
+                CHATBOT_CHILD_TERM_GRACE_SECONDS,
+            ):
+                _signal_owned_group(identity, process, signal.SIGKILL)
+        clean = _wait_for_owned_cleanup(
+            identity,
+            process,
+            CHATBOT_CHILD_KILL_GRACE_SECONDS,
+        )
+        if process.returncode is None:
+            process.wait(timeout=CHATBOT_CHILD_KILL_GRACE_SECONDS)
+        final_absent = not _process_group_exists(identity.pgid)
+        return clean and process.returncode is not None and final_absent, residual_group
+    except (OSError, subprocess.SubprocessError):
+        try:
+            process.kill()
+            process.wait(timeout=CHATBOT_CHILD_KILL_GRACE_SECONDS)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return False, residual_group
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("chatbot child control write failed")
+        offset += written
+
+
+def _run_owned_chatbot_child(
+    *,
+    command: tuple[str, ...],
+    control: bytes,
+    timeout_seconds: float,
+) -> ChatbotGateResult:
+    if (
+        type(command) is not tuple
+        or len(command) < 4
+        or command[:3] != (str(PYTHON_EXECUTABLE), "-I", "-B")
+        or any(type(argument) is not str or "\0" in argument for argument in command)
+        or not _valid_readiness_timeout(timeout_seconds)
+    ):
+        return _closed_child_failure()
+    try:
+        _decode_chatbot_child_control(control)
+    except Exception:
+        return _closed_child_failure()
+    read_descriptor = -1
+    write_descriptor = -1
+    process: subprocess.Popen[bytes] | None = None
+    identity: _OwnedChildIdentity | None = None
+    transport_failed = False
+    try:
+        read_descriptor, write_descriptor = os.pipe2(os.O_CLOEXEC)
+        with tempfile.TemporaryFile(mode="w+b") as result_file:
+            os.fchmod(result_file.fileno(), 0o600)
+            if os.fstat(result_file.fileno()).st_mode & 0o777 != 0o600:
+                raise OSError("chatbot child result file mode is invalid")
+            process = subprocess.Popen(
+                command,
+                stdin=read_descriptor,
+                stdout=result_file,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+            os.close(read_descriptor)
+            read_descriptor = -1
+            identity = _bind_owned_child(process)
+            if not hasattr(resource, "prlimit"):
+                raise OSError("chatbot child file limit is unavailable")
+            resource.prlimit(
+                identity.pid,
+                resource.RLIMIT_FSIZE,
+                (CHATBOT_CHILD_RESULT_MAX_BYTES, CHATBOT_CHILD_RESULT_MAX_BYTES),
+            )
+            _write_all(write_descriptor, control)
+            os.close(write_descriptor)
+            write_descriptor = -1
+            deadline = time.monotonic() + timeout_seconds
+            while process.poll() is None:
+                if (
+                    os.fstat(result_file.fileno()).st_size
+                    > CHATBOT_CHILD_RESULT_MAX_BYTES
+                    or time.monotonic() >= deadline
+                    or not _root_identity_matches(identity)
+                ):
+                    transport_failed = True
+                    break
+                time.sleep(CHATBOT_CHILD_POLL_SECONDS)
+            if os.fstat(result_file.fileno()).st_size > CHATBOT_CHILD_RESULT_MAX_BYTES:
+                transport_failed = True
+            clean, residual_group = _cleanup_owned_child(identity, process)
+            if (
+                not clean
+                or residual_group
+                or transport_failed
+                or process.returncode != 0
+            ):
+                return _closed_child_failure()
+            result_file.seek(0)
+            payload = result_file.read(CHATBOT_CHILD_RESULT_MAX_BYTES + 1)
+            return _decode_chatbot_child_result(payload)
+    except Exception:
+        if process is not None and identity is not None:
+            _cleanup_owned_child(identity, process)
+        elif process is not None:
+            try:
+                process.kill()
+                process.wait(timeout=CHATBOT_CHILD_KILL_GRACE_SECONDS)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        return _closed_child_failure()
+    finally:
+        for descriptor in (read_descriptor, write_descriptor):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def run_chatbot_gates(
+    *,
+    pyproject_path: Path,
+    configuration_path: Path,
+    startup_timeout_seconds: float = DEFAULT_READINESS_TIMEOUT_SECONDS,
+) -> ChatbotGateResult:
+    """Run the chatbot readiness probe in one owned fresh-exec child."""
+
+    try:
+        if _sha256_file(PYTHON_EXECUTABLE) != PYTHON_EXECUTABLE_SHA256:
+            raise OSError("chatbot interpreter identity mismatch")
+        control = _encode_chatbot_child_control(
+            pyproject_path=Path(pyproject_path),
+            configuration_path=Path(configuration_path),
+            timeout_seconds=startup_timeout_seconds,
+        )
+    except Exception:
+        return _closed_child_failure()
+    return _run_owned_chatbot_child(
+        command=(
+            str(PYTHON_EXECUTABLE),
+            "-I",
+            "-B",
+            str(_CHATBOT_CHILD_ENTRY),
+        ),
+        control=control,
+        timeout_seconds=startup_timeout_seconds,
+    )
+
+
+def _chatbot_child_main() -> int:
+    try:
+        payload = sys.stdin.buffer.read(CHATBOT_CHILD_CONTROL_MAX_BYTES + 1)
+        pyproject_path, configuration_path, timeout_seconds = (
+            _decode_chatbot_child_control(payload)
+        )
+        result = _run_chatbot_gates_core(
+            pyproject_path=pyproject_path,
+            configuration_path=configuration_path,
+            startup_timeout_seconds=timeout_seconds,
+        )
+        encoded = _encode_chatbot_child_result(result)
+        sys.stdout.buffer.write(encoded)
+        sys.stdout.buffer.flush()
+        return 0
+    except BaseException:
+        return 70

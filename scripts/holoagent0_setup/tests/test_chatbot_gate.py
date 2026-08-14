@@ -4,6 +4,7 @@ import builtins
 import _thread
 import importlib
 import json
+import os
 from pathlib import Path
 import signal
 import socket
@@ -21,9 +22,9 @@ from holoagent0_setup.chatbot_gate import (
     OfflineStartupSideEffectAttempt,
     REQUIRED_IMPORTS,
     REQUIRED_PROVIDER_VARIABLES,
+    _run_chatbot_gates_core as run_chatbot_gates,
     classify_external_readiness,
     enumerate_audio_devices,
-    run_chatbot_gates,
 )
 
 
@@ -197,6 +198,290 @@ def _statuses(result):
 
 def _configuration_measurements(result):
     return {row["name"]: row["value"] for row in result.gates[1]["measurements"]}
+
+
+def _child_result_bytes(result):
+    return (
+        json.dumps(
+            {
+                "exit_code": result.exit_code,
+                "gates": list(result.gates),
+                "label": result.label,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _passing_child_result_bytes():
+    result = run_chatbot_gates(
+        pyproject_path=PYPROJECT,
+        configuration_path=CONFIG,
+        dependency_probe=DependencyProbe(),
+        audio_enumerator=lambda: _devices(audio=True),
+        startup_checker=lambda *_args: None,
+        environment={
+            name: "fixture-provider-secret" for name in REQUIRED_PROVIDER_VARIABLES
+        },
+    )
+    assert result.label == "PASS_HOLOAGENT0_OFFLINE"
+    return _child_result_bytes(result)
+
+
+def _write_child_fixture(tmp_path, body):
+    script = tmp_path / "chatbot-child-fixture.py"
+    script.write_text(body, encoding="utf-8")
+    return ("/usr/bin/python3.10", "-I", "-B", str(script))
+
+
+def _child_control_bytes():
+    return chatbot_gate._encode_chatbot_child_control(
+        pyproject_path=PYPROJECT,
+        configuration_path=CONFIG,
+        timeout_seconds=0.5,
+    )
+
+
+def _assert_closed_child_failure(result):
+    assert _statuses(result) == [
+        ("chatbot.dependencies", "FAIL", "CHATBOT_DEPENDENCY_MISSING"),
+        ("chatbot.configuration", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+        ("chatbot.credentials", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+        ("chatbot.audio_hardware", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+    ]
+    assert (result.label, result.exit_code) == ("FAIL_CHATBOT", 1)
+
+
+def _assert_process_group_absent(pgid):
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pgid, 0)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "dependency_false_on_pass",
+        "configuration_side_effect_on_pass",
+        "audio_match_count_inconsistent",
+        "dependency_pass_with_later_not_run",
+    ],
+)
+def test_chatbot_child_result_acceptance_rejects_inconsistent_evidence(mutation):
+    document = json.loads(_passing_child_result_bytes())
+    if mutation == "dependency_false_on_pass":
+        document["gates"][0]["measurements"][0]["value"] = False
+    elif mutation == "configuration_side_effect_on_pass":
+        document["gates"][1]["measurements"][0]["value"] = True
+    elif mutation == "audio_match_count_inconsistent":
+        document["gates"][3]["measurements"][2]["value"] = 0
+    else:
+        for gate in document["gates"][1:]:
+            gate["status"] = "NOT_RUN"
+            gate["reason"] = "EARLIER_BLOCKING_GATE"
+            gate["measurements"] = []
+        document["label"] = "FAIL_CHATBOT"
+        document["exit_code"] = 1
+    payload = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+    with pytest.raises(ValueError):
+        chatbot_gate._decode_chatbot_child_result(payload)
+
+
+def test_chatbot_child_transport_is_closed_private_and_credential_free(
+    tmp_path, monkeypatch
+):
+    pid_path = tmp_path / "child.pid"
+    secret = "transport-secret-must-not-enter-control-or-argv"
+    for name in REQUIRED_PROVIDER_VARIABLES:
+        monkeypatch.setenv(name, secret)
+    payload = _passing_child_result_bytes()
+    command = _write_child_fixture(
+        tmp_path,
+        "import json,os,stat,sys\n"
+        f"open({str(pid_path)!r},'w').write(str(os.getpid()))\n"
+        "raw=sys.stdin.buffer.read()\n"
+        "document=json.loads(raw)\n"
+        "assert raw == (json.dumps(document,sort_keys=True,separators=(',',':'))+'\\n').encode()\n"
+        "assert set(document) == {'schema_version','pyproject_path','configuration_path','timeout_seconds'}\n"
+        "assert stat.S_IMODE(os.fstat(1).st_mode) == 0o600\n"
+        "assert os.getpid() == os.getpgrp()\n"
+        f"values=[os.environ.get(name) for name in {REQUIRED_PROVIDER_VARIABLES!r}]\n"
+        "assert all(values) and len(set(values)) == 1\n"
+        f"sys.stdout.buffer.write({payload!r})\n",
+    )
+    control = _child_control_bytes()
+
+    result = chatbot_gate._run_owned_chatbot_child(
+        command=command,
+        control=control,
+        timeout_seconds=0.5,
+    )
+
+    pgid = int(pid_path.read_text(encoding="utf-8"))
+    assert result.label == "PASS_HOLOAGENT0_OFFLINE"
+    assert secret not in repr(command)
+    assert secret.encode() not in control
+    assert secret.encode() not in payload
+    assert secret not in repr(result)
+    _assert_process_group_absent(pgid)
+
+
+def test_chatbot_fresh_exec_does_not_inherit_parent_core_or_cached_callable(
+    tmp_path,
+    monkeypatch,
+):
+    child_pyproject = tmp_path / "pyproject.toml"
+    child_pyproject.write_text("[project]\ndependencies = []\n", encoding="utf-8")
+    inherited_pass = chatbot_gate._decode_chatbot_child_result(
+        _passing_child_result_bytes()
+    )
+    marker = []
+    marker_path = tmp_path / "parent-worker-marker"
+    scheduled = threading.Event()
+    stop_worker = threading.Event()
+    cached_schedule = scheduled.set
+
+    def baseline_parent_worker():
+        while not stop_worker.wait(0.01):
+            if scheduled.is_set():
+                time.sleep(0.2)
+                marker_path.write_text("scheduled", encoding="utf-8")
+                return
+
+    baseline_worker = threading.Thread(target=baseline_parent_worker, daemon=True)
+    baseline_worker.start()
+    assert baseline_worker.is_alive()
+
+    def inherited_parent_core(**_kwargs):
+        marker.append("called")
+        cached_schedule()
+        return inherited_pass
+
+    monkeypatch.setattr(chatbot_gate, "_run_chatbot_gates_core", inherited_parent_core)
+
+    try:
+        result = chatbot_gate.run_chatbot_gates(
+            pyproject_path=child_pyproject,
+            configuration_path=CONFIG,
+            startup_timeout_seconds=0.5,
+        )
+        time.sleep(0.3)
+    finally:
+        stop_worker.set()
+        baseline_worker.join(timeout=1.0)
+
+    assert result.label != "PASS_HOLOAGENT0_OFFLINE"
+    assert marker == []
+    assert baseline_worker.is_alive() is False
+    assert scheduled.is_set() is False
+    assert marker_path.exists() is False
+
+
+def test_chatbot_actual_child_core_rejects_cached_low_level_waiting_worker(
+    tmp_path,
+):
+    marker_path = tmp_path / "late-marker"
+    pid_path = tmp_path / "child.pid"
+    package_root = Path(chatbot_gate.__file__).resolve().parents[1]
+    command = _write_child_fixture(
+        tmp_path,
+        "import _thread,os,sys,threading,time\n"
+        f"sys.path.insert(0,{str(package_root)!r})\n"
+        "import holoagent0_setup.chatbot_gate as gate\n"
+        f"open({str(pid_path)!r},'w').write(str(os.getpid()))\n"
+        "cached_start=_thread.start_new_thread\n"
+        "sys.stdin.buffer.read()\n"
+        "started=threading.Event()\n"
+        "def worker():\n"
+        "    started.set()\n"
+        "    time.sleep(0.25)\n"
+        f"    open({str(marker_path)!r},'w').write('escaped')\n"
+        "def startup(_configuration,_spies):\n"
+        "    cached_start(worker,())\n"
+        "    assert started.wait(0.2)\n"
+        f"result=gate._run_chatbot_gates_core(pyproject_path=gate.Path({str(PYPROJECT)!r}),configuration_path=gate.Path({str(CONFIG)!r}),dependency_probe=lambda _name: True,audio_enumerator=lambda: ({{'name':'USB Audio Device','maxInputChannels':1,'maxOutputChannels':1}},),startup_checker=startup,environment={{name:'valid-provider-secret' for name in gate.REQUIRED_PROVIDER_VARIABLES}},startup_timeout_seconds=0.5)\n"
+        "sys.stdout.buffer.write(gate._encode_chatbot_child_result(result))\n",
+    )
+
+    result = chatbot_gate._run_owned_chatbot_child(
+        command=command,
+        control=_child_control_bytes(),
+        timeout_seconds=0.5,
+    )
+    time.sleep(0.35)
+
+    assert _statuses(result)[1] == (
+        "chatbot.configuration",
+        "FAIL",
+        "CHATBOT_CONFIG_INVALID",
+    )
+    assert _configuration_measurements(result)["process_spawn_attempted"] is True
+    assert marker_path.exists() is False
+    _assert_process_group_absent(int(pid_path.read_text(encoding="utf-8")))
+
+
+def test_chatbot_rejects_success_until_residual_owned_process_group_is_empty(
+    tmp_path,
+):
+    marker_path = tmp_path / "escaped-marker"
+    pid_path = tmp_path / "child.pid"
+    descendant_path = tmp_path / "escaped-descendant.py"
+    descendant_path.write_text(
+        "import time\n"
+        "time.sleep(0.3)\n"
+        f"open({str(marker_path)!r},'w').write('escaped')\n",
+        encoding="utf-8",
+    )
+    payload = _passing_child_result_bytes()
+    command = _write_child_fixture(
+        tmp_path,
+        "import os,subprocess,sys\n"
+        f"open({str(pid_path)!r},'w').write(str(os.getpid()))\n"
+        "sys.stdin.buffer.read()\n"
+        f"subprocess.Popen([sys.executable,{str(descendant_path)!r}])\n"
+        f"sys.stdout.buffer.write({payload!r})\n",
+    )
+
+    result = chatbot_gate._run_owned_chatbot_child(
+        command=command,
+        control=_child_control_bytes(),
+        timeout_seconds=0.5,
+    )
+    time.sleep(0.4)
+
+    _assert_closed_child_failure(result)
+    assert marker_path.exists() is False
+    _assert_process_group_absent(int(pid_path.read_text(encoding="utf-8")))
+
+
+@pytest.mark.parametrize("defect", ["timeout", "signal", "malformed", "oversized"])
+def test_chatbot_child_transport_defects_fail_closed_and_reap_group(tmp_path, defect):
+    pid_path = tmp_path / f"{defect}.pid"
+    setup = (
+        "import os,signal,sys,time\n"
+        f"open({str(pid_path)!r},'w').write(str(os.getpid()))\n"
+        "sys.stdin.buffer.read()\n"
+    )
+    actions = {
+        "timeout": "time.sleep(2.0)\n",
+        "signal": "os.kill(os.getpid(),signal.SIGTERM)\n",
+        "malformed": "sys.stdout.write('not-json\\n')\n",
+        "oversized": "sys.stdout.write('x'*70000);sys.stdout.flush();time.sleep(2.0)\n",
+    }
+    command = _write_child_fixture(tmp_path, setup + actions[defect])
+
+    result = chatbot_gate._run_owned_chatbot_child(
+        command=command,
+        control=_child_control_bytes(),
+        timeout_seconds=0.05,
+    )
+
+    _assert_closed_child_failure(result)
+    _assert_process_group_absent(int(pid_path.read_text(encoding="utf-8")))
 
 
 @pytest.mark.parametrize(
@@ -1168,7 +1453,17 @@ def test_chatbot_guard_rejects_cached_waiting_worker_escape_and_cleans_fixture()
 
 @pytest.mark.parametrize(
     "thread_entry",
-    ["thread_start", "threading_start_new", "low_level_start_new"],
+    [
+        "thread_start",
+        pytest.param(
+            "threading_start_new",
+            marks=pytest.mark.skipif(
+                not callable(getattr(threading, "_start_new_thread", None)),
+                reason="interpreter does not expose threading._start_new_thread",
+            ),
+        ),
+        "low_level_start_new",
+    ],
 )
 def test_chatbot_configuration_fails_when_startup_catches_thread_attempt(
     thread_entry,
