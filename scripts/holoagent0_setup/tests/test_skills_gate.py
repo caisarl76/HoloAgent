@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
+from holoagent0_setup.openclaw_gate import LocalCommandRunner
+import holoagent0_setup.skills_gate as skills_gate
 from holoagent0_setup.skills_gate import (
     EXPECTED_SKILLS,
+    PYTHON_EXECUTABLE,
     SkillCommandResult,
     run_skills_gates,
 )
@@ -22,14 +28,16 @@ class FakeRunner:
 
     def run(self, command, *, environment, pass_fds=()):
         assert type(command) is tuple
-        assert pass_fds == ()
+        assert len(pass_fds) == 1
+        assert command[3] == f"/proc/self/fd/{pass_fds[0]}"
+        os.fstat(pass_fds[0])
         self.commands.append(command)
         self.environments.append(dict(environment))
         if self._results:
             return self._results.pop(0)
-        if command[-1].endswith("validate_skills.py"):
+        if len(self.commands) == 1:
             stdout = _validator_output()
-        elif command[-1].endswith("list_skills.py"):
+        elif len(self.commands) == 2:
             stdout = _list_output()
         else:
             stdout = "dry-run request only\n"
@@ -66,9 +74,8 @@ def test_skills_gate_validates_all_five_and_only_executes_pinned_dry_runs():
     assert result.exit_code == 0
     assert len(runner.commands) == 6
     assert all(command[0] == "/usr/bin/python3.10" for command in runner.commands)
-    assert all(command[1] == "-B" for command in runner.commands)
-    assert runner.commands[0][-1].endswith("validate_skills.py")
-    assert runner.commands[1][-1].endswith("list_skills.py")
+    assert all(command[1:3] == ("-I", "-B") for command in runner.commands)
+    assert all(command[3].startswith("/proc/self/fd/") for command in runner.commands)
     assert all("--dry-run" in command for command in runner.commands[2:])
     assert all(
         "-c" not in command and "--shell" not in command for command in runner.commands
@@ -88,11 +95,140 @@ def test_skills_gate_validates_all_five_and_only_executes_pinned_dry_runs():
         item["name"]: item["value"] for item in result.gates[1]["measurements"]
     }
     assert registry_measurements == {"validated_skill_count": 5}
-    assert dry_run_measurements == {
-        "dry_run_helper_count": 4,
-        "side_effect_attempted": False,
-        "remaining_process_group": False,
-    }
+    assert dry_run_measurements == {"dry_run_helper_count": 4}
+
+
+def test_skills_gate_real_default_runner_omits_unavailable_negative_telemetry():
+    result = run_skills_gates(repository_root=REPOSITORY_ROOT)
+
+    assert _statuses(result) == [
+        ("skills.registry", "PASS", "OK"),
+        ("skills.dry_run", "PASS", "OK"),
+    ]
+    assert result.gates[1]["measurements"] == [
+        {"name": "dry_run_helper_count", "value": 4, "unit": None}
+    ]
+
+
+def _direct_command(script: Path, *arguments: str) -> tuple[str, ...]:
+    return (str(PYTHON_EXECUTABLE), "-I", "-B", str(script), *arguments)
+
+
+def _digest(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def test_verified_skill_descriptor_survives_a_path_swap(tmp_path):
+    script = tmp_path / "reviewed.py"
+    replacement = tmp_path / "replacement.py"
+    reviewed_content = b'print("reviewed-bytes")\n'
+    script.write_bytes(reviewed_content)
+    replacement.write_text('print("replacement-bytes")\n', encoding="utf-8")
+
+    class SwapThenRun:
+        def run(self, command, *, environment, pass_fds=()):
+            replacement.replace(script)
+            return LocalCommandRunner(timeout_seconds=2.0).run(
+                command,
+                environment=environment,
+                pass_fds=pass_fds,
+            )
+
+    result = skills_gate._run_command(
+        SwapThenRun(),
+        _direct_command(script),
+        expected_script_digest=_digest(reviewed_content),
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "reviewed-bytes\n"
+
+
+def test_verified_skill_descriptor_rejects_a_symlink(tmp_path):
+    target = tmp_path / "target.py"
+    link = tmp_path / "reviewed.py"
+    content = b'print("must-not-run")\n'
+    target.write_bytes(content)
+    link.symlink_to(target)
+
+    with pytest.raises(OSError):
+        skills_gate._run_command(
+            FakeRunner(),
+            _direct_command(link),
+            expected_script_digest=_digest(content),
+        )
+
+
+def test_verified_skill_descriptor_is_closed_when_runner_raises(tmp_path):
+    script = tmp_path / "reviewed.py"
+    content = b'print("reviewed")\n'
+    script.write_bytes(content)
+    passed_descriptor = None
+
+    class RaisingRunner:
+        def run(self, _command, *, environment, pass_fds=()):
+            nonlocal passed_descriptor
+            passed_descriptor = pass_fds[0]
+            raise RuntimeError("runner failed")
+
+    with pytest.raises(RuntimeError, match="runner failed"):
+        skills_gate._run_command(
+            RaisingRunner(),
+            _direct_command(script),
+            expected_script_digest=_digest(content),
+        )
+
+    assert passed_descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(passed_descriptor)
+
+
+def test_isolated_skill_command_ignores_injected_user_site(tmp_path):
+    script = tmp_path / "reviewed.py"
+    content = b"""\
+try:
+    import holoagent0_user_site_probe
+except ModuleNotFoundError:
+    print("isolated")
+else:
+    print("injected")
+"""
+    script.write_bytes(content)
+    user_base = tmp_path / "user-base"
+    user_site = user_base / "lib/python3.10/site-packages"
+    user_site.mkdir(parents=True)
+    (user_site / "holoagent0_user_site_probe.py").write_text(
+        "INJECTED = True\n", encoding="utf-8"
+    )
+
+    class InjectedUserSiteRunner:
+        def run(self, command, *, environment, pass_fds=()):
+            process_environment = {
+                **environment,
+                "PYTHONUSERBASE": str(user_base),
+            }
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=process_environment,
+                pass_fds=pass_fds,
+            )
+            return SkillCommandResult(
+                completed.returncode,
+                completed.stdout,
+                completed.stderr,
+            )
+
+    result = skills_gate._run_command(
+        InjectedUserSiteRunner(),
+        _direct_command(script),
+        expected_script_digest=_digest(content),
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "isolated\n"
 
 
 def test_skills_gate_rejects_a_tracked_digest_mismatch_before_any_command():

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path
+import stat
 from typing import Callable, Protocol
 
 from .openclaw_gate import LocalCommandRunner
@@ -65,8 +67,8 @@ class SkillCommandResult:
     exit_code: int
     stdout: str
     stderr: str
-    side_effect_attempted: bool = False
-    remaining_process_group: bool = False
+    side_effect_attempted: bool | None = None
+    remaining_process_group: bool | None = None
 
 
 class SkillCommandRunner(Protocol):
@@ -141,8 +143,8 @@ def _command_result(value: object) -> SkillCommandResult:
         exit_code=getattr(value, "exit_code"),
         stdout=getattr(value, "stdout"),
         stderr=getattr(value, "stderr"),
-        side_effect_attempted=getattr(value, "side_effect_attempted", False),
-        remaining_process_group=getattr(value, "remaining_process_group", False),
+        side_effect_attempted=getattr(value, "side_effect_attempted", None),
+        remaining_process_group=getattr(value, "remaining_process_group", None),
     )
     if (
         type(result.exit_code) is not int
@@ -150,8 +152,8 @@ def _command_result(value: object) -> SkillCommandResult:
         or result.exit_code > 255
         or type(result.stdout) is not str
         or type(result.stderr) is not str
-        or type(result.side_effect_attempted) is not bool
-        or type(result.remaining_process_group) is not bool
+        or type(result.side_effect_attempted) not in {bool, type(None)}
+        or type(result.remaining_process_group) not in {bool, type(None)}
         or len(result.stdout.encode("utf-8")) + len(result.stderr.encode("utf-8"))
         > _OUTPUT_LIMIT_BYTES
     ):
@@ -160,17 +162,70 @@ def _command_result(value: object) -> SkillCommandResult:
 
 
 def _run_command(
-    runner: SkillCommandRunner, command: tuple[str, ...]
+    runner: SkillCommandRunner,
+    command: tuple[str, ...],
+    *,
+    expected_script_digest: str,
 ) -> SkillCommandResult:
     if (
         type(command) is not tuple
-        or not command
+        or len(command) < 4
         or any(type(argument) is not str for argument in command)
         or command[0] != str(PYTHON_EXECUTABLE)
+        or command[1:3] != ("-I", "-B")
+        or not Path(command[3]).is_absolute()
+        or type(expected_script_digest) is not str
+        or len(expected_script_digest) != 64
+        or any(
+            character not in "0123456789abcdef" for character in expected_script_digest
+        )
     ):
         raise ValueError("unreviewed skill command")
-    value = runner.run(command, environment={"PATH": "/usr/bin:/bin"}, pass_fds=())
-    return _command_result(value)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if type(no_follow) is not int:
+        raise OSError("no-follow script opening is unavailable")
+    descriptor = os.open(
+        command[3],
+        os.O_RDONLY | os.O_CLOEXEC | no_follow,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if descriptor < 3 or not stat.S_ISREG(before.st_mode):
+            raise OSError("reviewed skill script is not a regular file")
+        digest = hashlib.sha256()
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        for chunk in iter(lambda: os.read(descriptor, 1024 * 1024), b""):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field) for field in stable_fields
+        ):
+            raise OSError("reviewed skill script changed during verification")
+        if digest.hexdigest() != expected_script_digest:
+            raise OSError("reviewed skill script digest mismatch")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        verified_command = (
+            *command[:3],
+            f"/proc/self/fd/{descriptor}",
+            *command[4:],
+        )
+        value = runner.run(
+            verified_command,
+            environment={"PATH": "/usr/bin:/bin"},
+            pass_fds=(descriptor,),
+        )
+        return _command_result(value)
+    finally:
+        os.close(descriptor)
 
 
 def _list_inventory(output: str) -> tuple[str, ...] | None:
@@ -193,69 +248,83 @@ def _list_inventory(output: str) -> tuple[str, ...] | None:
     return tuple(names)
 
 
-def _registry_commands(repository_root: Path) -> tuple[tuple[str, ...], ...]:
+def _registry_commands(
+    repository_root: Path,
+) -> tuple[tuple[tuple[str, ...], str], ...]:
     return tuple(
-        (str(PYTHON_EXECUTABLE), "-B", str(repository_root / relative))
+        (
+            (
+                str(PYTHON_EXECUTABLE),
+                "-I",
+                "-B",
+                str(repository_root / relative),
+            ),
+            _PINNED_REPOSITORY_FILES[relative],
+        )
         for relative in (_VALIDATOR, _LIST)
     )
 
 
-def _dry_run_commands(repository_root: Path) -> tuple[tuple[str, ...], ...]:
-    base = (str(PYTHON_EXECUTABLE), "-B")
+def _dry_run_commands(
+    repository_root: Path,
+) -> tuple[tuple[tuple[str, ...], str], ...]:
+    base = (str(PYTHON_EXECUTABLE), "-I", "-B")
+    arm_script = _SKILLS_ROOT / "skills/arm-skill/scripts/trigger_arm_skill.py"
+    relative_move_script = (
+        _SKILLS_ROOT / "skills/rel-move-skill/scripts/relative_move.py"
+    )
+    service_script = _SKILLS_ROOT / "skills/robot-service/scripts/service_request.py"
+    semantic_nav_script = _SKILLS_ROOT / "skills/sem-nav-skill/scripts/semantic_nav.py"
     return (
         (
-            *base,
-            str(
-                repository_root
-                / _SKILLS_ROOT
-                / "skills/arm-skill/scripts/trigger_arm_skill.py"
+            (
+                *base,
+                str(repository_root / arm_script),
+                "--skill",
+                "high_wave",
+                "--dry-run",
             ),
-            "--skill",
-            "high_wave",
-            "--dry-run",
+            _PINNED_REPOSITORY_FILES[arm_script],
         ),
         (
-            *base,
-            str(
-                repository_root
-                / _SKILLS_ROOT
-                / "skills/rel-move-skill/scripts/relative_move.py"
+            (
+                *base,
+                str(repository_root / relative_move_script),
+                "--forward",
+                "0.0",
+                "--left",
+                "0.0",
+                "--rotation",
+                "0.0",
+                "--dry-run",
             ),
-            "--forward",
-            "0.0",
-            "--left",
-            "0.0",
-            "--rotation",
-            "0.0",
-            "--dry-run",
+            _PINNED_REPOSITORY_FILES[relative_move_script],
         ),
         (
-            *base,
-            str(
-                repository_root
-                / _SKILLS_ROOT
-                / "skills/robot-service/scripts/service_request.py"
+            (
+                *base,
+                str(repository_root / service_script),
+                "--endpoint",
+                "/health",
+                "--method",
+                "GET",
+                "--dry-run",
             ),
-            "--endpoint",
-            "/health",
-            "--method",
-            "GET",
-            "--dry-run",
+            _PINNED_REPOSITORY_FILES[service_script],
         ),
         (
-            *base,
-            str(
-                repository_root
-                / _SKILLS_ROOT
-                / "skills/sem-nav-skill/scripts/semantic_nav.py"
+            (
+                *base,
+                str(repository_root / semantic_nav_script),
+                "--floor",
+                "offline",
+                "--room",
+                "offline",
+                "--object",
+                "offline",
+                "--dry-run",
             ),
-            "--floor",
-            "offline",
-            "--room",
-            "offline",
-            "--object",
-            "offline",
-            "--dry-run",
+            _PINNED_REPOSITORY_FILES[semantic_nav_script],
         ),
     )
 
@@ -281,8 +350,12 @@ def run_skills_gates(
     command_runner = runner or LocalCommandRunner(timeout_seconds=10.0)
     try:
         registry_results = tuple(
-            _run_command(command_runner, command)
-            for command in _registry_commands(root)
+            _run_command(
+                command_runner,
+                command,
+                expected_script_digest=expected_digest,
+            )
+            for command, expected_digest in _registry_commands(root)
         )
     except Exception:
         registry_results = ()
@@ -290,7 +363,8 @@ def run_skills_gates(
         len(registry_results) == 2
         and all(result.exit_code == 0 for result in registry_results)
         and all(
-            not result.side_effect_attempted and not result.remaining_process_group
+            result.side_effect_attempted is not True
+            and result.remaining_process_group is not True
             for result in registry_results
         )
         and _list_inventory(registry_results[1].stdout) == EXPECTED_SKILLS
@@ -310,16 +384,26 @@ def run_skills_gates(
         "OK",
         (_measurement("validated_skill_count", len(EXPECTED_SKILLS)),),
     )
-    side_effect_attempted = False
-    remaining_process_group = False
+    dry_run_results: list[SkillCommandResult] = []
     try:
-        for command in _dry_run_commands(root):
+        for command, expected_digest in _dry_run_commands(root):
             if "--dry-run" not in command:
                 raise ValueError("motion-capable helper lacks dry-run")
-            result = _run_command(command_runner, command)
-            side_effect_attempted |= result.side_effect_attempted
-            remaining_process_group |= result.remaining_process_group
-            if side_effect_attempted or remaining_process_group:
+            result = _run_command(
+                command_runner,
+                command,
+                expected_script_digest=expected_digest,
+            )
+            dry_run_results.append(result)
+            if (
+                result.side_effect_attempted is True
+                or result.remaining_process_group is True
+            ):
+                measurements = [_measurement("dry_run_helper_count", 4)]
+                if result.side_effect_attempted is True:
+                    measurements.append(_measurement("side_effect_attempted", True))
+                if result.remaining_process_group is True:
+                    measurements.append(_measurement("remaining_process_group", True))
                 return SkillsGateResult(
                     gates=(
                         registry_gate,
@@ -327,14 +411,7 @@ def run_skills_gates(
                             "skills.dry_run",
                             "FAIL",
                             "OFFLINE_SIDE_EFFECT_ATTEMPT",
-                            (
-                                _measurement("dry_run_helper_count", 4),
-                                _measurement("side_effect_attempted", True),
-                                _measurement(
-                                    "remaining_process_group",
-                                    remaining_process_group,
-                                ),
-                            ),
+                            tuple(measurements),
                         ),
                     ),
                     exit_code=1,
@@ -350,6 +427,11 @@ def run_skills_gates(
             exit_code=1,
         )
 
+    measurements = [_measurement("dry_run_helper_count", 4)]
+    if all(result.side_effect_attempted is False for result in dry_run_results):
+        measurements.append(_measurement("side_effect_attempted", False))
+    if all(result.remaining_process_group is False for result in dry_run_results):
+        measurements.append(_measurement("remaining_process_group", False))
     return SkillsGateResult(
         gates=(
             registry_gate,
@@ -357,11 +439,7 @@ def run_skills_gates(
                 "skills.dry_run",
                 "PASS",
                 "OK",
-                (
-                    _measurement("dry_run_helper_count", 4),
-                    _measurement("side_effect_attempted", False),
-                    _measurement("remaining_process_group", False),
-                ),
+                tuple(measurements),
             ),
         ),
         exit_code=0,
