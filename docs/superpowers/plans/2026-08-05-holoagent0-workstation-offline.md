@@ -1243,136 +1243,185 @@ git add scripts/holoagent0_setup/holoagent0_setup/skills_gate.py scripts/holoage
 git commit -m "feat: add offline skills and chatbot gates"
 ```
 
-- [ ] **Step 6: Write fresh-exec chatbot boundary tests and verify RED**
+- [ ] **Step 6: Write sealed-before-hash skill snapshot tests and verify RED**
 
-Keep injected dependency/audio/startup fixtures on the private
-`_run_chatbot_gates_core`. Add real subprocess tests for the public adapter and
-private owned-child harness with these exact transport constants:
-
-```python
-CHATBOT_CHILD_CONTROL_MAX_BYTES = 4 * 1024
-CHATBOT_CHILD_RESULT_MAX_BYTES = 64 * 1024
-CHATBOT_CHILD_POLL_SECONDS = 0.01
-CHATBOT_CHILD_TERM_GRACE_SECONDS = 0.25
-CHATBOT_CHILD_KILL_GRACE_SECONDS = 1.0
-CHATBOT_CHILD_CONTROL_SCHEMA = "holoagent0.chatbot-child-control.v1"
-```
-
-The tests must prove that the command uses exact pinned `/usr/bin/python3.10`
-with `-I -B`, argv contains no provider value, control JSON is canonical and
-contains only `schema_version`, `pyproject_path`, `configuration_path`, and
-`timeout_seconds`, the mode-`0600` result file is polled while the child runs,
-and evidence is parsed only after root reaping and an `ESRCH` group check. Real
-fixture children cover a pre-existing parent worker/cached callable, a cached
-low-level waiting worker that tries to create a delayed marker, valid success
-with a residual group member, timeout, signal exit, malformed/noncanonical
-JSON, and output exceeding 64 KiB. Every fixture releases or is killed and is
-proven unable to write its marker after adapter return.
+Modify `scripts/holoagent0_setup/tests/test_skills_gate.py`. Add a private,
+deterministic snapshot hook to test the two exact mutation boundaries. At
+`before_seal`, overwrite the memfd with `pwrite`; the changed bytes must receive
+the full seal mask but then fail the expected digest, and the runner must not be
+called. At `after_seal`, prove the same write is rejected with `EPERM`, then let
+the runner execute and observe the original reviewed bytes. Trace helper calls
+to prove `F_ADD_SEALS` and complete `F_GET_SEALS` verification both occur before
+`_descriptor_sha256`, and preserve the existing success/exception descriptor
+closure assertions.
 
 Run:
-`PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /usr/bin/python3.10 -m pytest -q -p no:cacheprovider scripts/holoagent0_setup/tests/test_chatbot_gate.py -k 'process_boundary or child_transport or owned_process_group'`
+`PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /usr/bin/python3.10 -m pytest -q -p no:cacheprovider scripts/holoagent0_setup/tests/test_skills_gate.py -k 'before_seal or after_seal or sealed_before_hash'`
 
-Expected: FAIL because the public adapter still runs the core in-process and
-the owned fresh-exec harness does not exist.
+Expected: FAIL because `_run_command` hashes the memfd before applying and
+verifying its seals and has no deterministic mutation boundary.
 
-- [ ] **Step 7: Implement and commit the owned chatbot child boundary**
+- [ ] **Step 7: Seal, verify, then hash skill snapshots and commit**
 
-Rename the current injectable adapter to `_run_chatbot_gates_core`. Add a
-minimal tracked child entry point which reads at most 4097 stdin bytes,
-validates the exact canonical control object, calls the core with production
-defaults/inherited environment, and writes one canonical result object. The
-public adapter hashes the exact interpreter, creates a private result file,
-starts a new session with stderr at `/dev/null`, binds `(pid, pgid,
-start_time_ticks)`, polls monotonic time and `fstat().st_size`, and performs this
-closed acceptance sequence:
+Modify `scripts/holoagent0_setup/holoagent0_setup/skills_gate.py`. Give only the
+private `_run_command` helper an optional test hook receiving
+`("before_seal" | "after_seal", memfd)`. Keep the stable no-follow repository
+read, but do not make its pre-seal digest authoritative. Copy the exact bytes,
+run `before_seal`, apply all four required seals, verify the complete observed
+mask, hash the now-sealed descriptor against `expected_script_digest`, rewind,
+and run `after_seal`. Close the repository descriptor before invoking the
+runner; close both descriptors on every failure path. Missing seal support,
+hook failure, incomplete seals, or sealed digest mismatch remains blocking.
 
-```python
-try:
-    run_child_until_exit_or_violation()
-finally:
-    if owned_root_or_group_is_present():
-        send_owned_group_sigterm()
-        poll_and_reap_for_term_grace()
-        if owned_root_or_group_is_still_present():
-            send_owned_group_sigkill()
-    reap_root_in_a_separate_finally()
-    cleanup_proven = require_final_killpg_probe_errno_esrch()
-if not cleanup_proven:
-    raise ChatbotChildContainmentError()
-if operation_or_transport_failed:
-    return closed_dependency_failure()
-return parse_closed_canonical_result_only_now()
-```
-
-Identity ambiguity, an observed residual group even if cleanup succeeds,
-nonzero/signal exit, transport defect, or result schema defect returns a
-blocking `chatbot.dependencies` failure and all later gates `NOT_RUN` only
-after root reaping and `ESRCH` group absence are proven. If root reaping or
-group absence cannot be proven within the cleanup deadline, raise
-`ChatbotChildContainmentError` and return no gate result or evidence; Task 13
-maps that exception through supervisor safety/harness precedence. Do not
-include child bytes or errors in evidence or exceptions.
-
-Run the Step 6 command and the complete chatbot test file. Expected: PASS.
-Refresh the chatbot/test/child-entry tracked OIDs plus supervisor manifest
-digest, run the manifest-authority test, and commit:
+Run the Step 6 command and the complete skills test file. Expected: PASS.
+Refresh the skills/test tracked OIDs and supervisor manifest digest, run the
+manifest-authority tests, and commit:
 
 ```bash
-git commit -m "fix: isolate chatbot probe in owned exec"
+git commit -m "fix: hash sealed skill snapshots"
 ```
 
-- [ ] **Step 8: Write sealed-memfd skill execution tests and verify RED**
+- [ ] **Step 8: Write chatbot source-authority tests and verify RED**
 
-Add tests that mutate the reviewed repository inode in-place inside the runner,
-replace the pathname, remove `memfd_create`, fail `F_ADD_SEALS`, return an
-incomplete `F_GET_SEALS` mask, and raise from the runner. Record both the
-repository and memfd descriptors and assert both are closed after success and
-every exception. The mutation tests must still print only the originally
-reviewed bytes.
+Modify `scripts/holoagent0_setup/tests/test_chatbot_gate.py`. Require the public
+adapter call to supply this exact authority with no defaults:
+
+```python
+@dataclass(frozen=True)
+class ChatbotSourceAuthority:
+    repository_root: Path
+    tracked_manifest_sha256: str
+```
+
+Add adversarial tests for a relative/unowned root, symlinked traversal,
+nonregular or non-`100644` manifest/source, malformed/noncanonical/duplicate or
+wrong-digest manifest, missing exact source rows, and wrong sealed Git OIDs.
+Use deterministic internal seams to replace the manifest and each source
+pathname after their retained descriptors open; verification and execution
+must continue from the retained original descriptors. Mutate an opened inode
+during its stable read and require `ChatbotSourceAuthorityError` with no spawn.
+Cover unavailable memfd/seal APIs, failed or incomplete seals, spawn failure,
+and repository/snapshot FD closure after every outcome.
+
+Assert the child command is exact pinned Python with argv starting exactly
+`("-I", "-B", "/proc/self/fd/<entry-fd>", "<gate-fd>")` and `pass_fds` is
+exactly the two sealed snapshots. The parent closes both copies immediately
+after the spawn attempt.
+Assert there is no import-time `_CHATBOT_CHILD_ENTRY`, no package-path or
+`sys.path` fallback, and the child installs the gate module in `sys.modules`
+before `SourceFileLoader.exec_module`. Preserve the exact four-key control
+document and prove provider values are absent from argv, control, result, and
+exceptions.
 
 Run:
-`PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /usr/bin/python3.10 -m pytest -q -p no:cacheprovider scripts/holoagent0_setup/tests/test_skills_gate.py -k 'sealed or mutation or descriptor'`
+`PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /usr/bin/python3.10 -m pytest -q -p no:cacheprovider scripts/holoagent0_setup/tests/test_chatbot_gate.py -k 'source_authority or sealed_source or retained_source or source_descriptor'`
 
-Expected: FAIL because `_run_command` still passes the mutable repository FD.
+Expected: FAIL because the adapter rediscovers a mutable child pathname and
+does not accept externally pinned manifest authority.
 
-- [ ] **Step 9: Implement and commit the sealed skill snapshot**
+- [ ] **Step 9: Implement sealed chatbot source authority and commit**
 
-After stable no-follow read and digest verification, create a private memfd with
-`MFD_ALLOW_SEALING | MFD_CLOEXEC`, copy the reviewed bytes with a complete-write
-loop, apply and verify this exact mask, rewind it, close the repository FD, and
-pass only the memfd to the runner:
+Modify `scripts/holoagent0_setup/holoagent0_setup/chatbot_gate.py` and
+`scripts/holoagent0_setup/chatbot_child.py`. Add `ChatbotSourceAuthorityError`
+and the required dataclass. Open the absolute root once with
+`O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW`, require effective-UID ownership, and
+walk only fixed relative components with `dir_fd` plus `O_NOFOLLOW`. Open the
+derived manifest and exact child/gate sources as retained effective-UID-owned,
+stable regular mode-`100644` descriptors. Verify the manifest's supplied
+SHA-256, closed canonical grammar, and unique exact rows from that manifest FD.
 
-```python
-REQUIRED_SKILL_MEMFD_SEALS = (
-    fcntl.F_SEAL_WRITE
-    | fcntl.F_SEAL_GROW
-    | fcntl.F_SEAL_SHRINK
-    | fcntl.F_SEAL_SEAL
-)
-fcntl.fcntl(memfd, fcntl.F_ADD_SEALS, REQUIRED_SKILL_MEMFD_SEALS)
-observed = fcntl.fcntl(memfd, fcntl.F_GET_SEALS)
-if observed & REQUIRED_SKILL_MEMFD_SEALS != REQUIRED_SKILL_MEMFD_SEALS:
-    raise OSError("sealed skill snapshot is incomplete")
-```
+Copy both retained sources to `MFD_ALLOW_SEALING | MFD_CLOEXEC` snapshots.
+Apply and verify the complete seal mask before hashing each sealed descriptor
+as a Git blob and comparing it with its manifest row; rewind both, then close
+all repository descriptors. Execute only the sealed entry FD and pass the
+sealed gate FD numerically. In the child, load `/proc/self/fd/<gate-fd>` with
+`SourceFileLoader`, insert the module into `sys.modules` before `exec_module`,
+and remove all pathname import fallback. Pass exactly the two snapshots through
+`pass_fds`, close the parent's copies after every spawn attempt, and leave the
+control document's four keys unchanged. Authority, path, FD, manifest, OID,
+seal, or authority-cleanup failures raise `ChatbotSourceAuthorityError` with no
+gate result; functional failures retain their existing closed-result behavior.
 
-Missing APIs/constants and any create/write/seal/verify/close failure are
-blocking. The command remains exact `-I -B /proc/self/fd/<memfd>` and the memfd
-is closed in `finally` on success and exception.
-
-Run the Step 8 command and the complete skills test file. Expected: PASS.
-Refresh skills/test tracked OIDs plus supervisor manifest digest, run the
-manifest-authority test, and commit:
+Run the Step 8 command and the complete chatbot test file. Expected: PASS.
+Refresh child/gate/test tracked OIDs and the manifest digest, run the authority
+tests, and commit:
 
 ```bash
-git commit -m "fix: execute sealed skill snapshots"
+git commit -m "fix: execute sealed chatbot sources"
 ```
 
-- [ ] **Step 10: Run complete Task 12 and repository verification**
+- [ ] **Step 10: Write unreaped chatbot containment tests and verify RED**
 
-Run focused chatbot/skills tests, Ruff check and format-check, the tracked skill
-validator, the supervisor manifest-authority tests, and the complete pinned
-test manifest. Expected: all tests pass with only declared skips; `git
-diff --check` is clean and `git status --short` is empty.
+Modify `scripts/holoagent0_setup/tests/test_chatbot_gate.py`. Make
+`Popen.poll`, premature `Popen.wait`, and `waitpid` explode. Prove root exit is
+observed with `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`, a sole matching
+root in `Z`/`X` receives no signal, a residual descendant receives `SIGTERM`, a
+group that reaches root-only `Z`/`X` during the exact 250 ms grace receives no
+`SIGKILL`, and a resistant descendant does receive `SIGKILL`. Assert the root
+is reaped exactly once with final `process.wait(timeout=1.0)` and the literal
+final `killpg(pgid, 0)` returns `ESRCH` before parsing.
+
+Add pre-bind failure coverage proving only PID-directed `process.kill()` is
+used before the single wait. Add `SIGCHLD != SIG_DFL`, `waitid` `ECHILD`,
+malformed status, saved-status/returncode disagreement, identity mismatch,
+PID/PGID/start-time reuse, and final non-`ESRCH` probes; each must raise
+`ChatbotChildContainmentError` with no result and no unrelated group signal.
+For `/proc/*/stat` enumeration, ignore only an `ENOENT` entry that vanishes
+during the scan and fail closed on every other parse/read ambiguity. Preserve
+real fixtures for timeout, residual cleanup, delayed markers, bounded output,
+and normal child success.
+
+Run:
+`PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /usr/bin/python3.10 -m pytest -q -p no:cacheprovider scripts/holoagent0_setup/tests/test_chatbot_gate.py -k 'waitid or unreaped or root_zombie or sigchld or pid_reuse or group_enumeration'`
+
+Expected: FAIL because the current run loop and finalizer call `Popen.poll()`
+and reap before cleanup decisions.
+
+- [ ] **Step 11: Implement unreaped identity authority and commit**
+
+Modify `scripts/holoagent0_setup/holoagent0_setup/chatbot_gate.py`. Before
+spawning, require `signal.getsignal(SIGCHLD) is SIG_DFL`; otherwise raise
+`ChatbotChildContainmentError`. Bind PID=PGID/start-time before releasing
+control. On initial bind failure, use only `process.kill()` and perform the one
+final wait. On all bound paths, replace `poll`/pre-cleanup waits with
+`os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)` and enumerate
+`/proc` records `(pid, pgrp, state, start_time)` without treating enumeration as
+ownership authority.
+
+Treat only the matching root alone in `Z`/`X` as clean. Otherwise revalidate
+the unreaped root identity immediately before group `SIGTERM`, observe for
+exactly 250 ms without reaping, and send group `SIGKILL` only if the state has
+not reached root-only `Z`/`X`; revalidate again first. Then call
+`process.wait(timeout=1.0)` exactly once, compare any saved `waitid` status with
+`process.returncode`, and require a final `killpg(pgid, 0)` `ESRCH`. Parse only
+after all proofs. Containment ambiguity raises `ChatbotChildContainmentError`;
+only a proven-clean functional/transport defect returns the closed dependency
+failure.
+
+Run the Step 10 command and the complete chatbot test file. Expected: PASS.
+Refresh gate/test tracked OIDs and supervisor manifest digest, run the authority
+tests, and commit:
+
+```bash
+git commit -m "fix: retain chatbot child identity through cleanup"
+```
+
+- [ ] **Step 12: Run complete Task 12 and repository verification**
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /usr/bin/python3.10 -m pytest -q -p no:cacheprovider scripts/holoagent0_setup/tests/test_skills_gate.py scripts/holoagent0_setup/tests/test_chatbot_gate.py
+ruff check --no-cache scripts/holoagent0_setup/holoagent0_setup/skills_gate.py scripts/holoagent0_setup/holoagent0_setup/chatbot_gate.py scripts/holoagent0_setup/chatbot_child.py scripts/holoagent0_setup/tests/test_skills_gate.py scripts/holoagent0_setup/tests/test_chatbot_gate.py
+ruff format --check --no-cache scripts/holoagent0_setup/holoagent0_setup/skills_gate.py scripts/holoagent0_setup/holoagent0_setup/chatbot_gate.py scripts/holoagent0_setup/chatbot_child.py scripts/holoagent0_setup/tests/test_skills_gate.py scripts/holoagent0_setup/tests/test_chatbot_gate.py
+/usr/bin/python3.10 agentic_robot/agentOS/holoagent_skills/scripts/validate_skills.py
+cd scripts/holoagent0_setup
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /usr/bin/python3.10 -m pytest -q -p no:cacheprovider tests/test_supervisor.py -k 'tracked_file_manifest or tracked_manifest_pin'
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /usr/bin/python3.10 -m pytest -q -p no:cacheprovider $(sed '/^#/d;/^$/d' test-manifest-v1.txt)
+```
+
+Expected: all tests pass with only declared skips; `git diff --check` is clean
+and `git status --short` is empty.
 
 ### Task 13: Offline CLI and full gate integration
 
