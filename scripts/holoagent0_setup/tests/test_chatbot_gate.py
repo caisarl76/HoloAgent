@@ -13,6 +13,7 @@ from types import ModuleType
 import pytest
 
 from holoagent0_setup.chatbot_gate import (
+    OfflineStartupSideEffectAttempt,
     REQUIRED_IMPORTS,
     REQUIRED_PROVIDER_VARIABLES,
     classify_external_readiness,
@@ -827,6 +828,112 @@ def test_chatbot_guard_blocks_late_imported_audio_stream_entry_points(
         "microphone_attempted": True,
     }
     assert getattr(imported, side_effect_name) == []
+    assert secret not in repr(result)
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_measurement"),
+    [
+        ("cached_process", "process_spawn_attempted"),
+        ("cached_socket", "network_attempted"),
+        ("late_microphone", "microphone_attempted"),
+    ],
+)
+def test_chatbot_configuration_fails_when_startup_catches_real_guard_attempt(
+    tmp_path, monkeypatch, request, operation, expected_measurement
+):
+    secret = "/definitely-missing-caught-startup-secret"
+    cached_popen = subprocess.Popen
+    cached_socket = socket.socket
+    audio_calls = []
+    opened = []
+    if operation == "late_microphone":
+        module_path = tmp_path / "pyaudio.py"
+        module_path.write_text(
+            "OPENED = []\n"
+            "class PyAudio:\n"
+            "    def open(self, *_args, **_kwargs):\n"
+            "        OPENED.append(True)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.delitem(sys.modules, "pyaudio", raising=False)
+        request.addfinalizer(lambda: sys.modules.pop("pyaudio", None))
+
+    def startup_checker(_configuration, _spies):
+        try:
+            if operation == "cached_process":
+                cached_popen([secret])
+            elif operation == "cached_socket":
+                cached_socket(socket.AF_INET, socket.SOCK_STREAM).close()
+            else:
+                module = importlib.import_module("pyaudio")
+                opened.append(module)
+                module.PyAudio().open(secret)
+        except OfflineStartupSideEffectAttempt:
+            return
+        raise AssertionError("guarded startup operation did not raise")
+
+    result = run_chatbot_gates(
+        pyproject_path=PYPROJECT,
+        configuration_path=CONFIG,
+        dependency_probe=DependencyProbe(),
+        audio_enumerator=lambda: audio_calls.append(True) or _devices(audio=True),
+        startup_checker=startup_checker,
+        environment={name: secret for name in REQUIRED_PROVIDER_VARIABLES},
+    )
+
+    assert _statuses(result) == [
+        ("chatbot.dependencies", "PASS", "OK"),
+        ("chatbot.configuration", "FAIL", "CHATBOT_CONFIG_INVALID"),
+        ("chatbot.credentials", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+        ("chatbot.audio_hardware", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+    ]
+    assert _configuration_measurements(result) == {
+        "process_spawn_attempted": expected_measurement == "process_spawn_attempted",
+        "network_attempted": expected_measurement == "network_attempted",
+        "microphone_attempted": expected_measurement == "microphone_attempted",
+    }
+    assert audio_calls == []
+    if opened:
+        assert opened[0].OPENED == []
+    assert secret not in repr(result)
+
+
+def test_chatbot_configuration_fails_when_audio_inventory_catches_guard_attempt():
+    secret = "/definitely-missing-caught-audio-secret"
+    cached_popen = subprocess.Popen
+    process_returned = []
+
+    def audio_enumerator():
+        try:
+            cached_popen([secret])
+        except OfflineStartupSideEffectAttempt:
+            return _devices(audio=True)
+        process_returned.append(True)
+        return _devices(audio=True)
+
+    result = run_chatbot_gates(
+        pyproject_path=PYPROJECT,
+        configuration_path=CONFIG,
+        dependency_probe=DependencyProbe(),
+        audio_enumerator=audio_enumerator,
+        startup_checker=lambda *_args: None,
+        environment={name: secret for name in REQUIRED_PROVIDER_VARIABLES},
+    )
+
+    assert _statuses(result) == [
+        ("chatbot.dependencies", "PASS", "OK"),
+        ("chatbot.configuration", "FAIL", "CHATBOT_CONFIG_INVALID"),
+        ("chatbot.credentials", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+        ("chatbot.audio_hardware", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+    ]
+    assert _configuration_measurements(result) == {
+        "process_spawn_attempted": True,
+        "network_attempted": False,
+        "microphone_attempted": False,
+    }
+    assert process_returned == []
     assert secret not in repr(result)
 
 

@@ -825,7 +825,15 @@ def run_chatbot_gates(
             configuration = _load_configuration(configuration_path)
             validate_configuration_startup(configuration, StartupSideEffectSpies())
             _configuration_startup(startup_checker, configuration, spies)
+            if guard.side_effect_attempted:
+                raise OfflineStartupSideEffectAttempt(
+                    "configuration startup side effect rejected"
+                )
             inventory = _normalize_inventory(audio_enumerator())
+            if guard.side_effect_attempted:
+                raise OfflineStartupSideEffectAttempt(
+                    "audio inventory side effect rejected"
+                )
 
             configuration_gate = _configuration_gate(guard, passed=True)
             source_environment = os.environ if environment is None else environment
