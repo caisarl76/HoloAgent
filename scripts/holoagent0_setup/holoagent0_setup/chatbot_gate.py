@@ -1445,6 +1445,27 @@ def _wait_for_group_absence(pgid: int, timeout_seconds: float) -> bool:
     return not _process_group_exists(pgid)
 
 
+def _owned_child_or_group_present(process: subprocess.Popen[bytes], pgid: int) -> bool:
+    try:
+        root_present = process.poll() is None
+    except BaseException:
+        root_present = True
+    try:
+        group_present = _process_group_exists(pgid)
+    except BaseException:
+        group_present = True
+    return root_present or group_present
+
+
+def _wait_for_owned_term_cleanup(process: subprocess.Popen[bytes], pgid: int) -> bool:
+    deadline = time.monotonic() + CHATBOT_CHILD_TERM_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        if not _owned_child_or_group_present(process, pgid):
+            return True
+        time.sleep(CHATBOT_CHILD_POLL_SECONDS)
+    return not _owned_child_or_group_present(process, pgid)
+
+
 def _finalize_owned_child(
     process: subprocess.Popen[bytes],
     _identity: _OwnedChildIdentity | None,
@@ -1460,14 +1481,22 @@ def _finalize_owned_child(
 
     wait_error = None
     try:
-        if pgid is not None:
+        if pgid is not None and _owned_child_or_group_present(process, pgid):
             try:
-                os.killpg(pgid, signal.SIGKILL)
+                os.killpg(pgid, signal.SIGTERM)
             except ProcessLookupError as error:
                 if error.errno != errno.ESRCH:
                     raise
             except BaseException:
                 pass
+            if not _wait_for_owned_term_cleanup(process, pgid):
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError as error:
+                    if error.errno != errno.ESRCH:
+                        raise
+                except BaseException:
+                    pass
     finally:
         try:
             process.wait(timeout=CHATBOT_CHILD_KILL_GRACE_SECONDS)

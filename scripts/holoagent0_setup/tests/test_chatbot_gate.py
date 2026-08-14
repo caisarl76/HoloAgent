@@ -260,6 +260,17 @@ def _assert_process_group_absent(pgid):
         os.killpg(pgid, 0)
 
 
+def _assert_process_group_eventually_absent(pgid, timeout_seconds=2.0):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.01)
+    _assert_process_group_absent(pgid)
+
+
 class _MockSpawnedChatbotChild:
     def __init__(self, *, wait_fails=False):
         self.pid = 43210
@@ -279,8 +290,87 @@ class _MockSpawnedChatbotChild:
         self.wait_calls += 1
         if self.wait_fails:
             raise subprocess.TimeoutExpired(("mock-chatbot-child",), timeout)
-        self.returncode = -signal.SIGKILL
+        if self.returncode is None:
+            self.returncode = -signal.SIGKILL
         return self.returncode
+
+
+def test_chatbot_finalizer_does_not_signal_a_clean_absent_group(monkeypatch):
+    process = _MockSpawnedChatbotChild()
+    process.returncode = 0
+    signals = []
+
+    def killpg(pgid, signum):
+        assert pgid == process.pid
+        if signum:
+            signals.append(signum)
+        raise ProcessLookupError(errno.ESRCH, "group absent")
+
+    monkeypatch.setattr(os, "killpg", killpg)
+
+    residual_group = chatbot_gate._finalize_owned_child(process, None)
+
+    assert residual_group is False
+    assert signals == []
+    assert process.wait_calls == 1
+    assert process.returncode == 0
+
+
+def test_chatbot_finalizer_uses_term_only_for_graceful_cleanup(monkeypatch):
+    process = _MockSpawnedChatbotChild()
+    group_live = True
+    signals = []
+
+    def killpg(pgid, signum):
+        nonlocal group_live
+        assert pgid == process.pid
+        if signum == 0:
+            if group_live:
+                return None
+            raise ProcessLookupError(errno.ESRCH, "group absent")
+        signals.append(signum)
+        assert signum == signal.SIGTERM
+        group_live = False
+        process.returncode = -signal.SIGTERM
+
+    monkeypatch.setattr(os, "killpg", killpg)
+
+    residual_group = chatbot_gate._finalize_owned_child(process, None)
+
+    assert residual_group is True
+    assert signals == [signal.SIGTERM]
+    assert process.wait_calls == 1
+    assert process.returncode == -signal.SIGTERM
+    assert group_live is False
+
+
+def test_chatbot_finalizer_escalates_term_resistant_group_to_sigkill(monkeypatch):
+    process = _MockSpawnedChatbotChild()
+    group_live = True
+    signals = []
+
+    def killpg(pgid, signum):
+        nonlocal group_live
+        assert pgid == process.pid
+        if signum == 0:
+            if group_live:
+                return None
+            raise ProcessLookupError(errno.ESRCH, "group absent")
+        signals.append(signum)
+        if signum == signal.SIGKILL:
+            group_live = False
+            process.returncode = -signal.SIGKILL
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(chatbot_gate, "CHATBOT_CHILD_TERM_GRACE_SECONDS", 0.01)
+
+    residual_group = chatbot_gate._finalize_owned_child(process, None)
+
+    assert residual_group is True
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert process.wait_calls == 1
+    assert process.returncode == -signal.SIGKILL
+    assert group_live is False
 
 
 @pytest.mark.parametrize("failure_phase", ["bind", "prlimit", "transport"])
@@ -307,6 +397,7 @@ def test_chatbot_spawn_exception_paths_mandatorily_reap_and_empty_group(
 
     monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
     monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(chatbot_gate, "CHATBOT_CHILD_TERM_GRACE_SECONDS", 0.01)
     monkeypatch.setattr(chatbot_gate, "_root_identity_matches", lambda _identity: True)
     identity = chatbot_gate._OwnedChildIdentity(
         process.pid,
@@ -571,16 +662,23 @@ def test_chatbot_rejects_success_until_residual_owned_process_group_is_empty(
         f"sys.stdout.buffer.write({payload!r})\n",
     )
 
-    result = chatbot_gate._run_owned_chatbot_child(
-        command=command,
-        control=_child_control_bytes(),
-        timeout_seconds=0.5,
-    )
+    result = None
+    containment_unproven = False
+    try:
+        result = chatbot_gate._run_owned_chatbot_child(
+            command=command,
+            control=_child_control_bytes(),
+            timeout_seconds=0.5,
+        )
+    except chatbot_gate.ChatbotChildContainmentError:
+        containment_unproven = True
     time.sleep(0.4)
 
-    _assert_closed_child_failure(result)
+    assert containment_unproven or result is not None
+    if result is not None:
+        _assert_closed_child_failure(result)
     assert marker_path.exists() is False
-    _assert_process_group_absent(int(pid_path.read_text(encoding="utf-8")))
+    _assert_process_group_eventually_absent(int(pid_path.read_text(encoding="utf-8")))
 
 
 @pytest.mark.parametrize("defect", ["timeout", "signal", "malformed", "oversized"])

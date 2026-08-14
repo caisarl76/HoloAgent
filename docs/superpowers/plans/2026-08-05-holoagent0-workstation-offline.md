@@ -1290,18 +1290,28 @@ closed acceptance sequence:
 try:
     run_child_until_exit_or_violation()
 finally:
-    terminate_then_kill_owned_group_if_needed()
-    reap_root()
-    require_final_killpg_probe_errno_esrch()
-if transport_or_cleanup_failed:
+    if owned_root_or_group_is_present():
+        send_owned_group_sigterm()
+        poll_and_reap_for_term_grace()
+        if owned_root_or_group_is_still_present():
+            send_owned_group_sigkill()
+    reap_root_in_a_separate_finally()
+    cleanup_proven = require_final_killpg_probe_errno_esrch()
+if not cleanup_proven:
+    raise ChatbotChildContainmentError()
+if operation_or_transport_failed:
     return closed_dependency_failure()
 return parse_closed_canonical_result_only_now()
 ```
 
 Identity ambiguity, an observed residual group even if cleanup succeeds,
-cleanup deadline expiry, nonzero/signal exit, transport defect, or result schema
-defect returns a blocking `chatbot.dependencies` failure and all later gates
-`NOT_RUN`. Do not include child bytes or errors in evidence or exceptions.
+nonzero/signal exit, transport defect, or result schema defect returns a
+blocking `chatbot.dependencies` failure and all later gates `NOT_RUN` only
+after root reaping and `ESRCH` group absence are proven. If root reaping or
+group absence cannot be proven within the cleanup deadline, raise
+`ChatbotChildContainmentError` and return no gate result or evidence; Task 13
+maps that exception through supervisor safety/harness precedence. Do not
+include child bytes or errors in evidence or exceptions.
 
 Run the Step 6 command and the complete chatbot test file. Expected: PASS.
 Refresh the chatbot/test/child-entry tracked OIDs plus supervisor manifest

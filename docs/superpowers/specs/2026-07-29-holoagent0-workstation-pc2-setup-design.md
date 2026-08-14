@@ -1226,12 +1226,17 @@ or storage. On success, functional failure, side-effect violation, timeout,
 malformed output, signal, or transport error, the parent terminates and kills
 owned group members as needed, reaps the root, and requires the final process
 group probe to fail with `ESRCH`. Child evidence is parsed and accepted only
-after that proof. Any identity ambiguity, residual group, cleanup timeout,
-noncanonical or oversized transport, nonzero child exit, or schema defect is a
-blocking dependency/harness failure with no child evidence. A fresh `exec`
-also prevents pre-existing coordinator threads or cached Python callables from
-crossing the production boundary; Task 13 trace/seccomp enforcement remains
-defense in depth.
+after that proof. With proven root reaping and group absence, any identity
+ambiguity, observed residual group, noncanonical or oversized transport,
+nonzero child exit, or schema defect becomes a closed blocking dependency
+failure with no child evidence. If the parent cannot prove both root reaping
+and `ESRCH` group absence within the cleanup deadline, it raises
+`ChatbotChildContainmentError` and returns no gate result or evidence; the Task
+13 supervisor maps that exception through safety/harness precedence rather
+than treating it as a functional chatbot result. A fresh `exec` also prevents
+pre-existing coordinator threads or cached Python callables from crossing the
+production boundary; Task 13 trace/seccomp enforcement remains defense in
+depth.
 
 Dependency/import or JSON-configuration failure is blocking
 `FAIL_CHATBOT`. External readiness is classified separately:
