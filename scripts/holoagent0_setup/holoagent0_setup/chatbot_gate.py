@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import _thread
 from contextlib import ExitStack
 from dataclasses import dataclass
 import importlib
@@ -14,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 from threading import current_thread, main_thread
 import time
 from typing import Callable, Mapping
@@ -105,12 +107,29 @@ class _WholeReadinessDeadline:
         self._previous_handler = signal.getsignal(signal.SIGALRM)
         self._started = time.monotonic()
         signal.signal(signal.SIGALRM, self._timed_out)
-        signal.setitimer(signal.ITIMER_REAL, self._timeout_seconds)
+        try:
+            signal.setitimer(signal.ITIMER_REAL, self._timeout_seconds)
+        except BaseException:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+            finally:
+                signal.signal(signal.SIGALRM, self._previous_handler)
+            raise
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        signal.signal(signal.SIGALRM, self._previous_handler)
+        cleanup_error: BaseException | None = None
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+        except BaseException as error:
+            cleanup_error = error
+        try:
+            signal.signal(signal.SIGALRM, self._previous_handler)
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if cleanup_error is not None and exc_type is None:
+            raise cleanup_error
         if (
             exc_type is None
             and time.monotonic() - self._started > self._timeout_seconds
@@ -197,22 +216,34 @@ class _PythonOfflineSideEffectGuard:
             "subprocess.Popen",
         }
     )
+    _AUDIT_PROBE_EVENT = "holoagent0.chatbot.audit_probe"
     _active_guard: "_PythonOfflineSideEffectGuard | None" = None
+    _audit_probe_acknowledged = False
     _audit_hook_installed = False
 
     def __init__(self) -> None:
         self.network_attempts: list[str] = []
         self.process_attempts: list[str] = []
+        self._entry_thread_identities: frozenset[int] | None = None
         self._stack: ExitStack | None = None
+        self._used = False
 
     def __enter__(self) -> "_PythonOfflineSideEffectGuard":
+        if self._used:
+            raise RuntimeError("Python side-effect guard is single-use")
+        self._used = True
         if self._stack is not None or type(self)._active_guard is not None:
             raise RuntimeError("Python side-effect guard is already active")
         stack = ExitStack()
         self._stack = stack
+        self._entry_thread_identities = frozenset(sys._current_frames())
         try:
             if not type(self)._audit_hook_installed:
+                type(self)._audit_probe_acknowledged = False
                 sys.addaudithook(type(self)._audit_hook)
+                sys.audit(type(self)._AUDIT_PROBE_EVENT)
+                if not type(self)._audit_probe_acknowledged:
+                    raise RuntimeError("Python audit hook installation was not proven")
                 type(self)._audit_hook_installed = True
             type(self)._active_guard = self
             for name in self._NETWORK_SOCKET_METHODS:
@@ -268,6 +299,28 @@ class _PythonOfflineSideEffectGuard:
                     self._blocked("process", "multiprocessing.Process.start"),
                 )
             )
+            stack.enter_context(
+                patch.object(
+                    threading.Thread,
+                    "start",
+                    self._blocked("process", "threading.Thread.start"),
+                )
+            )
+            if callable(getattr(threading, "_start_new_thread", None)):
+                stack.enter_context(
+                    patch.object(
+                        threading,
+                        "_start_new_thread",
+                        self._blocked("process", "threading._start_new_thread"),
+                    )
+                )
+            stack.enter_context(
+                patch.object(
+                    _thread,
+                    "start_new_thread",
+                    self._blocked("process", "_thread.start_new_thread"),
+                )
+            )
         except BaseException:
             if type(self)._active_guard is self:
                 type(self)._active_guard = None
@@ -280,15 +333,29 @@ class _PythonOfflineSideEffectGuard:
         stack = self._stack
         if stack is None:
             raise RuntimeError("Python side-effect guard is not active")
-        self._stack = None
         try:
-            stack.close()
+            if exc_type is None:
+                self.reject_new_live_threads()
         finally:
-            if type(self)._active_guard is self:
-                type(self)._active_guard = None
+            self._stack = None
+            try:
+                stack.close()
+            finally:
+                if type(self)._active_guard is self:
+                    type(self)._active_guard = None
+
+    def reject_new_live_threads(self) -> None:
+        entry_threads = self._entry_thread_identities
+        if entry_threads is None:
+            raise RuntimeError("Python side-effect guard is not active")
+        if set(sys._current_frames()).difference(entry_threads):
+            self._reject("process", "thread.live")
 
     @classmethod
     def _audit_hook(cls, event: str, _arguments: tuple[object, ...]) -> None:
+        if event == cls._AUDIT_PROBE_EVENT:
+            cls._audit_probe_acknowledged = True
+            return
         guard = cls._active_guard
         if guard is None:
             return
@@ -331,6 +398,7 @@ class ChatbotOfflineSideEffectGuard:
         self.microphone_attempts: list[str] = []
         self._patched_audio_entries: set[tuple[int, str]] = set()
         self._stack: ExitStack | None = None
+        self._used = False
 
     @property
     def process_attempts(self) -> tuple[str, ...]:
@@ -347,6 +415,9 @@ class ChatbotOfflineSideEffectGuard:
         )
 
     def __enter__(self) -> "ChatbotOfflineSideEffectGuard":
+        if self._used:
+            raise RuntimeError("chatbot side-effect guard is single-use")
+        self._used = True
         if self._stack is not None:
             raise RuntimeError("chatbot side-effect guard is already active")
         stack = ExitStack()
@@ -376,6 +447,9 @@ class ChatbotOfflineSideEffectGuard:
             raise RuntimeError("chatbot side-effect guard is not active")
         self._stack = None
         stack.close()
+
+    def reject_new_live_threads(self) -> None:
+        self._offline_guard.reject_new_live_threads()
 
     def _blocked_microphone(self, operation: str):
         def blocked(*_args: object, **_kwargs: object) -> None:
@@ -808,6 +882,7 @@ def run_chatbot_gates(
                 except Exception:
                     available = False
                 importability.append((name, available is True))
+                guard.reject_new_live_threads()
                 if guard.side_effect_attempted:
                     raise OfflineStartupSideEffectAttempt(
                         "dependency side effect rejected"
@@ -825,19 +900,26 @@ def run_chatbot_gates(
             configuration = _load_configuration(configuration_path)
             validate_configuration_startup(configuration, StartupSideEffectSpies())
             _configuration_startup(startup_checker, configuration, spies)
+            guard.reject_new_live_threads()
             if guard.side_effect_attempted:
                 raise OfflineStartupSideEffectAttempt(
                     "configuration startup side effect rejected"
                 )
             inventory = _normalize_inventory(audio_enumerator())
+            guard.reject_new_live_threads()
             if guard.side_effect_attempted:
                 raise OfflineStartupSideEffectAttempt(
                     "audio inventory side effect rejected"
                 )
 
-            configuration_gate = _configuration_gate(guard, passed=True)
             source_environment = os.environ if environment is None else environment
             credential_presence = _credential_presence(source_environment)
+            guard.reject_new_live_threads()
+            if guard.side_effect_attempted:
+                raise OfflineStartupSideEffectAttempt(
+                    "credential inspection side effect rejected"
+                )
+            configuration_gate = _configuration_gate(guard, passed=True)
             credentials = all(present for _, present in credential_presence)
             audio = inventory.input_count > 0 and inventory.output_count > 0
             credential_gate = _gate(

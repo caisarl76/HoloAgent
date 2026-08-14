@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import builtins
+import _thread
 import importlib
 import json
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from types import ModuleType
 
 import pytest
+
+import holoagent0_setup.chatbot_gate as chatbot_gate
 
 from holoagent0_setup.chatbot_gate import (
     OfflineStartupSideEffectAttempt,
@@ -44,6 +49,112 @@ def test_chatbot_gate_import_does_not_require_agentos_or_yaml(monkeypatch):
         assert reloaded.REQUIRED_IMPORTS == REQUIRED_IMPORTS
     finally:
         sys.modules[module_name] = loaded
+
+
+@pytest.mark.parametrize("install_mode", ["no_op", "veto"])
+def test_chatbot_guard_requires_audited_installation_acknowledgement(install_mode):
+    package_root = str(Path(chatbot_gate.__file__).resolve().parents[1])
+    script = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from holoagent0_setup.chatbot_gate import _PythonOfflineSideEffectGuard
+
+if sys.argv[2] == "no_op":
+    sys.addaudithook = lambda _hook: None
+else:
+    def veto(_hook):
+        raise RuntimeError("vetoed")
+    sys.addaudithook = veto
+
+try:
+    with _PythonOfflineSideEffectGuard():
+        pass
+except RuntimeError:
+    raise SystemExit(0)
+raise SystemExit(9)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script, package_root, install_mode],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+
+
+def test_chatbot_guard_supports_repeated_distinct_instances():
+    with chatbot_gate.ChatbotOfflineSideEffectGuard():
+        pass
+    with chatbot_gate.ChatbotOfflineSideEffectGuard():
+        pass
+
+
+def test_chatbot_guard_instance_is_explicitly_single_use():
+    guard = chatbot_gate.ChatbotOfflineSideEffectGuard()
+
+    with guard:
+        pass
+
+    with pytest.raises(RuntimeError, match="single-use"):
+        with guard:
+            pass
+
+
+def test_chatbot_deadline_restores_handler_when_timer_activation_fails(monkeypatch):
+    previous_handler = object()
+    handler_calls = []
+    timer_calls = []
+
+    monkeypatch.setattr(signal, "getitimer", lambda _which: (0.0, 0.0))
+    monkeypatch.setattr(signal, "getsignal", lambda _signum: previous_handler)
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda signum, handler: handler_calls.append((signum, handler)),
+    )
+
+    def setitimer(which, delay):
+        timer_calls.append((which, delay))
+        if delay:
+            raise RuntimeError("activation failed")
+
+    monkeypatch.setattr(signal, "setitimer", setitimer)
+
+    with pytest.raises(RuntimeError, match="activation failed"):
+        with chatbot_gate._WholeReadinessDeadline(1.0):
+            pass
+
+    assert timer_calls == [(signal.ITIMER_REAL, 1.0), (signal.ITIMER_REAL, 0.0)]
+    assert handler_calls[-1] == (signal.SIGALRM, previous_handler)
+
+
+def test_chatbot_deadline_restores_handler_when_timer_cancellation_fails(
+    monkeypatch,
+):
+    previous_handler = object()
+    handler_calls = []
+
+    monkeypatch.setattr(signal, "getitimer", lambda _which: (0.0, 0.0))
+    monkeypatch.setattr(signal, "getsignal", lambda _signum: previous_handler)
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda signum, handler: handler_calls.append((signum, handler)),
+    )
+
+    def setitimer(_which, delay):
+        if not delay:
+            raise RuntimeError("cancellation failed")
+
+    monkeypatch.setattr(signal, "setitimer", setitimer)
+
+    with pytest.raises(RuntimeError, match="cancellation failed"):
+        with chatbot_gate._WholeReadinessDeadline(1.0):
+            pass
+
+    assert handler_calls[-1] == (signal.SIGALRM, previous_handler)
 
 
 class DependencyProbe:
@@ -401,6 +512,52 @@ def test_chatbot_hostile_environment_mapping_cannot_leak_a_credential_value():
     )
 
     assert result.label == "READY_CREDENTIALS_REQUIRED"
+    assert secret not in repr(result)
+
+
+@pytest.mark.parametrize("attempt", ["process", "network"])
+def test_chatbot_rechecks_guard_after_hostile_credential_mapping(attempt):
+    secret = "hostile-credential-side-effect-secret-must-not-escape"
+    cached_popen = subprocess.Popen
+    cached_socket = socket.socket
+
+    class HostileEnvironment(dict):
+        attempted = False
+
+        def __contains__(self, _key):
+            if not self.attempted:
+                self.attempted = True
+                try:
+                    if attempt == "process":
+                        cached_popen([secret])
+                    else:
+                        cached_socket(socket.AF_INET, socket.SOCK_STREAM).close()
+                except OfflineStartupSideEffectAttempt:
+                    pass
+            return True
+
+        def __getitem__(self, _key):
+            return secret
+
+    result = run_chatbot_gates(
+        pyproject_path=PYPROJECT,
+        configuration_path=CONFIG,
+        dependency_probe=DependencyProbe(),
+        audio_enumerator=lambda: _devices(audio=True),
+        startup_checker=lambda *_args: None,
+        environment=HostileEnvironment(),
+    )
+
+    assert _statuses(result)[1:] == [
+        ("chatbot.configuration", "FAIL", "CHATBOT_CONFIG_INVALID"),
+        ("chatbot.credentials", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+        ("chatbot.audio_hardware", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+    ]
+    evidence = _configuration_measurements(result)
+    evidence_name = (
+        "process_spawn_attempted" if attempt == "process" else "network_attempted"
+    )
+    assert evidence[evidence_name] is True
     assert secret not in repr(result)
 
 
@@ -934,6 +1091,114 @@ def test_chatbot_configuration_fails_when_audio_inventory_catches_guard_attempt(
         "microphone_attempted": False,
     }
     assert process_returned == []
+    assert secret not in repr(result)
+
+
+def test_chatbot_guard_rejects_cached_waiting_worker_escape_and_cleans_fixture():
+    secret = "waiting-worker-secret-must-not-escape"
+    cached_start = _thread.start_new_thread
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def wait_worker():
+        try:
+            started.set()
+            release.wait(2.0)
+        finally:
+            finished.set()
+
+    def startup_checker(_configuration, _spies):
+        cached_start(wait_worker, ())
+        assert started.wait(1.0)
+
+    try:
+        result = run_chatbot_gates(
+            pyproject_path=PYPROJECT,
+            configuration_path=CONFIG,
+            dependency_probe=DependencyProbe(),
+            audio_enumerator=lambda: _devices(audio=True),
+            startup_checker=startup_checker,
+            environment={name: secret for name in REQUIRED_PROVIDER_VARIABLES},
+        )
+    finally:
+        release.set()
+        assert finished.wait(2.0)
+
+    assert _statuses(result) == [
+        ("chatbot.dependencies", "PASS", "OK"),
+        ("chatbot.configuration", "FAIL", "CHATBOT_CONFIG_INVALID"),
+        ("chatbot.credentials", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+        ("chatbot.audio_hardware", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+    ]
+    assert _configuration_measurements(result) == {
+        "process_spawn_attempted": True,
+        "network_attempted": False,
+        "microphone_attempted": False,
+    }
+    assert secret not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "thread_entry",
+    ["thread_start", "threading_start_new", "low_level_start_new"],
+)
+def test_chatbot_configuration_fails_when_startup_catches_thread_attempt(
+    thread_entry,
+):
+    secret = "caught-thread-secret-must-not-escape"
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    worker = None
+
+    def wait_worker():
+        try:
+            started.set()
+            release.wait(2.0)
+        finally:
+            finished.set()
+
+    def startup_checker(_configuration, _spies):
+        nonlocal worker
+        try:
+            if thread_entry == "thread_start":
+                worker = threading.Thread(target=wait_worker, daemon=True)
+                worker.start()
+            elif thread_entry == "threading_start_new":
+                threading._start_new_thread(wait_worker, ())
+            else:
+                _thread.start_new_thread(wait_worker, ())
+        except OfflineStartupSideEffectAttempt:
+            return
+        assert started.wait(1.0)
+
+    try:
+        result = run_chatbot_gates(
+            pyproject_path=PYPROJECT,
+            configuration_path=CONFIG,
+            dependency_probe=DependencyProbe(),
+            audio_enumerator=lambda: _devices(audio=True),
+            startup_checker=startup_checker,
+            environment={name: secret for name in REQUIRED_PROVIDER_VARIABLES},
+        )
+    finally:
+        release.set()
+        if worker is not None and worker.ident is not None:
+            worker.join(timeout=2.0)
+        elif started.is_set():
+            finished.wait(2.0)
+
+    assert _statuses(result)[1:] == [
+        ("chatbot.configuration", "FAIL", "CHATBOT_CONFIG_INVALID"),
+        ("chatbot.credentials", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+        ("chatbot.audio_hardware", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
+    ]
+    assert _configuration_measurements(result) == {
+        "process_spawn_attempted": True,
+        "network_attempted": False,
+        "microphone_attempted": False,
+    }
     assert secret not in repr(result)
 
 
