@@ -133,6 +133,21 @@ class _OwnedChildIdentity:
     start_time_ticks: int
 
 
+@dataclass(frozen=True)
+class _ProcessRecord:
+    pid: int
+    pgrp: int
+    state: str
+    start_time_ticks: int
+
+
+@dataclass(frozen=True)
+class _ChildWaitStatus:
+    pid: int
+    code: int
+    status: int
+
+
 class OfflineStartupSideEffectAttempt(RuntimeError):
     """A configuration-only startup attempted a prohibited operation."""
 
@@ -1821,131 +1836,322 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_process_start_time(pid: int) -> int:
-    payload = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-    closing_parenthesis = payload.rfind(")")
-    fields = payload[closing_parenthesis + 2 :].split()
-    if closing_parenthesis < 1 or len(fields) < 20:
-        raise OSError("chatbot child process identity is invalid")
-    value = int(fields[19])
-    if value <= 0:
-        raise OSError("chatbot child process start time is invalid")
-    return value
+def _read_process_record(
+    pid: int,
+    *,
+    _proc_root: Path = Path("/proc"),
+) -> _ProcessRecord:
+    if type(pid) is not int or pid <= 0:
+        raise ChatbotChildContainmentError("chatbot process identity is invalid")
+    try:
+        payload = (_proc_root / str(pid) / "stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        raise
+    except BaseException as error:
+        raise ChatbotChildContainmentError(
+            "chatbot process identity is unreadable"
+        ) from error
+    try:
+        opening_parenthesis = payload.find("(")
+        closing_parenthesis = payload.rfind(")")
+        fields = payload[closing_parenthesis + 2 :].split()
+        state = fields[0]
+        pgrp = int(fields[2])
+        start_time_ticks = int(fields[19])
+        encoded_pid = int(payload[:opening_parenthesis].strip())
+        if (
+            opening_parenthesis < 1
+            or closing_parenthesis <= opening_parenthesis
+            or len(fields) < 20
+            or encoded_pid != pid
+            or len(state) != 1
+            or not state.isascii()
+            or not state.isalpha()
+            or pgrp <= 0
+            or start_time_ticks <= 0
+        ):
+            raise ValueError("invalid proc stat")
+        return _ProcessRecord(pid, pgrp, state, start_time_ticks)
+    except (IndexError, ValueError) as error:
+        raise ChatbotChildContainmentError(
+            "chatbot process identity is malformed"
+        ) from error
+
+
+def _enumerate_process_group(
+    pgid: int,
+    *,
+    _proc_root: Path = Path("/proc"),
+) -> tuple[_ProcessRecord, ...]:
+    if type(pgid) is not int or pgid <= 1:
+        raise ChatbotChildContainmentError("chatbot process group is invalid")
+    try:
+        entries = tuple(_proc_root.iterdir())
+    except BaseException as error:
+        raise ChatbotChildContainmentError(
+            "chatbot process group enumeration failed"
+        ) from error
+    records: list[_ProcessRecord] = []
+    for entry in entries:
+        if not entry.name.isascii() or not entry.name.isdecimal():
+            continue
+        pid = int(entry.name)
+        try:
+            record = _read_process_record(pid, _proc_root=_proc_root)
+        except FileNotFoundError as error:
+            if error.errno == errno.ENOENT:
+                continue
+            raise ChatbotChildContainmentError(
+                "chatbot process group enumeration failed"
+            ) from error
+        if record.pgrp == pgid:
+            records.append(record)
+    return tuple(sorted(records, key=lambda record: record.pid))
 
 
 def _bind_owned_child(process: subprocess.Popen[bytes]) -> _OwnedChildIdentity:
     pid = process.pid
-    pgid = os.getpgid(pid)
-    identity = _OwnedChildIdentity(pid, pgid, _read_process_start_time(pid))
-    if pid <= 1 or pgid != pid:
+    try:
+        pgid = os.getpgid(pid)
+        record = _read_process_record(pid)
+    except BaseException as error:
+        raise OSError("chatbot child process identity is unavailable") from error
+    identity = _OwnedChildIdentity(pid, pgid, record.start_time_ticks)
+    if (
+        type(pid) is not int
+        or pid <= 1
+        or pgid != pid
+        or record.pid != pid
+        or record.pgrp != pgid
+    ):
         raise OSError("chatbot child process group is not owned")
     return identity
 
 
-def _root_identity_matches(identity: _OwnedChildIdentity) -> bool:
+def _observe_owned_root_exit(
+    identity: _OwnedChildIdentity,
+) -> _ChildWaitStatus | None:
     try:
-        return (
-            os.getpgid(identity.pid) == identity.pgid
-            and _read_process_start_time(identity.pid) == identity.start_time_ticks
+        observed = os.waitid(
+            os.P_PID,
+            identity.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
         )
-    except (OSError, ValueError):
-        return False
+    except BaseException as error:
+        raise ChatbotChildContainmentError(
+            "chatbot child wait status is unavailable"
+        ) from error
+    if observed is None:
+        return None
+    pid = getattr(observed, "si_pid", None)
+    code = getattr(observed, "si_code", None)
+    status = getattr(observed, "si_status", None)
+    allowed_codes = {
+        getattr(os, "CLD_EXITED", None),
+        getattr(os, "CLD_KILLED", None),
+        getattr(os, "CLD_DUMPED", None),
+    }
+    allowed_codes.discard(None)
+    if (
+        type(pid) is not int
+        or pid != identity.pid
+        or type(code) is not int
+        or code not in allowed_codes
+        or type(status) is not int
+        or status < 0
+        or status > 255
+    ):
+        raise ChatbotChildContainmentError("chatbot child wait status is malformed")
+    return _ChildWaitStatus(pid, code, status)
 
 
-def _process_group_exists(pgid: int) -> bool:
+def _require_owned_root_record(
+    identity: _OwnedChildIdentity,
+    records: tuple[_ProcessRecord, ...],
+) -> _ProcessRecord:
+    roots = tuple(record for record in records if record.pid == identity.pid)
+    if (
+        len(roots) != 1
+        or roots[0].pgrp != identity.pgid
+        or roots[0].start_time_ticks != identity.start_time_ticks
+    ):
+        raise ChatbotChildContainmentError("chatbot child process identity changed")
+    return roots[0]
+
+
+def _root_only_dead_state(
+    identity: _OwnedChildIdentity,
+    wait_status: _ChildWaitStatus | None,
+    records: tuple[_ProcessRecord, ...],
+) -> bool:
+    root = _require_owned_root_record(identity, records)
+    if root.state in {"Z", "X"} and wait_status is None:
+        raise ChatbotChildContainmentError(
+            "chatbot child wait status contradicts process state"
+        )
+    if wait_status is not None and root.state not in {"Z", "X"}:
+        raise ChatbotChildContainmentError(
+            "chatbot child wait status contradicts process state"
+        )
+    return wait_status is not None and len(records) == 1 and root.state in {"Z", "X"}
+
+
+def _signal_owned_group(
+    identity: _OwnedChildIdentity,
+    records: tuple[_ProcessRecord, ...],
+    signum: int,
+) -> None:
+    _require_owned_root_record(identity, records)
+    try:
+        os.killpg(identity.pgid, signum)
+    except ProcessLookupError as error:
+        if error.errno != errno.ESRCH:
+            raise ChatbotChildContainmentError(
+                "chatbot child group signal failed"
+            ) from error
+    except BaseException as error:
+        raise ChatbotChildContainmentError(
+            "chatbot child group signal failed"
+        ) from error
+
+
+def _observe_until_root_only_dead(
+    identity: _OwnedChildIdentity,
+    wait_status: _ChildWaitStatus | None,
+    timeout_seconds: float,
+) -> tuple[bool, _ChildWaitStatus | None, tuple[_ProcessRecord, ...]]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if wait_status is None:
+            wait_status = _observe_owned_root_exit(identity)
+        records = _enumerate_process_group(identity.pgid)
+        if _root_only_dead_state(identity, wait_status, records):
+            return True, wait_status, records
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, wait_status, records
+        time.sleep(min(CHATBOT_CHILD_POLL_SECONDS, remaining))
+
+
+def _wait_status_returncode(status: _ChildWaitStatus) -> int:
+    if status.code == os.CLD_EXITED:
+        return status.status
+    if status.code in {os.CLD_KILLED, os.CLD_DUMPED} and status.status > 0:
+        return -status.status
+    raise ChatbotChildContainmentError("chatbot child wait status is malformed")
+
+
+def _final_group_absence(pgid: int) -> None:
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError as error:
+        if error.errno == errno.ESRCH:
+            return
+        raise ChatbotChildContainmentError(
+            "chatbot child group absence is unproven"
+        ) from error
+    except BaseException as error:
+        raise ChatbotChildContainmentError(
+            "chatbot child group absence is unproven"
+        ) from error
+    raise ChatbotChildContainmentError("chatbot child process group remains")
+
+
+def _finalize_unbound_child(process: subprocess.Popen[bytes]) -> None:
+    cleanup_error: BaseException | None = None
+    try:
+        process.kill()
+    except ProcessLookupError as error:
         if error.errno != errno.ESRCH:
-            raise
-        return False
-    return True
-
-
-def _wait_for_group_absence(pgid: int, timeout_seconds: float) -> bool:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if not _process_group_exists(pgid):
-            return True
-        time.sleep(CHATBOT_CHILD_POLL_SECONDS)
-    return not _process_group_exists(pgid)
-
-
-def _owned_child_or_group_present(process: subprocess.Popen[bytes], pgid: int) -> bool:
+            cleanup_error = error
+    except BaseException as error:
+        cleanup_error = error
     try:
-        root_present = process.poll() is None
-    except BaseException:
-        root_present = True
-    try:
-        group_present = _process_group_exists(pgid)
-    except BaseException:
-        group_present = True
-    return root_present or group_present
-
-
-def _wait_for_owned_term_cleanup(process: subprocess.Popen[bytes], pgid: int) -> bool:
-    deadline = time.monotonic() + CHATBOT_CHILD_TERM_GRACE_SECONDS
-    while time.monotonic() < deadline:
-        if not _owned_child_or_group_present(process, pgid):
-            return True
-        time.sleep(CHATBOT_CHILD_POLL_SECONDS)
-    return not _owned_child_or_group_present(process, pgid)
+        process.wait(timeout=CHATBOT_CHILD_KILL_GRACE_SECONDS)
+    except BaseException as error:
+        if cleanup_error is None:
+            cleanup_error = error
+    if process.returncode is None:
+        cleanup_error = cleanup_error or RuntimeError("chatbot child was not reaped")
+    if cleanup_error is not None:
+        raise ChatbotChildContainmentError(
+            "unbound chatbot child cleanup could not be proven"
+        ) from cleanup_error
 
 
 def _finalize_owned_child(
     process: subprocess.Popen[bytes],
-    _identity: _OwnedChildIdentity | None,
+    identity: _OwnedChildIdentity,
+    observed_wait_status: _ChildWaitStatus | None,
 ) -> bool:
-    pid = getattr(process, "pid", None)
-    pgid = pid if type(pid) is int and pid > 1 else None
-    group_was_present = True
-    if pgid is not None:
-        try:
-            group_was_present = _process_group_exists(pgid)
-        except BaseException:
-            pass
-
-    wait_error = None
+    wait_status = observed_wait_status
+    cleanup_error: BaseException | None = None
+    residual_group = False
     try:
-        if pgid is not None and _owned_child_or_group_present(process, pgid):
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-            except ProcessLookupError as error:
-                if error.errno != errno.ESRCH:
-                    raise
-            except BaseException:
-                pass
-            if not _wait_for_owned_term_cleanup(process, pgid):
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except ProcessLookupError as error:
-                    if error.errno != errno.ESRCH:
-                        raise
-                except BaseException:
-                    pass
-    finally:
-        try:
-            process.wait(timeout=CHATBOT_CHILD_KILL_GRACE_SECONDS)
-        except BaseException as error:
-            wait_error = error
-
-    group_absent = False
-    if pgid is not None:
-        try:
-            if wait_error is None:
-                group_absent = _wait_for_group_absence(
-                    pgid,
+        if wait_status is None:
+            wait_status = _observe_owned_root_exit(identity)
+        records = _enumerate_process_group(identity.pgid)
+        clean = _root_only_dead_state(identity, wait_status, records)
+        if not clean:
+            residual_group = True
+            _signal_owned_group(identity, records, signal.SIGTERM)
+            clean, wait_status, records = _observe_until_root_only_dead(
+                identity,
+                wait_status,
+                CHATBOT_CHILD_TERM_GRACE_SECONDS,
+            )
+            if not clean:
+                _signal_owned_group(identity, records, signal.SIGKILL)
+                clean, wait_status, records = _observe_until_root_only_dead(
+                    identity,
+                    wait_status,
                     CHATBOT_CHILD_KILL_GRACE_SECONDS,
                 )
-            else:
-                group_absent = not _process_group_exists(pgid)
-        except BaseException:
-            pass
-    if wait_error is not None or process.returncode is None or not group_absent:
+                if not clean:
+                    raise ChatbotChildContainmentError(
+                        "chatbot child group survived SIGKILL"
+                    )
+    except BaseException as error:
+        cleanup_error = error
+    wait_result: object = None
+    try:
+        wait_result = process.wait(timeout=CHATBOT_CHILD_KILL_GRACE_SECONDS)
+    except BaseException as error:
+        if cleanup_error is None:
+            cleanup_error = error
+    if (
+        type(wait_result) is not int
+        or type(process.returncode) is not int
+        or wait_result != process.returncode
+    ):
+        cleanup_error = cleanup_error or RuntimeError(
+            "chatbot child reap result is invalid"
+        )
+    if wait_status is None:
+        cleanup_error = cleanup_error or RuntimeError(
+            "chatbot child exit was not observed before reaping"
+        )
+    else:
+        try:
+            expected_returncode = _wait_status_returncode(wait_status)
+        except BaseException as error:
+            expected_returncode = None
+            if cleanup_error is None:
+                cleanup_error = error
+        if expected_returncode != process.returncode:
+            cleanup_error = cleanup_error or RuntimeError(
+                "chatbot child wait status disagrees with return code"
+            )
+    try:
+        _final_group_absence(identity.pgid)
+    except BaseException as error:
+        if cleanup_error is None:
+            cleanup_error = error
+    if cleanup_error is not None:
         raise ChatbotChildContainmentError(
             "chatbot child cleanup could not be proven"
-        ) from wait_error
-    return group_was_present
+        ) from cleanup_error
+    return residual_group
 
 
 def _close_chatbot_control_descriptor(descriptor: int) -> None:
@@ -2012,12 +2218,22 @@ def _run_owned_chatbot_child(
                 "chatbot source snapshot cleanup failed"
             ) from cleanup_error
         return _closed_child_failure()
+    if signal.getsignal(signal.SIGCHLD) is not signal.SIG_DFL:
+        cleanup_error = _close_chatbot_source_descriptors(source_descriptor_list)
+        error = ChatbotChildContainmentError(
+            "chatbot child requires default SIGCHLD disposition"
+        )
+        if cleanup_error is not None:
+            raise error from cleanup_error
+        raise error
     read_descriptor = -1
     write_descriptor = -1
     process: subprocess.Popen[bytes] | None = None
     identity: _OwnedChildIdentity | None = None
     transport_failed = False
     source_cleanup_error: BaseException | None = None
+    observed_wait_status: _ChildWaitStatus | None = None
+    lifecycle_error: ChatbotChildContainmentError | None = None
     try:
         read_descriptor, write_descriptor = os.pipe2(os.O_CLOEXEC)
         with tempfile.TemporaryFile(mode="w+b") as result_file:
@@ -2058,12 +2274,20 @@ def _run_owned_chatbot_child(
                 _close_chatbot_control_descriptor(write_descriptor)
                 write_descriptor = -1
                 deadline = time.monotonic() + timeout_seconds
-                while process.poll() is None:
+                while True:
+                    observed_wait_status = _observe_owned_root_exit(identity)
+                    records = _enumerate_process_group(identity.pgid)
+                    root = _require_owned_root_record(identity, records)
+                    if observed_wait_status is not None:
+                        if root.state not in {"Z", "X"}:
+                            raise ChatbotChildContainmentError(
+                                "chatbot child wait status contradicts process state"
+                            )
+                        break
                     if (
                         os.fstat(result_file.fileno()).st_size
                         > CHATBOT_CHILD_RESULT_MAX_BYTES
                         or time.monotonic() >= deadline
-                        or not _root_identity_matches(identity)
                     ):
                         transport_failed = True
                         break
@@ -2073,11 +2297,26 @@ def _run_owned_chatbot_child(
                     > CHATBOT_CHILD_RESULT_MAX_BYTES
                 ):
                     transport_failed = True
+            except ChatbotChildContainmentError as error:
+                lifecycle_error = error
             except Exception:
                 operation_failed = True
             finally:
                 if process is not None:
-                    residual_group = _finalize_owned_child(process, identity)
+                    try:
+                        if identity is None:
+                            _finalize_unbound_child(process)
+                        else:
+                            residual_group = _finalize_owned_child(
+                                process,
+                                identity,
+                                observed_wait_status,
+                            )
+                    except ChatbotChildContainmentError as error:
+                        if lifecycle_error is None:
+                            lifecycle_error = error
+            if lifecycle_error is not None:
+                raise lifecycle_error
             if source_cleanup_error is not None:
                 raise ChatbotSourceAuthorityError(
                     "chatbot source snapshot cleanup failed"
@@ -2086,6 +2325,7 @@ def _run_owned_chatbot_child(
                 operation_failed
                 or residual_group
                 or transport_failed
+                or process is None
                 or process.returncode != 0
             ):
                 return _closed_child_failure()
