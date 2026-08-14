@@ -1294,8 +1294,10 @@ class ChatbotSourceAuthority:
 ```
 
 Add adversarial tests for a relative/unowned root, symlinked traversal,
-nonregular or non-`100644` manifest/source, malformed/noncanonical/duplicate or
-wrong-digest manifest, missing exact source rows, and wrong sealed Git OIDs.
+nonregular or executable manifest/source (the forbidden alternative to Git mode
+`100644`), malformed/noncanonical/duplicate or wrong-digest manifest, missing
+exact source rows, and wrong sealed Git OIDs. Do not require checkout POSIX
+permission bits to equal literal `0644`.
 Use deterministic internal seams to replace the manifest and each source
 pathname after their retained descriptors open; verification and execution
 must continue from the retained original descriptors. Mutate an opened inode
@@ -1327,8 +1329,9 @@ and the required dataclass. Open the absolute root once with
 `O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW`, require effective-UID ownership, and
 walk only fixed relative components with `dir_fd` plus `O_NOFOLLOW`. Open the
 derived manifest and exact child/gate sources as retained effective-UID-owned,
-stable regular mode-`100644` descriptors. Verify the manifest's supplied
-SHA-256, closed canonical grammar, and unique exact rows from that manifest FD.
+stable regular non-executable descriptors corresponding to manifest Git mode
+`100644`. Verify the manifest's supplied SHA-256, closed canonical grammar, and
+unique exact rows from that manifest FD.
 
 Copy both retained sources to `MFD_ALLOW_SEALING | MFD_CLOEXEC` snapshots.
 Apply and verify the complete seal mask before hashing each sealed descriptor

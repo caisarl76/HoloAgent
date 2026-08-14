@@ -1236,11 +1236,12 @@ It derives the exact
 accepting a caller-selected manifest. The manifest must match the supplied
 literal SHA-256 and the canonical closed manifest grammar, with one unique row
 for each exact chatbot source. Its descriptor must be an effective-UID-owned,
-stable regular file with mode `100644`. The retained `chatbot_child.py` and
-`chatbot_gate.py` descriptors must likewise be effective-UID-owned stable
-regular files with manifest mode `100644`. Manifest verification and later
-snapshotting consume those same retained source descriptors; a pathname is
-never trusted twice.
+stable regular non-executable file whose manifest Git mode is `100644`. The
+retained `chatbot_child.py` and `chatbot_gate.py` descriptors must satisfy the
+same contract. Git mode `100644` means regular and non-executable; it does not
+require the checkout's POSIX permission bits to equal literal `0644`. Manifest
+verification and later snapshotting consume those same retained source
+descriptors; a pathname is never trusted twice.
 
 Each retained source is copied to its own `MFD_ALLOW_SEALING` descriptor. The
 adapter applies and verifies the complete write/grow/shrink/seal mask before it

@@ -7,15 +7,17 @@ import _thread
 from contextlib import ExitStack
 from dataclasses import dataclass
 import errno
+import fcntl
 import hashlib
 import importlib
 import json
 import multiprocessing
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import resource
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -56,7 +58,18 @@ CHATBOT_CHILD_RESULT_MAX_BYTES = 64 * 1024
 CHATBOT_CHILD_POLL_SECONDS = 0.01
 CHATBOT_CHILD_TERM_GRACE_SECONDS = 0.25
 CHATBOT_CHILD_KILL_GRACE_SECONDS = 1.0
-_CHATBOT_CHILD_ENTRY = Path(__file__).resolve().parents[1] / "chatbot_child.py"
+CHATBOT_SOURCE_MANIFEST_MAX_BYTES = 8 * 1024 * 1024
+CHATBOT_SOURCE_MAX_BYTES = 2 * 1024 * 1024
+CHATBOT_MANIFEST_RELATIVE_PATH = PurePosixPath(
+    "scripts/holoagent0_setup/manifests/git-tracked-files-v1.txt"
+)
+CHATBOT_CHILD_RELATIVE_PATH = PurePosixPath("scripts/holoagent0_setup/chatbot_child.py")
+CHATBOT_GATE_RELATIVE_PATH = PurePosixPath(
+    "scripts/holoagent0_setup/holoagent0_setup/chatbot_gate.py"
+)
+REQUIRED_CHATBOT_SOURCE_SEALS = (
+    fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+)
 _CREDENTIAL_MINIMUM_LENGTH = 4
 _CREDENTIAL_PLACEHOLDERS = frozenset({"changeme", "placeholder", "xxxx"})
 _CONFIG_ROOT_KEYS = {
@@ -108,6 +121,12 @@ class ChatbotGateResult:
 
 
 @dataclass(frozen=True)
+class ChatbotSourceAuthority:
+    repository_root: Path
+    tracked_manifest_sha256: str
+
+
+@dataclass(frozen=True)
 class _OwnedChildIdentity:
     pid: int
     pgid: int
@@ -124,6 +143,10 @@ class ChatbotReadinessTimeout(TimeoutError):
 
 class ChatbotChildContainmentError(RuntimeError):
     """A spawned chatbot child could not be proven reaped and contained."""
+
+
+class ChatbotSourceAuthorityError(RuntimeError):
+    """Chatbot source bytes could not be bound to reviewed authority."""
 
 
 class _WholeReadinessDeadline:
@@ -1392,6 +1415,404 @@ def _decode_chatbot_child_result(payload: bytes) -> ChatbotGateResult:
     )
 
 
+def _is_lower_hex(value: object, length: int) -> bool:
+    return bool(
+        type(value) is str
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _chatbot_authority_open_flags() -> tuple[int, int]:
+    required = ("O_CLOEXEC", "O_NOFOLLOW", "O_DIRECTORY")
+    values = tuple(getattr(os, name, None) for name in required)
+    if any(type(value) is not int for value in values):
+        raise ChatbotSourceAuthorityError("chatbot source opening is unavailable")
+    close_on_exec, no_follow, directory = values
+    return (
+        os.O_RDONLY | close_on_exec | no_follow,
+        os.O_RDONLY | close_on_exec | no_follow | directory,
+    )
+
+
+def _open_chatbot_authority_relative(
+    root_descriptor: int,
+    relative_path: PurePosixPath,
+) -> int:
+    file_flags, directory_flags = _chatbot_authority_open_flags()
+    components = relative_path.parts
+    if (
+        not components
+        or relative_path.is_absolute()
+        or ".." in components
+        or str(relative_path) != relative_path.as_posix()
+    ):
+        raise ChatbotSourceAuthorityError("chatbot source path is invalid")
+    parent_descriptor = root_descriptor
+    opened_directories: list[int] = []
+    result_descriptor = -1
+    cleanup_error: BaseException | None = None
+    try:
+        for component in components[:-1]:
+            parent_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            if parent_descriptor < 3:
+                raise OSError("invalid chatbot source directory descriptor")
+            opened_directories.append(parent_descriptor)
+        result_descriptor = os.open(
+            components[-1],
+            file_flags,
+            dir_fd=parent_descriptor,
+        )
+        if result_descriptor < 3:
+            raise OSError("invalid chatbot source descriptor")
+    except ChatbotSourceAuthorityError:
+        raise
+    except BaseException as error:
+        raise ChatbotSourceAuthorityError(
+            "chatbot source path is unavailable"
+        ) from error
+    finally:
+        for descriptor in reversed(opened_directories):
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None:
+            if result_descriptor >= 0:
+                try:
+                    os.close(result_descriptor)
+                except BaseException:
+                    pass
+                result_descriptor = -1
+            raise ChatbotSourceAuthorityError(
+                "chatbot source directory cleanup failed"
+            ) from cleanup_error
+    return result_descriptor
+
+
+def _stable_chatbot_authority_payload(
+    descriptor: int,
+    relative_path: PurePosixPath,
+    *,
+    maximum_bytes: int,
+    source_hook: Callable[[str, Path, int], None] | None,
+) -> bytes:
+    try:
+        before = os.fstat(descriptor)
+        if (
+            descriptor < 3
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_mode & 0o111
+            or before.st_nlink < 1
+            or before.st_size < 0
+            or before.st_size > maximum_bytes
+        ):
+            raise ChatbotSourceAuthorityError(
+                "chatbot source authority file identity is invalid"
+            )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        remaining = before.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ChatbotSourceAuthorityError(
+                    "chatbot source authority file is truncated"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ChatbotSourceAuthorityError(
+                "chatbot source authority file exceeds its bound"
+            )
+        if source_hook is not None:
+            source_hook("after_read", Path(str(relative_path)), descriptor)
+        after = os.fstat(descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field) for field in stable_fields
+        ):
+            raise ChatbotSourceAuthorityError(
+                "chatbot source authority file changed during verification"
+            )
+        return b"".join(chunks)
+    except ChatbotSourceAuthorityError:
+        raise
+    except BaseException as error:
+        raise ChatbotSourceAuthorityError(
+            "chatbot source authority file is unavailable"
+        ) from error
+
+
+def _chatbot_manifest_source_oids(
+    payload: bytes, expected_sha256: str
+) -> dict[str, str]:
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise ChatbotSourceAuthorityError(
+            "chatbot source manifest digest is unreviewed"
+        )
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ChatbotSourceAuthorityError(
+            "chatbot source manifest is undecodable"
+        ) from error
+    if not text.endswith("\n") or "\r" in text or "\0" in text:
+        raise ChatbotSourceAuthorityError("chatbot source manifest is noncanonical")
+    rows: list[tuple[str, str, str]] = []
+    for encoded in text.splitlines():
+        try:
+            metadata, relative = encoded.split("\t", 1)
+            mode, oid = metadata.split(" ", 1)
+        except ValueError as error:
+            raise ChatbotSourceAuthorityError(
+                "chatbot source manifest row is invalid"
+            ) from error
+        path = PurePosixPath(relative)
+        if (
+            mode not in {"100644", "100755", "120000"}
+            or not relative
+            or path.is_absolute()
+            or ".." in path.parts
+            or relative != path.as_posix()
+            or oid != "SELF"
+            and not _is_lower_hex(oid, 40)
+        ):
+            raise ChatbotSourceAuthorityError("chatbot source manifest row is invalid")
+        rows.append((mode, oid, relative))
+    paths = tuple(row[2] for row in rows)
+    if not rows or paths != tuple(sorted(paths)) or len(paths) != len(set(paths)):
+        raise ChatbotSourceAuthorityError(
+            "chatbot source manifest inventory is invalid"
+        )
+    by_path = {relative: (mode, oid) for mode, oid, relative in rows}
+    result: dict[str, str] = {}
+    for required_path in (
+        CHATBOT_CHILD_RELATIVE_PATH,
+        CHATBOT_GATE_RELATIVE_PATH,
+    ):
+        row = by_path.get(str(required_path))
+        if row is None or row[0] != "100644" or not _is_lower_hex(row[1], 40):
+            raise ChatbotSourceAuthorityError(
+                "chatbot source manifest row is unavailable"
+            )
+        result[str(required_path)] = row[1]
+    return result
+
+
+def _chatbot_source_memfd_parameters() -> tuple[int, int, int, int]:
+    required = (
+        (os, "MFD_ALLOW_SEALING"),
+        (os, "MFD_CLOEXEC"),
+        (fcntl, "F_ADD_SEALS"),
+        (fcntl, "F_GET_SEALS"),
+        (fcntl, "F_SEAL_WRITE"),
+        (fcntl, "F_SEAL_GROW"),
+        (fcntl, "F_SEAL_SHRINK"),
+        (fcntl, "F_SEAL_SEAL"),
+    )
+    values = tuple(getattr(module, name, None) for module, name in required)
+    if any(type(value) is not int for value in values):
+        raise ChatbotSourceAuthorityError("chatbot source sealing is unavailable")
+    (
+        allow_sealing,
+        close_on_exec,
+        add_seals,
+        get_seals,
+        seal_write,
+        seal_grow,
+        seal_shrink,
+        seal_seal,
+    ) = values
+    seal_mask = seal_write | seal_grow | seal_shrink | seal_seal
+    if seal_mask != REQUIRED_CHATBOT_SOURCE_SEALS:
+        raise ChatbotSourceAuthorityError("chatbot source sealing constants changed")
+    return allow_sealing | close_on_exec, add_seals, get_seals, seal_mask
+
+
+def _create_chatbot_source_memfd(name: str, flags: int) -> int:
+    creator = getattr(os, "memfd_create", None)
+    if not callable(creator):
+        raise ChatbotSourceAuthorityError("chatbot source memfd is unavailable")
+    descriptor = creator(name, flags)
+    if type(descriptor) is not int or descriptor < 3:
+        raise ChatbotSourceAuthorityError("chatbot source memfd is invalid")
+    return descriptor
+
+
+def _write_chatbot_source_snapshot(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if type(written) is not int or written <= 0:
+            raise ChatbotSourceAuthorityError("chatbot source snapshot write failed")
+        offset += written
+
+
+def _sealed_chatbot_source_git_oid(descriptor: int) -> str:
+    metadata = os.fstat(descriptor)
+    digest = hashlib.sha1()
+    digest.update(f"blob {metadata.st_size}\0".encode("ascii"))
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    remaining = metadata.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            raise ChatbotSourceAuthorityError("sealed chatbot source is truncated")
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        raise ChatbotSourceAuthorityError("sealed chatbot source exceeds its bound")
+    return digest.hexdigest()
+
+
+def _close_chatbot_source_descriptors(descriptors: list[int]) -> BaseException | None:
+    cleanup_error: BaseException | None = None
+    while descriptors:
+        descriptor = descriptors.pop()
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+    return cleanup_error
+
+
+def _prepare_chatbot_source_snapshots(
+    authority: ChatbotSourceAuthority,
+    *,
+    _source_hook: Callable[[str, Path, int], None] | None = None,
+) -> tuple[int, int]:
+    if (
+        not isinstance(authority, ChatbotSourceAuthority)
+        or not isinstance(authority.repository_root, Path)
+        or not authority.repository_root.is_absolute()
+        or "\0" in str(authority.repository_root)
+        or not _is_lower_hex(authority.tracked_manifest_sha256, 64)
+        or _source_hook is not None
+        and not callable(_source_hook)
+    ):
+        raise ChatbotSourceAuthorityError("chatbot source authority is invalid")
+    file_flags, directory_flags = _chatbot_authority_open_flags()
+    del file_flags
+    repository_descriptors: list[int] = []
+    snapshot_descriptors: list[int] = []
+    failure: BaseException | None = None
+    try:
+        root_descriptor = os.open(str(authority.repository_root), directory_flags)
+        repository_descriptors.append(root_descriptor)
+        root_metadata = os.fstat(root_descriptor)
+        if (
+            root_descriptor < 3
+            or not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.geteuid()
+        ):
+            raise ChatbotSourceAuthorityError(
+                "chatbot source repository root identity is invalid"
+            )
+        opened_list: list[tuple[PurePosixPath, int]] = []
+        for relative_path in (
+            CHATBOT_MANIFEST_RELATIVE_PATH,
+            CHATBOT_CHILD_RELATIVE_PATH,
+            CHATBOT_GATE_RELATIVE_PATH,
+        ):
+            descriptor = _open_chatbot_authority_relative(
+                root_descriptor,
+                relative_path,
+            )
+            opened_list.append((relative_path, descriptor))
+            repository_descriptors.append(descriptor)
+        opened = tuple(opened_list)
+        if _source_hook is not None:
+            for relative_path, descriptor in opened:
+                _source_hook("after_open", Path(str(relative_path)), descriptor)
+        payloads = {
+            str(relative_path): _stable_chatbot_authority_payload(
+                descriptor,
+                relative_path,
+                maximum_bytes=(
+                    CHATBOT_SOURCE_MANIFEST_MAX_BYTES
+                    if relative_path == CHATBOT_MANIFEST_RELATIVE_PATH
+                    else CHATBOT_SOURCE_MAX_BYTES
+                ),
+                source_hook=_source_hook,
+            )
+            for relative_path, descriptor in opened
+        }
+        expected_oids = _chatbot_manifest_source_oids(
+            payloads[str(CHATBOT_MANIFEST_RELATIVE_PATH)],
+            authority.tracked_manifest_sha256,
+        )
+        flags, add_seals, get_seals, required_seals = _chatbot_source_memfd_parameters()
+        for name, relative_path in (
+            ("holoagent0-chatbot-entry", CHATBOT_CHILD_RELATIVE_PATH),
+            ("holoagent0-chatbot-gate", CHATBOT_GATE_RELATIVE_PATH),
+        ):
+            descriptor = _create_chatbot_source_memfd(name, flags)
+            snapshot_descriptors.append(descriptor)
+            _write_chatbot_source_snapshot(
+                descriptor,
+                payloads[str(relative_path)],
+            )
+            fcntl.fcntl(descriptor, add_seals, required_seals)
+            observed = fcntl.fcntl(descriptor, get_seals)
+            if type(observed) is not int or observed & required_seals != required_seals:
+                raise ChatbotSourceAuthorityError(
+                    "sealed chatbot source snapshot is incomplete"
+                )
+            if (
+                _sealed_chatbot_source_git_oid(descriptor)
+                != expected_oids[str(relative_path)]
+            ):
+                raise ChatbotSourceAuthorityError(
+                    "sealed chatbot source Git OID mismatch"
+                )
+            os.lseek(descriptor, 0, os.SEEK_SET)
+    except ChatbotSourceAuthorityError as error:
+        failure = error
+    except BaseException as error:
+        failure = ChatbotSourceAuthorityError(
+            "chatbot source authority verification failed"
+        )
+        failure.__cause__ = error
+    repository_cleanup_error = _close_chatbot_source_descriptors(repository_descriptors)
+    if repository_cleanup_error is not None:
+        failure = ChatbotSourceAuthorityError(
+            "chatbot source repository descriptor cleanup failed"
+        )
+        failure.__cause__ = repository_cleanup_error
+    if failure is not None:
+        snapshot_cleanup_error = _close_chatbot_source_descriptors(snapshot_descriptors)
+        if snapshot_cleanup_error is not None:
+            failure = ChatbotSourceAuthorityError(
+                "chatbot source snapshot cleanup failed"
+            )
+            failure.__cause__ = snapshot_cleanup_error
+        raise failure
+    if len(snapshot_descriptors) != 2:
+        cleanup_error = _close_chatbot_source_descriptors(snapshot_descriptors)
+        error = ChatbotSourceAuthorityError("chatbot source snapshots are incomplete")
+        if cleanup_error is not None:
+            error.__cause__ = cleanup_error
+        raise error
+    return snapshot_descriptors[0], snapshot_descriptors[1]
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -1550,24 +1971,53 @@ def _run_owned_chatbot_child(
     command: tuple[str, ...],
     control: bytes,
     timeout_seconds: float,
+    source_descriptors: tuple[int, int] | tuple[()] = (),
 ) -> ChatbotGateResult:
+    source_descriptor_list = (
+        list(source_descriptors)
+        if type(source_descriptors) is tuple
+        and all(
+            type(descriptor) is int and descriptor >= 3
+            for descriptor in source_descriptors
+        )
+        else []
+    )
+    source_shape_valid = not source_descriptors or (
+        len(source_descriptors) == 2
+        and len(set(source_descriptors)) == 2
+        and len(command) == 5
+        and command[3] == f"/proc/self/fd/{source_descriptors[0]}"
+        and command[4] == str(source_descriptors[1])
+    )
     if (
         type(command) is not tuple
         or len(command) < 4
         or command[:3] != (str(PYTHON_EXECUTABLE), "-I", "-B")
         or any(type(argument) is not str or "\0" in argument for argument in command)
         or not _valid_readiness_timeout(timeout_seconds)
+        or not source_shape_valid
     ):
+        cleanup_error = _close_chatbot_source_descriptors(source_descriptor_list)
+        if cleanup_error is not None:
+            raise ChatbotSourceAuthorityError(
+                "chatbot source snapshot cleanup failed"
+            ) from cleanup_error
         return _closed_child_failure()
     try:
         _decode_chatbot_child_control(control)
     except Exception:
+        cleanup_error = _close_chatbot_source_descriptors(source_descriptor_list)
+        if cleanup_error is not None:
+            raise ChatbotSourceAuthorityError(
+                "chatbot source snapshot cleanup failed"
+            ) from cleanup_error
         return _closed_child_failure()
     read_descriptor = -1
     write_descriptor = -1
     process: subprocess.Popen[bytes] | None = None
     identity: _OwnedChildIdentity | None = None
     transport_failed = False
+    source_cleanup_error: BaseException | None = None
     try:
         read_descriptor, write_descriptor = os.pipe2(os.O_CLOEXEC)
         with tempfile.TemporaryFile(mode="w+b") as result_file:
@@ -1577,14 +2027,20 @@ def _run_owned_chatbot_child(
                 os.fchmod(result_file.fileno(), 0o600)
                 if os.fstat(result_file.fileno()).st_mode & 0o777 != 0o600:
                     raise OSError("chatbot child result file mode is invalid")
-                process = subprocess.Popen(
-                    command,
-                    stdin=read_descriptor,
-                    stdout=result_file,
-                    stderr=subprocess.DEVNULL,
-                    close_fds=True,
-                    start_new_session=True,
-                )
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        stdin=read_descriptor,
+                        stdout=result_file,
+                        stderr=subprocess.DEVNULL,
+                        close_fds=True,
+                        start_new_session=True,
+                        pass_fds=source_descriptors,
+                    )
+                finally:
+                    source_cleanup_error = _close_chatbot_source_descriptors(
+                        source_descriptor_list
+                    )
                 _close_chatbot_control_descriptor(read_descriptor)
                 read_descriptor = -1
                 identity = _bind_owned_child(process)
@@ -1622,6 +2078,10 @@ def _run_owned_chatbot_child(
             finally:
                 if process is not None:
                     residual_group = _finalize_owned_child(process, identity)
+            if source_cleanup_error is not None:
+                raise ChatbotSourceAuthorityError(
+                    "chatbot source snapshot cleanup failed"
+                ) from source_cleanup_error
             if (
                 operation_failed
                 or residual_group
@@ -1634,15 +2094,23 @@ def _run_owned_chatbot_child(
             return _decode_chatbot_child_result(payload)
     except ChatbotChildContainmentError:
         raise
+    except ChatbotSourceAuthorityError:
+        raise
     except Exception:
         return _closed_child_failure()
     finally:
         for descriptor in (read_descriptor, write_descriptor):
             _close_chatbot_control_descriptor(descriptor)
+        cleanup_error = _close_chatbot_source_descriptors(source_descriptor_list)
+        if cleanup_error is not None:
+            raise ChatbotSourceAuthorityError(
+                "chatbot source snapshot cleanup failed"
+            ) from cleanup_error
 
 
 def run_chatbot_gates(
     *,
+    source_authority: ChatbotSourceAuthority,
     pyproject_path: Path,
     configuration_path: Path,
     startup_timeout_seconds: float = DEFAULT_READINESS_TIMEOUT_SECONDS,
@@ -1659,15 +2127,18 @@ def run_chatbot_gates(
         )
     except Exception:
         return _closed_child_failure()
+    source_descriptors = _prepare_chatbot_source_snapshots(source_authority)
     return _run_owned_chatbot_child(
         command=(
             str(PYTHON_EXECUTABLE),
             "-I",
             "-B",
-            str(_CHATBOT_CHILD_ENTRY),
+            f"/proc/self/fd/{source_descriptors[0]}",
+            str(source_descriptors[1]),
         ),
         control=control,
         timeout_seconds=startup_timeout_seconds,
+        source_descriptors=source_descriptors,
     )
 
 

@@ -3,7 +3,10 @@ from __future__ import annotations
 import builtins
 import _thread
 import errno
+import fcntl
+import hashlib
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -33,6 +36,14 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 CHATBOT_ROOT = REPOSITORY_ROOT / "agentic_robot/chatbot/g1"
 PYPROJECT = CHATBOT_ROOT / "pyproject.toml"
 CONFIG = CHATBOT_ROOT / "g1.json"
+CHATBOT_CHILD_SOURCE = REPOSITORY_ROOT / "scripts/holoagent0_setup/chatbot_child.py"
+CHATBOT_MANIFEST_RELATIVE = Path(
+    "scripts/holoagent0_setup/manifests/git-tracked-files-v1.txt"
+)
+CHATBOT_CHILD_RELATIVE = Path("scripts/holoagent0_setup/chatbot_child.py")
+CHATBOT_GATE_RELATIVE = Path(
+    "scripts/holoagent0_setup/holoagent0_setup/chatbot_gate.py"
+)
 
 
 def test_chatbot_required_imports_cover_all_seven_runtime_dependencies():
@@ -245,6 +256,325 @@ def _child_control_bytes():
     )
 
 
+def _git_blob_oid(payload):
+    digest = hashlib.sha1()
+    digest.update(f"blob {len(payload)}\0".encode("ascii"))
+    digest.update(payload)
+    return digest.hexdigest()
+
+
+def _source_authority_fixture(tmp_path):
+    root = tmp_path / "authority-root"
+    child_path = root / CHATBOT_CHILD_RELATIVE
+    gate_path = root / CHATBOT_GATE_RELATIVE
+    manifest_path = root / CHATBOT_MANIFEST_RELATIVE
+    child_payload = b'print("retained-child")\n'
+    gate_payload = b'VALUE = "retained-gate"\n'
+    child_path.parent.mkdir(parents=True)
+    gate_path.parent.mkdir(parents=True)
+    manifest_path.parent.mkdir(parents=True)
+    child_path.write_bytes(child_payload)
+    gate_path.write_bytes(gate_payload)
+    child_path.chmod(0o644)
+    gate_path.chmod(0o644)
+    rows = sorted(
+        (
+            f"100644 {_git_blob_oid(child_payload)}\t{CHATBOT_CHILD_RELATIVE}\n",
+            f"100644 {_git_blob_oid(gate_payload)}\t{CHATBOT_GATE_RELATIVE}\n",
+        )
+    )
+    manifest_payload = "".join(rows).encode("utf-8")
+    manifest_path.write_bytes(manifest_payload)
+    manifest_path.chmod(0o644)
+    authority = chatbot_gate.ChatbotSourceAuthority(
+        repository_root=root,
+        tracked_manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+    )
+    return authority, child_payload, gate_payload
+
+
+def _production_source_authority():
+    return _source_authority_from_root(REPOSITORY_ROOT)
+
+
+def _source_authority_from_root(repository_root):
+    manifest_payload = (repository_root / CHATBOT_MANIFEST_RELATIVE).read_bytes()
+    return chatbot_gate.ChatbotSourceAuthority(
+        repository_root=repository_root,
+        tracked_manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+    )
+
+
+def _read_descriptor(descriptor):
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return b"".join(iter(lambda: os.read(descriptor, 1024 * 1024), b""))
+
+
+def test_chatbot_source_authority_is_a_required_public_argument():
+    parameter = inspect.signature(chatbot_gate.run_chatbot_gates).parameters[
+        "source_authority"
+    ]
+
+    assert parameter.default is inspect.Parameter.empty
+
+
+def test_sealed_source_snapshots_use_retained_fds_after_path_replacement(tmp_path):
+    authority, child_payload, gate_payload = _source_authority_fixture(tmp_path)
+    replaced = []
+
+    def replace_open_path(stage, relative_path, _descriptor):
+        if stage != "after_open":
+            return
+        path = authority.repository_root / relative_path
+        displaced = path.with_name(f"{path.name}.retained")
+        path.replace(displaced)
+        path.write_bytes(b"malicious replacement\n")
+        path.chmod(0o644)
+        replaced.append(relative_path)
+
+    snapshots = chatbot_gate._prepare_chatbot_source_snapshots(
+        authority,
+        _source_hook=replace_open_path,
+    )
+    try:
+        assert _read_descriptor(snapshots[0]) == child_payload
+        assert _read_descriptor(snapshots[1]) == gate_payload
+        for descriptor in snapshots:
+            assert (
+                fcntl.fcntl(descriptor, fcntl.F_GET_SEALS)
+                & chatbot_gate.REQUIRED_CHATBOT_SOURCE_SEALS
+                == chatbot_gate.REQUIRED_CHATBOT_SOURCE_SEALS
+            )
+    finally:
+        for descriptor in snapshots:
+            os.close(descriptor)
+
+    assert replaced == [
+        CHATBOT_MANIFEST_RELATIVE,
+        CHATBOT_CHILD_RELATIVE,
+        CHATBOT_GATE_RELATIVE,
+    ]
+
+
+def test_source_authority_rejects_in_place_mutation_during_stable_read(tmp_path):
+    authority, _child_payload, _gate_payload = _source_authority_fixture(tmp_path)
+
+    def mutate_open_inode(stage, relative_path, _descriptor):
+        if stage == "after_read" and relative_path == CHATBOT_GATE_RELATIVE:
+            path = authority.repository_root / relative_path
+            with path.open("r+b", buffering=0) as stream:
+                stream.seek(0, os.SEEK_END)
+                assert stream.write(b"X") == 1
+
+    with pytest.raises(
+        chatbot_gate.ChatbotSourceAuthorityError,
+        match="changed during verification",
+    ):
+        chatbot_gate._prepare_chatbot_source_snapshots(
+            authority,
+            _source_hook=mutate_open_inode,
+        )
+
+
+def test_source_authority_rejects_incomplete_seals_and_closes_snapshots(
+    tmp_path,
+    monkeypatch,
+):
+    authority, _child_payload, _gate_payload = _source_authority_fixture(tmp_path)
+    descriptors = []
+    real_create = os.memfd_create
+    real_fcntl = fcntl.fcntl
+
+    def record_memfd(name, flags):
+        descriptor = real_create(name, flags)
+        descriptors.append(descriptor)
+        return descriptor
+
+    def omit_write_seal(descriptor, operation, argument=0):
+        if operation == fcntl.F_GET_SEALS:
+            return fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+        return real_fcntl(descriptor, operation, argument)
+
+    monkeypatch.setattr(chatbot_gate, "_create_chatbot_source_memfd", record_memfd)
+    monkeypatch.setattr(fcntl, "fcntl", omit_write_seal)
+
+    with pytest.raises(
+        chatbot_gate.ChatbotSourceAuthorityError,
+        match="sealed chatbot source snapshot is incomplete",
+    ):
+        chatbot_gate._prepare_chatbot_source_snapshots(authority)
+
+    assert descriptors
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "relative_root",
+        "root_symlink",
+        "wrong_manifest_digest",
+        "manifest_executable",
+        "source_executable",
+        "source_nonregular",
+        "manifest_noncanonical",
+        "duplicate_source_row",
+        "missing_source_row",
+        "wrong_source_oid",
+    ],
+)
+def test_source_authority_rejects_every_unreviewed_variant(tmp_path, defect):
+    authority, _child_payload, _gate_payload = _source_authority_fixture(tmp_path)
+    root = authority.repository_root
+    manifest_path = root / CHATBOT_MANIFEST_RELATIVE
+    child_path = root / CHATBOT_CHILD_RELATIVE
+    if defect == "relative_root":
+        authority = chatbot_gate.ChatbotSourceAuthority(
+            repository_root=Path("relative-authority-root"),
+            tracked_manifest_sha256=authority.tracked_manifest_sha256,
+        )
+    elif defect == "root_symlink":
+        symlink = tmp_path / "authority-symlink"
+        symlink.symlink_to(root, target_is_directory=True)
+        authority = chatbot_gate.ChatbotSourceAuthority(
+            repository_root=symlink,
+            tracked_manifest_sha256=authority.tracked_manifest_sha256,
+        )
+    elif defect == "wrong_manifest_digest":
+        authority = chatbot_gate.ChatbotSourceAuthority(
+            repository_root=root,
+            tracked_manifest_sha256="0" * 64,
+        )
+    elif defect == "manifest_executable":
+        manifest_path.chmod(0o755)
+    elif defect == "source_executable":
+        child_path.chmod(0o755)
+    elif defect == "source_nonregular":
+        child_path.unlink()
+        child_path.mkdir()
+    else:
+        rows = manifest_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        if defect == "manifest_noncanonical":
+            manifest_path.write_text("".join(rows).rstrip("\n"), encoding="utf-8")
+        elif defect == "duplicate_source_row":
+            manifest_path.write_text("".join((*rows, rows[0])), encoding="utf-8")
+        elif defect == "missing_source_row":
+            manifest_path.write_text("".join(rows[1:]), encoding="utf-8")
+        else:
+            metadata, relative = rows[0].split("\t", 1)
+            mode, _oid = metadata.split(" ", 1)
+            rows[0] = f"{mode} {'0' * 40}\t{relative}"
+            manifest_path.write_text("".join(rows), encoding="utf-8")
+        authority = _source_authority_from_root(root)
+
+    with pytest.raises(chatbot_gate.ChatbotSourceAuthorityError):
+        chatbot_gate._prepare_chatbot_source_snapshots(authority)
+
+
+def test_source_authority_requires_effective_uid_ownership(tmp_path, monkeypatch):
+    authority, _child_payload, _gate_payload = _source_authority_fixture(tmp_path)
+    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+
+    with pytest.raises(
+        chatbot_gate.ChatbotSourceAuthorityError,
+        match="root identity is invalid",
+    ):
+        chatbot_gate._prepare_chatbot_source_snapshots(authority)
+
+
+def test_source_authority_closes_retained_repository_descriptors(tmp_path, monkeypatch):
+    authority, _child_payload, _gate_payload = _source_authority_fixture(tmp_path)
+    descriptors = []
+    real_open = chatbot_gate._open_chatbot_authority_relative
+
+    def record_open(root_descriptor, relative_path):
+        descriptor = real_open(root_descriptor, relative_path)
+        descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(chatbot_gate, "_open_chatbot_authority_relative", record_open)
+
+    snapshots = chatbot_gate._prepare_chatbot_source_snapshots(authority)
+    try:
+        assert len(descriptors) == 3
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        for descriptor in snapshots:
+            os.close(descriptor)
+
+
+def test_source_authority_rejects_failed_sealing_and_closes_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    authority, _child_payload, _gate_payload = _source_authority_fixture(tmp_path)
+    descriptors = []
+    real_create = os.memfd_create
+    real_fcntl = fcntl.fcntl
+
+    def record_memfd(name, flags):
+        descriptor = real_create(name, flags)
+        descriptors.append(descriptor)
+        return descriptor
+
+    def fail_add_seals(descriptor, operation, argument=0):
+        if operation == fcntl.F_ADD_SEALS:
+            raise OSError(errno.EIO, "injected seal failure")
+        return real_fcntl(descriptor, operation, argument)
+
+    monkeypatch.setattr(chatbot_gate, "_create_chatbot_source_memfd", record_memfd)
+    monkeypatch.setattr(fcntl, "fcntl", fail_add_seals)
+
+    with pytest.raises(chatbot_gate.ChatbotSourceAuthorityError):
+        chatbot_gate._prepare_chatbot_source_snapshots(authority)
+
+    assert descriptors
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.parametrize(
+    ("module", "attribute"),
+    [
+        (os, "memfd_create"),
+        (os, "MFD_ALLOW_SEALING"),
+        (os, "MFD_CLOEXEC"),
+        (fcntl, "F_ADD_SEALS"),
+        (fcntl, "F_GET_SEALS"),
+        (fcntl, "F_SEAL_WRITE"),
+        (fcntl, "F_SEAL_GROW"),
+        (fcntl, "F_SEAL_SHRINK"),
+        (fcntl, "F_SEAL_SEAL"),
+    ],
+)
+def test_source_authority_requires_every_memfd_sealing_api(
+    tmp_path,
+    monkeypatch,
+    module,
+    attribute,
+):
+    authority, _child_payload, _gate_payload = _source_authority_fixture(tmp_path)
+    monkeypatch.delattr(module, attribute)
+
+    with pytest.raises(chatbot_gate.ChatbotSourceAuthorityError):
+        chatbot_gate._prepare_chatbot_source_snapshots(authority)
+
+
+def test_sealed_source_child_loads_only_the_gate_descriptor():
+    source = CHATBOT_CHILD_SOURCE.read_text(encoding="utf-8")
+
+    assert "SourceFileLoader" in source
+    assert "sys.modules[" in source
+    assert "exec_module" in source
+    assert "sys.path" not in source
+    assert "from holoagent0_setup" not in source
+
+
 def _assert_closed_child_failure(result):
     assert _statuses(result) == [
         ("chatbot.dependencies", "FAIL", "CHATBOT_DEPENDENCY_MISSING"),
@@ -282,6 +612,87 @@ class _MockSpawnedChatbotChild:
         if self.returncode is None:
             self.returncode = -signal.SIGKILL
         return self.returncode
+
+
+def test_sealed_source_descriptors_are_the_only_popen_pass_fds_and_close(
+    monkeypatch,
+):
+    descriptors = (
+        os.memfd_create("chatbot-entry-test", os.MFD_CLOEXEC),
+        os.memfd_create("chatbot-gate-test", os.MFD_CLOEXEC),
+    )
+    process = _MockSpawnedChatbotChild()
+    process.returncode = 0
+    popen_calls = []
+
+    def popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        assert kwargs["pass_fds"] == descriptors
+        for descriptor in descriptors:
+            os.fstat(descriptor)
+        return process
+
+    def killpg(_pgid, _signum):
+        raise ProcessLookupError(errno.ESRCH, "group absent")
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(
+        chatbot_gate,
+        "_bind_owned_child",
+        lambda _process: chatbot_gate._OwnedChildIdentity(process.pid, process.pid, 1),
+    )
+    monkeypatch.setattr(chatbot_gate.resource, "prlimit", lambda *_args: None)
+
+    result = chatbot_gate._run_owned_chatbot_child(
+        command=(
+            "/usr/bin/python3.10",
+            "-I",
+            "-B",
+            f"/proc/self/fd/{descriptors[0]}",
+            str(descriptors[1]),
+        ),
+        control=_child_control_bytes(),
+        timeout_seconds=0.5,
+        source_descriptors=descriptors,
+    )
+
+    _assert_closed_child_failure(result)
+    assert len(popen_calls) == 1
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_source_descriptors_close_when_popen_fails(monkeypatch):
+    descriptors = (
+        os.memfd_create("chatbot-entry-spawn-failure", os.MFD_CLOEXEC),
+        os.memfd_create("chatbot-gate-spawn-failure", os.MFD_CLOEXEC),
+    )
+
+    def fail_popen(*_args, **kwargs):
+        assert kwargs["pass_fds"] == descriptors
+        raise OSError(errno.EIO, "injected spawn failure")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+
+    result = chatbot_gate._run_owned_chatbot_child(
+        command=(
+            "/usr/bin/python3.10",
+            "-I",
+            "-B",
+            f"/proc/self/fd/{descriptors[0]}",
+            str(descriptors[1]),
+        ),
+        control=_child_control_bytes(),
+        timeout_seconds=0.5,
+        source_descriptors=descriptors,
+    )
+
+    _assert_closed_child_failure(result)
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_chatbot_finalizer_does_not_signal_a_clean_absent_group(monkeypatch):
@@ -638,6 +1049,7 @@ def test_chatbot_fresh_exec_does_not_inherit_parent_core_or_cached_callable(
 
     try:
         result = chatbot_gate.run_chatbot_gates(
+            source_authority=_production_source_authority(),
             pyproject_path=child_pyproject,
             configuration_path=CONFIG,
             startup_timeout_seconds=0.5,

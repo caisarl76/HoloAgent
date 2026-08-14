@@ -2657,9 +2657,9 @@
 100644 88c3fbdb4c5cdaf69f2167b1764abd0a79ce019b	docs/superpowers/plans/2026-07-24-holoagent-stages3-4.md
 100644 d636e656af05dab9df62e4968b3a1a9e42a27fa0	docs/superpowers/plans/2026-08-05-holoagent0-mujoco-readiness.md
 100644 6ca9cea0f607a4427b392aba03339c1bd50d8b83	docs/superpowers/plans/2026-08-05-holoagent0-pc2-sensor-only.md
-100644 62e2d31f6e2b73837d2360b93c6ce7463557c3a9	docs/superpowers/plans/2026-08-05-holoagent0-workstation-offline.md
+100644 76159746c509411fa9ddde454881082ddd19ce16	docs/superpowers/plans/2026-08-05-holoagent0-workstation-offline.md
 100644 ecda0adf0291dcd288057065e3edf289d1768c1f	docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md
-100644 fc7d677a8b3f6a6a255233cbeb8c21be1f1c9e82	docs/superpowers/specs/2026-07-29-holoagent0-workstation-pc2-setup-design.md
+100644 62bad4907be25b181ddfded18ac785a83751d7cb	docs/superpowers/specs/2026-07-29-holoagent0-workstation-pc2-setup-design.md
 100644 4edb82ebc13ab0603c2c2fc78d87b9172a338c21	docs/user_guide/Intruduction.md
 100644 ca62882add18b8a86da91cfec8fee8ee57dd49f5	docs/user_guide/README_agent.md
 100644 921b8a6592f7419e2462534e1ee298bf64b04d75	docs/user_guide/README_workflow.md
@@ -2876,7 +2876,7 @@
 100644 98bbe731c61dc4df6fa34ef258f236cd6d5225f6	scripts/container/start_container.sh
 100644 8e50aa46e5af28d46d2d57581905595faa400c67	scripts/container/start_docker.sh
 100644 79046170b33031626a46ae607ce5218eaeb5515f	scripts/holoagent0_setup/README.md
-100644 483291ceb6f36aae2f6c43dc3db9ea061938dcb1	scripts/holoagent0_setup/chatbot_child.py
+100644 7a4f66195f13c5b6e71689b926355f46a4360018	scripts/holoagent0_setup/chatbot_child.py
 100644 1c1c222c558bf553adc29614c0e6a14c46982a9c	scripts/holoagent0_setup/config/cyclonedds-offline-p0.xml
 100644 4cc8b7446a14c1687b5f330e1b7b22b6493fcc0c	scripts/holoagent0_setup/config/cyclonedds-offline-p1.xml
 100644 fefa5661a53a5ba397ce8311bab90ddf1d3c2951	scripts/holoagent0_setup/config/cyclonedds-offline-p2.xml
@@ -2931,7 +2931,7 @@
 100644 db2902832430fb41731cf15241c1f9a92df38209	scripts/holoagent0_setup/holoagent0_setup/agentos_gate.py
 100644 8f9c0610288675773fa3f89c5d5fedc4bf690f8d	scripts/holoagent0_setup/holoagent0_setup/atomic_io.py
 100644 cf76bd049b61b7ee3d963bc16da3391a1904ff3f	scripts/holoagent0_setup/holoagent0_setup/broker.py
-100644 d2ee9576cd15d46b47bfb3ba97f7bb6f2692404f	scripts/holoagent0_setup/holoagent0_setup/chatbot_gate.py
+100644 c2482886e17480080588d7b503b6650cd01693d4	scripts/holoagent0_setup/holoagent0_setup/chatbot_gate.py
 100644 bd8faa7534c44f4229d96646f26dffc2c45f73d7	scripts/holoagent0_setup/holoagent0_setup/constants.py
 100644 5c0fa1caeac4720f55f5e2dbc5cc381f18540d07	scripts/holoagent0_setup/holoagent0_setup/contract.py
 100644 e63f507ef9af09010f1c16ba3699d2dcf2ed7cf3	scripts/holoagent0_setup/holoagent0_setup/coordinator.py
@@ -2973,7 +2973,7 @@
 100644 709a7e838e440aafd289c4b86fd51c6f0756513e	scripts/holoagent0_setup/tests/test_agentos_gate.py
 100644 97cfbdf39ab9c66a0777e23f94cf670b12238bf9	scripts/holoagent0_setup/tests/test_atomic_io.py
 100644 bd31fe39242787e4d0239a03784fb008741edfe4	scripts/holoagent0_setup/tests/test_broker.py
-100644 20090e41413d393d303b07f1cfb1d0527ff7f49a	scripts/holoagent0_setup/tests/test_chatbot_gate.py
+100644 132460229db1dea61acd5f65bcd78daa03a4294c	scripts/holoagent0_setup/tests/test_chatbot_gate.py
 100644 d3148c1b9f0a211a28d40cccd5a946110fc784cb	scripts/holoagent0_setup/tests/test_constants.py
 100644 8eb22e6c718dace0a8fab27d65b7d2f88e59b330	scripts/holoagent0_setup/tests/test_contract.py
 100644 3379961b230d04663c63d0c8e45a5df4b4b470b0	scripts/holoagent0_setup/tests/test_coordinator.py
