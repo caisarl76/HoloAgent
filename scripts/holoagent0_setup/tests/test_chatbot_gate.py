@@ -727,6 +727,146 @@ def test_waitid_malformed_status_is_containment_ambiguity(monkeypatch, observed)
         chatbot_gate._observe_owned_root_exit(identity)
 
 
+@pytest.mark.parametrize("state", ["Z", "X"])
+def test_waitid_none_then_dead_root_is_reobserved_before_classification(
+    monkeypatch, state
+):
+    process = _MockSpawnedChatbotChild()
+    identity = chatbot_gate._OwnedChildIdentity(process.pid, process.pid, 123)
+    observations = iter((None, _wait_status(process.pid)))
+    waitid_calls = []
+    signals = []
+
+    def waitid(idtype, pid, options):
+        waitid_calls.append((idtype, pid, options))
+        return next(observations)
+
+    def wait(timeout=None):
+        assert timeout == 1.0
+        process.wait_calls += 1
+        process.returncode = 0
+        return 0
+
+    def killpg(_pgid, signum):
+        if signum:
+            signals.append(signum)
+            return None
+        raise ProcessLookupError(errno.ESRCH, "group absent")
+
+    process.poll = lambda: (_ for _ in ()).throw(
+        AssertionError("Popen.poll must never be called")
+    )
+    process.wait = wait
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(
+        os,
+        "waitpid",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("os.waitpid must never be called")
+        ),
+    )
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(
+        chatbot_gate,
+        "_enumerate_process_group",
+        lambda _pgid: (_process_record(process.pid, process.pid, state, 123),),
+    )
+
+    residual = chatbot_gate._finalize_owned_child(process, identity, None)
+
+    assert residual is False
+    assert len(waitid_calls) == 2
+    assert all(
+        call
+        == (
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+        for call in waitid_calls
+    )
+    assert signals == []
+    assert process.wait_calls == 1
+
+
+def test_unreaped_saved_wait_status_rejects_live_proc_record_immediately(monkeypatch):
+    process = _MockSpawnedChatbotChild()
+    identity = chatbot_gate._OwnedChildIdentity(process.pid, process.pid, 123)
+    status = chatbot_gate._ChildWaitStatus(process.pid, os.CLD_EXITED, 0)
+    enumeration_count = 0
+    signals = []
+
+    def enumerate_group(_pgid):
+        nonlocal enumeration_count
+        enumeration_count += 1
+        return (_process_record(process.pid, process.pid, "S", 123),)
+
+    def wait(timeout=None):
+        assert timeout == 1.0
+        process.wait_calls += 1
+        process.returncode = 0
+        return 0
+
+    def killpg(_pgid, signum):
+        if signum:
+            signals.append(signum)
+            return None
+        raise ProcessLookupError(errno.ESRCH, "group absent")
+
+    process.wait = wait
+    monkeypatch.setattr(
+        os,
+        "waitid",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("saved wait status must be retained")
+        ),
+    )
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(chatbot_gate, "_enumerate_process_group", enumerate_group)
+
+    with pytest.raises(chatbot_gate.ChatbotChildContainmentError):
+        chatbot_gate._finalize_owned_child(process, identity, status)
+
+    assert enumeration_count == 1
+    assert signals == []
+    assert process.wait_calls == 1
+
+
+def test_waitid_persistent_incoherence_retries_boundedly_and_fails_closed(
+    monkeypatch,
+):
+    process = _MockSpawnedChatbotChild()
+    identity = chatbot_gate._OwnedChildIdentity(process.pid, process.pid, 123)
+    waitid_calls = 0
+
+    def waitid(*_args):
+        nonlocal waitid_calls
+        waitid_calls += 1
+        if waitid_calls > 4:
+            raise AssertionError("coherence retries exceeded their bound")
+        return None
+
+    process.wait = lambda timeout=None: setattr(process, "returncode", 0) or 0
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(
+        os,
+        "killpg",
+        lambda _pgid, _signum: (_ for _ in ()).throw(
+            ProcessLookupError(errno.ESRCH, "group absent")
+        ),
+    )
+    monkeypatch.setattr(
+        chatbot_gate,
+        "_enumerate_process_group",
+        lambda _pgid: (_process_record(process.pid, process.pid, "Z", 123),),
+    )
+
+    with pytest.raises(chatbot_gate.ChatbotChildContainmentError):
+        chatbot_gate._finalize_owned_child(process, identity, None)
+
+    assert 2 <= waitid_calls <= 4
+
+
 def test_unreaped_root_zombie_is_not_signaled_and_is_reaped_once(monkeypatch):
     process = _MockSpawnedChatbotChild()
     identity = chatbot_gate._OwnedChildIdentity(process.pid, process.pid, 123)
@@ -802,6 +942,62 @@ def test_unreaped_term_grace_stops_at_root_only_zombie(monkeypatch):
 
     assert residual is True
     assert signals == [signal.SIGTERM]
+
+
+@pytest.mark.parametrize("state", ["Z", "X"])
+def test_waitid_none_then_dead_root_during_term_grace_avoids_sigkill(
+    monkeypatch, state
+):
+    process = _MockSpawnedChatbotChild()
+    identity = chatbot_gate._OwnedChildIdentity(process.pid, process.pid, 123)
+    root_live = _process_record(process.pid, process.pid, "S", 123)
+    descendant = _process_record(process.pid + 1, process.pid, "S", 456)
+    root_dead = _process_record(process.pid, process.pid, state, 123)
+    group_observations = iter(((root_live, descendant), (root_dead,), (root_dead,)))
+    wait_observations = iter((None, None, _wait_status(process.pid)))
+    waitid_calls = []
+    signals = []
+
+    def waitid(idtype, pid, options):
+        waitid_calls.append((idtype, pid, options))
+        return next(wait_observations)
+
+    def wait(timeout=None):
+        assert timeout == 1.0
+        process.wait_calls += 1
+        process.returncode = 0
+        return 0
+
+    def killpg(_pgid, signum):
+        if signum:
+            signals.append(signum)
+            return None
+        raise ProcessLookupError(errno.ESRCH, "group absent")
+
+    process.wait = wait
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(
+        chatbot_gate,
+        "_enumerate_process_group",
+        lambda _pgid: next(group_observations),
+    )
+
+    residual = chatbot_gate._finalize_owned_child(process, identity, None)
+
+    assert residual is True
+    assert signals == [signal.SIGTERM]
+    assert len(waitid_calls) == 3
+    assert all(
+        call
+        == (
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+        for call in waitid_calls
+    )
+    assert process.wait_calls == 1
 
 
 def test_unreaped_term_resistant_group_escalates_to_kill(monkeypatch):

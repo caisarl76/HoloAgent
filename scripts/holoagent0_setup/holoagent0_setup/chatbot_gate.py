@@ -1996,6 +1996,37 @@ def _root_only_dead_state(
     return wait_status is not None and len(records) == 1 and root.state in {"Z", "X"}
 
 
+def _observe_owned_group_coherently(
+    identity: _OwnedChildIdentity,
+    wait_status: _ChildWaitStatus | None,
+    deadline: float,
+) -> tuple[_ChildWaitStatus | None, tuple[_ProcessRecord, ...]]:
+    immediate_retry_available = True
+    while True:
+        if wait_status is None:
+            wait_status = _observe_owned_root_exit(identity)
+        records = _enumerate_process_group(identity.pgid)
+        root = _require_owned_root_record(identity, records)
+        root_is_dead = root.state in {"Z", "X"}
+        if wait_status is not None:
+            if not root_is_dead:
+                raise ChatbotChildContainmentError(
+                    "chatbot child wait status contradicts process state"
+                )
+            return wait_status, records
+        if not root_is_dead:
+            return wait_status, records
+        if immediate_retry_available:
+            immediate_retry_available = False
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ChatbotChildContainmentError(
+                "chatbot child wait status contradicts process state"
+            )
+        time.sleep(min(CHATBOT_CHILD_POLL_SECONDS, remaining))
+
+
 def _signal_owned_group(
     identity: _OwnedChildIdentity,
     records: tuple[_ProcessRecord, ...],
@@ -2022,9 +2053,11 @@ def _observe_until_root_only_dead(
 ) -> tuple[bool, _ChildWaitStatus | None, tuple[_ProcessRecord, ...]]:
     deadline = time.monotonic() + timeout_seconds
     while True:
-        if wait_status is None:
-            wait_status = _observe_owned_root_exit(identity)
-        records = _enumerate_process_group(identity.pgid)
+        wait_status, records = _observe_owned_group_coherently(
+            identity,
+            wait_status,
+            deadline,
+        )
         if _root_only_dead_state(identity, wait_status, records):
             return True, wait_status, records
         remaining = deadline - time.monotonic()
@@ -2088,9 +2121,11 @@ def _finalize_owned_child(
     cleanup_error: BaseException | None = None
     residual_group = False
     try:
-        if wait_status is None:
-            wait_status = _observe_owned_root_exit(identity)
-        records = _enumerate_process_group(identity.pgid)
+        wait_status, records = _observe_owned_group_coherently(
+            identity,
+            wait_status,
+            time.monotonic() + CHATBOT_CHILD_POLL_SECONDS,
+        )
         clean = _root_only_dead_state(identity, wait_status, records)
         if not clean:
             residual_group = True
@@ -2275,8 +2310,11 @@ def _run_owned_chatbot_child(
                 write_descriptor = -1
                 deadline = time.monotonic() + timeout_seconds
                 while True:
-                    observed_wait_status = _observe_owned_root_exit(identity)
-                    records = _enumerate_process_group(identity.pgid)
+                    observed_wait_status, records = _observe_owned_group_coherently(
+                        identity,
+                        observed_wait_status,
+                        deadline,
+                    )
                     root = _require_owned_root_record(identity, records)
                     if observed_wait_status is not None:
                         if root.state not in {"Z", "X"}:
