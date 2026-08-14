@@ -1187,16 +1187,23 @@ continues to use only its prevalidated simulator-native fixture.
 ### 4.5 HoloAgent Skill Script Immutability
 
 The skills gate never executes a regular repository file descriptor directly.
-It opens the reviewed script with `O_NOFOLLOW`, reads and hashes its stable
-regular-file bytes, copies those bytes into a private `memfd` created with
-`MFD_ALLOW_SEALING`, and applies `F_SEAL_WRITE`, `F_SEAL_GROW`,
-`F_SEAL_SHRINK`, and `F_SEAL_SEAL`. The gate verifies the complete seal mask
-with `F_GET_SEALS`, rewinds the sealed descriptor, and closes the repository
-descriptor before invoking the runner. The isolated Python command receives
-only the sealed descriptor through `/proc/self/fd/<fd>`. Missing `memfd` or
-seal support, an incomplete seal mask, a copy/hash mismatch, or descriptor
-cleanup failure is blocking. Repository pathname replacement or in-place inode
-mutation after verification therefore cannot change the executed bytes.
+It opens the reviewed script with `O_NOFOLLOW`, obtains one stable read of its
+regular-file bytes, and copies exactly those bytes into a private `memfd`
+created with `MFD_ALLOW_SEALING`. A private deterministic test seam may mutate
+the snapshot at the `before_seal` boundary. The gate then applies
+`F_SEAL_WRITE`, `F_SEAL_GROW`, `F_SEAL_SHRINK`, and `F_SEAL_SEAL` and verifies
+the complete seal mask with `F_GET_SEALS` **before** computing any snapshot
+digest. It hashes the sealed descriptor against the reviewed expected digest,
+rewinds it, runs the `after_seal` test seam, closes the repository descriptor,
+and invokes the runner. The isolated Python command receives only the sealed
+descriptor through `/proc/self/fd/<fd>`.
+
+Missing `memfd` or seal support, an incomplete seal mask, a sealed-descriptor
+digest mismatch, or descriptor cleanup failure is blocking. A deterministic
+pre-seal mutation is therefore sealed but rejected by its digest, while a
+post-seal mutation must fail and the original reviewed bytes remain the only
+executable bytes. Repository pathname replacement or in-place inode mutation
+after the stable read likewise cannot change the executed snapshot.
 
 ### 5. Chatbot Environment and Classification
 
@@ -1210,33 +1217,106 @@ The chatbot environment uses Python 3.10 and the dependencies declared in
 - presence, never value, of required provider variable names;
 - bounded configuration-check startup with no microphone or network action.
 
-The public chatbot adapter runs the complete probe in a fresh `exec` of the
-exact pinned Python 3.10 interpreter, never in the coordinator process or a
-fork-only child. The child starts in a disposable owned session/process group.
-Its closed, canonical, bounded stdin control document contains only schema,
-repository configuration paths, and timeout metadata; provider credentials
-remain inherited environment state and never enter argv or the control/result
-documents. The child-only core emits one closed, canonical, bounded gate result
-to a private mode-`0600` temporary file. Stderr is discarded.
+The public adapter requires an explicit supervisor-pinned source authority and
+has no ambient repository-root or digest default:
 
-The parent binds the child root PID, PGID, and Linux process start time before
-accepting any progress. It owns the monotonic deadline and polls the output-file
-size while the child runs, so oversized output cannot consume unbounded memory
-or storage. On success, functional failure, side-effect violation, timeout,
-malformed output, signal, or transport error, the parent terminates and kills
-owned group members as needed, reaps the root, and requires the final process
-group probe to fail with `ESRCH`. Child evidence is parsed and accepted only
-after that proof. With proven root reaping and group absence, any identity
-ambiguity, observed residual group, noncanonical or oversized transport,
-nonzero child exit, or schema defect becomes a closed blocking dependency
-failure with no child evidence. If the parent cannot prove both root reaping
-and `ESRCH` group absence within the cleanup deadline, it raises
-`ChatbotChildContainmentError` and returns no gate result or evidence; the Task
-13 supervisor maps that exception through safety/harness precedence rather
-than treating it as a functional chatbot result. A fresh `exec` also prevents
-pre-existing coordinator threads or cached Python callables from crossing the
-production boundary; Task 13 trace/seccomp enforcement remains defense in
-depth.
+```python
+@dataclass(frozen=True)
+class ChatbotSourceAuthority:
+    repository_root: Path
+    tracked_manifest_sha256: str
+```
+
+The repository root must be absolute. The adapter opens it once with
+`O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW`, requires that descriptor to be owned by
+the effective UID, then traverses only fixed relative components with directory
+descriptors and `O_NOFOLLOW`; it never reopens an absolute repository pathname.
+It derives the exact
+`scripts/holoagent0_setup/manifests/git-tracked-files-v1.txt` path rather than
+accepting a caller-selected manifest. The manifest must match the supplied
+literal SHA-256 and the canonical closed manifest grammar, with one unique row
+for each exact chatbot source. Its descriptor must be an effective-UID-owned,
+stable regular file with mode `100644`. The retained `chatbot_child.py` and
+`chatbot_gate.py` descriptors must likewise be effective-UID-owned stable
+regular files with manifest mode `100644`. Manifest verification and later
+snapshotting consume those same retained source descriptors; a pathname is
+never trusted twice.
+
+Each retained source is copied to its own `MFD_ALLOW_SEALING` descriptor. The
+adapter applies and verifies the complete write/grow/shrink/seal mask before it
+computes the Git blob OID from the sealed descriptor and compares that OID with
+the manifest row. It then rewinds both snapshots and closes all repository and
+manifest descriptors. A missing or incomplete seal, source or manifest swap,
+in-place mutation, unstable read, mode/owner mismatch, manifest defect, Git OID
+mismatch, or descriptor cleanup defect raises `ChatbotSourceAuthorityError` and
+produces no chatbot gate result. Task 13 maps this exception to
+`offline.evidence_binding: FAIL` and `FAIL_HARNESS` under its existing
+safety-over-harness precedence.
+
+The adapter runs the complete probe in a fresh `exec` of the exact pinned
+Python 3.10 interpreter, never in the coordinator process or a fork-only child.
+The entry point executes only as `/proc/self/fd/<entry-fd>`. It receives the
+numeric sealed gate descriptor, constructs a `SourceFileLoader` over
+`/proc/self/fd/<gate-fd>`, installs the module in `sys.modules` before
+`exec_module` so dataclass resolution is correct, and has no pathname or
+`sys.path` import fallback. `Popen.pass_fds` contains exactly the entry and gate
+snapshots, and the parent closes its copies after every spawn outcome. There is
+no import-time `_CHATBOT_CHILD_ENTRY` repository-path binding. The child starts
+in a disposable owned session/process group. Its closed, canonical, bounded
+stdin control document retains exactly four keys: `schema_version`, the
+`pyproject_path`, `configuration_path`, and `timeout_seconds`. Source
+descriptor numbers exist only in the reviewed argv and `pass_fds`; provider
+credentials remain in inherited environment state and never enter argv or the
+control/result documents. The child-only core emits one closed, canonical,
+bounded gate result to a private mode-`0600` temporary file. Stderr is
+discarded.
+
+Before `Popen`, the adapter requires the `SIGCHLD` disposition to be exactly
+`SIG_DFL`; an ignored signal or installed handler raises
+`ChatbotChildContainmentError` before a child exists. After spawn, the parent
+binds the root PID, equal PGID, and Linux process start time before releasing
+the control document or accepting progress. Failure during this initial bind
+uses only `process.kill()` against the still-unreaped child and then the one
+final reap; it never sends a group signal through an unvalidated identity.
+
+After binding, the parent never calls `Popen.poll()`, `Popen.wait()`, or
+`waitpid` while making cleanup decisions. It observes root termination without
+reaping via `waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`, retains and
+revalidates the recorded PID/PGID/start-time identity while the zombie pins
+that identity, and enumerates `/proc/*/stat` for `(pid, pgrp, state,
+start-time)` group membership. `/proc` enumeration is decision evidence, not a
+second ownership authority. `ENOENT` for an entry that vanished during the scan
+is an ignorable absence; `ECHILD`, malformed wait status, every other parse or
+read ambiguity, or an identity mismatch is a containment failure. The monotonic
+run loop also polls the output-file size, so oversized output cannot consume
+unbounded memory or storage.
+
+An exited root that is the group's sole member and is in zombie/dead state
+`Z`/`X` is the normal clean case and receives no signal. A live root or any
+additional member is residual work: after revalidating the unreaped root
+identity immediately before each signal, the parent sends `SIGTERM` to the
+owned group, observes a fixed 250 ms grace without reaping, and sends
+`SIGKILL` only if observation has not reached the sole clean state of a
+root-only `Z`/`X`; the intentionally unreaped root zombie does not itself
+justify `SIGKILL`. The unreaped recorded root is the only group-signal
+authority; a reused PID, PGID, or start time can never authorize a signal to an
+unrelated group. The adapter performs exactly one reaping action,
+`process.wait(timeout=1.0)`, after cleanup decisions. Any saved `waitid` exit
+status must agree with `process.returncode`, and a literal final
+`killpg(pgid, 0)` probe must fail with `ESRCH` before result parsing begins.
+
+On success, functional failure, side-effect violation, timeout, malformed
+output, signal, or transport error, this lifecycle is still mandatory. With
+proven one-time root reaping and final group absence, functional or transport
+defects become a closed blocking dependency failure with no accepted child
+evidence. If identity, observation, signaling, reaping, status agreement, or
+final absence cannot be proven, the adapter raises
+`ChatbotChildContainmentError` and returns no gate result or evidence; Task 13
+maps it through safety/harness precedence instead of treating it as a
+functional chatbot result. A fresh sealed-source `exec` also prevents
+pre-existing coordinator threads, cached Python callables, and mutable
+repository paths from crossing the production boundary; Task 13 trace/seccomp
+enforcement remains defense in depth.
 
 Dependency/import or JSON-configuration failure is blocking
 `FAIL_CHATBOT`. External readiness is classified separately:
