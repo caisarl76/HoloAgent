@@ -1217,7 +1217,7 @@ Expected: FAIL because gate adapters do not exist.
 
 - [ ] **Step 3: Implement observation-only gates**
 
-Call the tracked skill validator/list/dry-run commands without executing robot scripts. For chatbot, import the declared Python 3.10 dependencies, parse robot JSON, enumerate audio devices without opening streams, record only credential variable presence, and run bounded configuration startup with process/network/microphone spies. Map missing credentials/audio only through the approved qualification matrix.
+Call the tracked skill validator/list/dry-run commands without executing robot scripts. For chatbot, import all seven declared Python 3.10 runtime dependencies (`aiohttp`, `loguru`, `numpy`, `openai`, `pyaudio`, `pydub`, and `websockets`), parse robot JSON, require the configured device-name substring on one full-duplex audio device without opening streams, record only credential variable presence, and run bounded configuration startup with process/network/microphone spies. Map missing credentials/audio only through the approved qualification matrix.
 
 ```python
 def classify_external_readiness(credentials: bool, audio: bool) -> tuple[str, int]:

@@ -1189,9 +1189,10 @@ continues to use only its prevalidated simulator-native fixture.
 The chatbot environment uses Python 3.10 and the dependencies declared in
 `agentic_robot/chatbot/g1/pyproject.toml`. The offline checks record:
 
-- importability of `aiohttp`, `loguru`, `pyaudio`, `pydub`, and `websockets`;
+- importability of `aiohttp`, `loguru`, `numpy`, `openai`, `pyaudio`, `pydub`, and `websockets`;
 - successful parsing of the robot JSON configuration;
-- audio input and output device inventory without opening a stream;
+- case-insensitive configured-name matching on one full-duplex audio device,
+  without opening a stream or recording device names;
 - presence, never value, of required provider variable names;
 - bounded configuration-check startup with no microphone or network action.
 

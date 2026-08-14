@@ -33,6 +33,18 @@ PYPROJECT = CHATBOT_ROOT / "pyproject.toml"
 CONFIG = CHATBOT_ROOT / "g1.json"
 
 
+def test_chatbot_required_imports_cover_all_seven_runtime_dependencies():
+    assert REQUIRED_IMPORTS == (
+        "aiohttp",
+        "loguru",
+        "numpy",
+        "openai",
+        "pyaudio",
+        "pydub",
+        "websockets",
+    )
+
+
 def test_chatbot_gate_import_does_not_require_agentos_or_yaml(monkeypatch):
     module_name = "holoagent0_setup.chatbot_gate"
     loaded = sys.modules.pop(module_name)
@@ -171,8 +183,11 @@ def _devices(*, audio: bool):
     if not audio:
         return ()
     return (
-        {"name": "private input", "maxInputChannels": 1, "maxOutputChannels": 0},
-        {"name": "private output", "maxInputChannels": 0, "maxOutputChannels": 2},
+        {
+            "name": "Fixture USB AUDIO DEVICE revision",
+            "maxInputChannels": 1,
+            "maxOutputChannels": 2,
+        },
     )
 
 
@@ -293,7 +308,7 @@ def test_chatbot_gates_apply_qualification_matrix_without_leaking_values(
     assert all(sentinel not in repr(row) for row in credentials_measurements)
 
 
-def test_chatbot_dependency_failure_is_blocking_and_queries_exact_five_modules():
+def test_chatbot_dependency_failure_is_blocking_and_queries_exact_seven_modules():
     probe = DependencyProbe(("pyaudio",))
     calls = []
 
@@ -837,7 +852,7 @@ def test_chatbot_guard_blocks_loaded_audio_device_stream_method(monkeypatch):
         ("direct_socket", "network_attempted"),
     ],
 )
-def test_chatbot_guard_classifies_dependency_side_effect_as_configuration_failure(
+def test_chatbot_guard_classifies_dependency_side_effect_as_dependency_failure(
     operation, expected_measurement
 ):
     secret = "/definitely-missing-dependency-provider-secret"
@@ -862,20 +877,24 @@ def test_chatbot_guard_classifies_dependency_side_effect_as_configuration_failur
     )
 
     assert _statuses(result) == [
-        ("chatbot.dependencies", "PASS", "OK"),
-        ("chatbot.configuration", "FAIL", "CHATBOT_CONFIG_INVALID"),
+        ("chatbot.dependencies", "FAIL", "CHATBOT_DEPENDENCY_MISSING"),
+        ("chatbot.configuration", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
         ("chatbot.credentials", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
         ("chatbot.audio_hardware", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
     ]
     assert result.gates[0]["measurements"] == [
-        {"name": f"{name}_importable", "value": True, "unit": None}
-        for name in REQUIRED_IMPORTS
+        {
+            "name": "process_spawn_attempted",
+            "value": expected_measurement == "process_spawn_attempted",
+            "unit": None,
+        },
+        {
+            "name": "network_attempted",
+            "value": expected_measurement == "network_attempted",
+            "unit": None,
+        },
+        {"name": "microphone_attempted", "value": False, "unit": None},
     ]
-    assert _configuration_measurements(result) == {
-        "process_spawn_attempted": expected_measurement == "process_spawn_attempted",
-        "network_attempted": expected_measurement == "network_attempted",
-        "microphone_attempted": False,
-    }
     assert (result.label, result.exit_code) == ("FAIL_CHATBOT", 1)
     assert calls == [REQUIRED_IMPORTS[0]]
     assert secret not in repr(result)
@@ -904,11 +923,19 @@ def test_chatbot_guard_detects_dependency_side_effect_even_when_probe_catches_it
     )
 
     assert _statuses(result)[:2] == [
-        ("chatbot.dependencies", "PASS", "OK"),
-        ("chatbot.configuration", "FAIL", "CHATBOT_CONFIG_INVALID"),
+        ("chatbot.dependencies", "FAIL", "CHATBOT_DEPENDENCY_MISSING"),
+        ("chatbot.configuration", "NOT_RUN", "EARLIER_BLOCKING_GATE"),
     ]
-    assert all(row["value"] is True for row in result.gates[0]["measurements"])
-    assert _configuration_measurements(result)["process_spawn_attempted"] is True
+    assert result.gates[0]["measurements"] == [
+        {
+            "name": f"{REQUIRED_IMPORTS[0]}_importable",
+            "value": True,
+            "unit": None,
+        },
+        {"name": "process_spawn_attempted", "value": True, "unit": None},
+        {"name": "network_attempted", "value": False, "unit": None},
+        {"name": "microphone_attempted", "value": False, "unit": None},
+    ]
     assert calls == [REQUIRED_IMPORTS[0]]
     assert secret not in repr(result)
 
@@ -1207,21 +1234,15 @@ def test_audio_inventory_never_opens_a_stream_and_records_no_device_names():
 
     class FakeAudio:
         def get_device_count(self):
-            return 2
+            return 1
 
         def get_device_info_by_index(self, index):
-            return (
-                {
-                    "name": "sensitive microphone name",
-                    "maxInputChannels": 1,
-                    "maxOutputChannels": 0,
-                },
-                {
-                    "name": "sensitive speaker name",
-                    "maxInputChannels": 0,
-                    "maxOutputChannels": 2,
-                },
-            )[index]
+            assert index == 0
+            return {
+                "name": "sensitive USB AUDIO DEVICE serial name",
+                "maxInputChannels": 1,
+                "maxOutputChannels": 2,
+            }
 
         def open(self, *_args, **_kwargs):
             raise AssertionError("offline inventory must never open a stream")
@@ -1235,12 +1256,80 @@ def test_audio_inventory_never_opens_a_stream_and_records_no_device_names():
             calls.append("construct")
             return FakeAudio()
 
-    inventory = enumerate_audio_devices(FakePyAudioModule())
+    inventory = enumerate_audio_devices(FakePyAudioModule(), "usb audio device")
 
     assert inventory.input_count == 1
     assert inventory.output_count == 1
-    assert repr(inventory) == "AudioInventory(input_count=1, output_count=1)"
+    assert inventory.matching_full_duplex_count == 1
+    assert repr(inventory) == (
+        "AudioInventory(input_count=1, output_count=1, matching_full_duplex_count=1)"
+    )
+    assert "sensitive" not in repr(inventory)
     assert calls == ["construct", "terminate"]
+
+
+def test_chatbot_split_input_output_devices_do_not_satisfy_configured_audio():
+    split_devices = (
+        {
+            "name": "USB Audio Device microphone",
+            "maxInputChannels": 1,
+            "maxOutputChannels": 0,
+        },
+        {
+            "name": "USB Audio Device speaker",
+            "maxInputChannels": 0,
+            "maxOutputChannels": 2,
+        },
+    )
+
+    result = run_chatbot_gates(
+        pyproject_path=PYPROJECT,
+        configuration_path=CONFIG,
+        dependency_probe=DependencyProbe(),
+        audio_enumerator=lambda: split_devices,
+        startup_checker=lambda *_args: None,
+        environment={
+            name: "valid-provider-secret" for name in REQUIRED_PROVIDER_VARIABLES
+        },
+    )
+
+    assert _statuses(result)[3] == (
+        "chatbot.audio_hardware",
+        "QUALIFIED",
+        "AUDIO_HARDWARE_MISSING",
+    )
+    measurements = {
+        row["name"]: row["value"] for row in result.gates[3]["measurements"]
+    }
+    assert measurements["matching_full_duplex_device_count"] == 0
+    assert measurements["configured_full_duplex_device_present"] is False
+    assert "USB Audio Device" not in repr(result)
+
+
+def test_chatbot_requires_configured_name_match_on_the_full_duplex_device():
+    unrelated_device = (
+        {
+            "name": "Built-in Audio Duplex",
+            "maxInputChannels": 1,
+            "maxOutputChannels": 2,
+        },
+    )
+
+    result = run_chatbot_gates(
+        pyproject_path=PYPROJECT,
+        configuration_path=CONFIG,
+        dependency_probe=DependencyProbe(),
+        audio_enumerator=lambda: unrelated_device,
+        startup_checker=lambda *_args: None,
+        environment={
+            name: "valid-provider-secret" for name in REQUIRED_PROVIDER_VARIABLES
+        },
+    )
+
+    assert _statuses(result)[3][1:] == (
+        "QUALIFIED",
+        "AUDIO_HARDWARE_MISSING",
+    )
 
 
 def test_chatbot_rejects_structurally_incomplete_configuration(tmp_path):

@@ -22,7 +22,15 @@ from typing import Callable, Mapping
 from unittest.mock import patch
 
 
-REQUIRED_IMPORTS = ("aiohttp", "loguru", "pyaudio", "pydub", "websockets")
+REQUIRED_IMPORTS = (
+    "aiohttp",
+    "loguru",
+    "numpy",
+    "openai",
+    "pyaudio",
+    "pydub",
+    "websockets",
+)
 REQUIRED_PROVIDER_VARIABLES = (
     "CHATBOT_ASR_APP_KEY",
     "CHATBOT_ASR_ACCESS_KEY",
@@ -61,6 +69,7 @@ class ExternalReadiness:
 class AudioInventory:
     input_count: int
     output_count: int
+    matching_full_duplex_count: int
 
     def __post_init__(self) -> None:
         if (
@@ -68,6 +77,10 @@ class AudioInventory:
             or self.input_count < 0
             or type(self.output_count) is not int
             or self.output_count < 0
+            or type(self.matching_full_duplex_count) is not int
+            or self.matching_full_duplex_count < 0
+            or self.matching_full_duplex_count > self.input_count
+            or self.matching_full_duplex_count > self.output_count
         ):
             raise ValueError("invalid audio inventory")
 
@@ -582,17 +595,23 @@ def _failure_after_configuration(
 
 
 def _dependency_gate(
-    importability: tuple[tuple[str, bool], ...], *, passed: bool
+    importability: tuple[tuple[str, bool], ...],
+    *,
+    passed: bool,
+    guard: ChatbotOfflineSideEffectGuard | None = None,
 ) -> dict[str, object]:
+    measurements = tuple(
+        _measurement(f"{name}_importable", available)
+        for name, available in importability
+    )
+    if guard is not None and guard.side_effect_attempted:
+        measurements += _side_effect_measurements(guard)
     return _gate(
         "chatbot.dependencies",
         "PASS" if passed else "FAIL",
         "OK" if passed else "CHATBOT_DEPENDENCY_MISSING",
         role="required",
-        measurements=tuple(
-            _measurement(f"{name}_importable", available)
-            for name, available in importability
-        ),
+        measurements=measurements,
     )
 
 
@@ -756,12 +775,9 @@ def _configuration_startup(
         raise OfflineStartupSideEffectAttempt("configuration startup rejected")
 
 
-def enumerate_audio_devices(pyaudio_module: object) -> AudioInventory:
-    """Count input/output devices without ever opening an audio stream."""
-
+def _audio_device_rows(pyaudio_module: object) -> tuple[dict[str, object], ...]:
     audio = getattr(pyaudio_module, "PyAudio")()
-    input_count = 0
-    output_count = 0
+    rows: list[dict[str, object]] = []
     try:
         count = audio.get_device_count()
         if type(count) is not int or count < 0 or count > 4096:
@@ -776,25 +792,43 @@ def enumerate_audio_devices(pyaudio_module: object) -> AudioInventory:
                 output_channels, (int, float)
             ):
                 raise ValueError("audio channel inventory is invalid")
-            input_count += int(input_channels > 0)
-            output_count += int(output_channels > 0)
+            rows.append(
+                {
+                    "name": device.get("name"),
+                    "maxInputChannels": input_channels,
+                    "maxOutputChannels": output_channels,
+                }
+            )
     finally:
         audio.terminate()
-    return AudioInventory(input_count=input_count, output_count=output_count)
+    return tuple(rows)
 
 
-def _default_audio_enumerator() -> AudioInventory:
+def enumerate_audio_devices(
+    pyaudio_module: object, configured_device_name: str
+) -> AudioInventory:
+    """Count matching full-duplex devices without opening an audio stream."""
+
+    return _normalize_inventory(
+        _audio_device_rows(pyaudio_module), configured_device_name
+    )
+
+
+def _default_audio_enumerator() -> tuple[dict[str, object], ...]:
     pyaudio_module = importlib.import_module("pyaudio")
-    return enumerate_audio_devices(pyaudio_module)
+    return _audio_device_rows(pyaudio_module)
 
 
-def _normalize_inventory(value: object) -> AudioInventory:
+def _normalize_inventory(value: object, configured_device_name: str) -> AudioInventory:
+    if type(configured_device_name) is not str or not configured_device_name:
+        raise ValueError("configured audio device name is invalid")
     if type(value) is AudioInventory:
         return value
     if type(value) not in {tuple, list}:
         raise ValueError("audio inventory is invalid")
     input_count = 0
     output_count = 0
+    matching_full_duplex_count = 0
     if len(value) > 4096:
         raise ValueError("audio inventory exceeds bound")
     for device in value:
@@ -802,13 +836,25 @@ def _normalize_inventory(value: object) -> AudioInventory:
             raise ValueError("audio inventory row is invalid")
         input_channels = device.get("maxInputChannels", 0)
         output_channels = device.get("maxOutputChannels", 0)
-        if not isinstance(input_channels, (int, float)) or not isinstance(
-            output_channels, (int, float)
+        name = device.get("name")
+        if (
+            not isinstance(input_channels, (int, float))
+            or not isinstance(output_channels, (int, float))
+            or type(name) is not str
         ):
             raise ValueError("audio channel inventory is invalid")
         input_count += int(input_channels > 0)
         output_count += int(output_channels > 0)
-    return AudioInventory(input_count=input_count, output_count=output_count)
+        matching_full_duplex_count += int(
+            input_channels > 0
+            and output_channels > 0
+            and configured_device_name.casefold() in name.casefold()
+        )
+    return AudioInventory(
+        input_count=input_count,
+        output_count=output_count,
+        matching_full_duplex_count=matching_full_duplex_count,
+    )
 
 
 def _credential_presence(
@@ -899,13 +945,20 @@ def run_chatbot_gates(
             stage = "configuration"
             configuration = _load_configuration(configuration_path)
             validate_configuration_startup(configuration, StartupSideEffectSpies())
+            configured_device_name = _require_string(
+                _require_mapping(
+                    configuration["audio_device"],
+                    {"device_name", "channels", "chunk_size"},
+                ),
+                "device_name",
+            )
             _configuration_startup(startup_checker, configuration, spies)
             guard.reject_new_live_threads()
             if guard.side_effect_attempted:
                 raise OfflineStartupSideEffectAttempt(
                     "configuration startup side effect rejected"
                 )
-            inventory = _normalize_inventory(audio_enumerator())
+            inventory = _normalize_inventory(audio_enumerator(), configured_device_name)
             guard.reject_new_live_threads()
             if guard.side_effect_attempted:
                 raise OfflineStartupSideEffectAttempt(
@@ -921,7 +974,7 @@ def run_chatbot_gates(
                 )
             configuration_gate = _configuration_gate(guard, passed=True)
             credentials = all(present for _, present in credential_presence)
-            audio = inventory.input_count > 0 and inventory.output_count > 0
+            audio = inventory.matching_full_duplex_count > 0
             credential_gate = _gate(
                 "chatbot.credentials",
                 "PASS" if credentials else "QUALIFIED",
@@ -940,6 +993,14 @@ def run_chatbot_gates(
                 measurements=(
                     _measurement("audio_input_device_count", inventory.input_count),
                     _measurement("audio_output_device_count", inventory.output_count),
+                    _measurement(
+                        "matching_full_duplex_device_count",
+                        inventory.matching_full_duplex_count,
+                    ),
+                    _measurement(
+                        "configured_full_duplex_device_present",
+                        audio,
+                    ),
                     _measurement("audio_stream_opened", False),
                 ),
             )
@@ -955,20 +1016,12 @@ def run_chatbot_gates(
                 exit_code=decision.exit_code,
             )
     except OfflineStartupSideEffectAttempt:
-        if (
-            stage == "dependencies"
-            and declarations_valid
-            and guard.side_effect_attempted
-        ):
-            dependency_gate = _dependency_gate(
-                tuple((name, True) for name in REQUIRED_IMPORTS), passed=True
-            )
-            return _failure_after_configuration(
-                dependency_gate,
-                _configuration_gate(guard, passed=False),
-            )
         if stage == "dependencies":
-            dependency_gate = _dependency_gate(tuple(importability), passed=False)
+            dependency_gate = _dependency_gate(
+                tuple(importability),
+                passed=False,
+                guard=guard,
+            )
             return _failure_after_dependencies(dependency_gate)
         return _failure_after_configuration(
             dependency_gate,
