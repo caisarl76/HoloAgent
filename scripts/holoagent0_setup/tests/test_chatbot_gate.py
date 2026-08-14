@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import _thread
+import errno
 import importlib
 import json
 import os
@@ -257,6 +258,130 @@ def _assert_closed_child_failure(result):
 def _assert_process_group_absent(pgid):
     with pytest.raises(ProcessLookupError):
         os.killpg(pgid, 0)
+
+
+class _MockSpawnedChatbotChild:
+    def __init__(self, *, wait_fails=False):
+        self.pid = 43210
+        self.returncode = None
+        self.wait_calls = 0
+        self.kill_calls = 0
+        self.wait_fails = wait_fails
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.kill_calls += 1
+        raise ProcessLookupError(errno.ESRCH, "already exited")
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        if self.wait_fails:
+            raise subprocess.TimeoutExpired(("mock-chatbot-child",), timeout)
+        self.returncode = -signal.SIGKILL
+        return self.returncode
+
+
+@pytest.mark.parametrize("failure_phase", ["bind", "prlimit", "transport"])
+def test_chatbot_spawn_exception_paths_mandatorily_reap_and_empty_group(
+    monkeypatch,
+    failure_phase,
+):
+    process = _MockSpawnedChatbotChild()
+    group_live = True
+    kill_signals = []
+
+    def killpg(pgid, signum):
+        nonlocal group_live
+        assert pgid == process.pid
+        if signum == 0:
+            if group_live:
+                return None
+            raise ProcessLookupError(errno.ESRCH, "group absent")
+        kill_signals.append(signum)
+        if signum == signal.SIGTERM:
+            raise OSError(errno.EIO, "injected term failure")
+        assert signum == signal.SIGKILL
+        group_live = False
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(chatbot_gate, "_root_identity_matches", lambda _identity: True)
+    identity = chatbot_gate._OwnedChildIdentity(
+        process.pid,
+        process.pid,
+        123,
+    )
+    if failure_phase == "bind":
+        monkeypatch.setattr(
+            chatbot_gate,
+            "_bind_owned_child",
+            lambda _process: (_ for _ in ()).throw(OSError("bind failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            chatbot_gate,
+            "_bind_owned_child",
+            lambda _process: identity,
+        )
+        if failure_phase == "prlimit":
+            monkeypatch.setattr(
+                chatbot_gate.resource,
+                "prlimit",
+                lambda *_args: (_ for _ in ()).throw(OSError("prlimit failed")),
+            )
+        else:
+            monkeypatch.setattr(chatbot_gate.resource, "prlimit", lambda *_args: None)
+            monkeypatch.setattr(
+                chatbot_gate,
+                "_write_all",
+                lambda *_args: (_ for _ in ()).throw(OSError("transport failed")),
+            )
+
+    result = chatbot_gate._run_owned_chatbot_child(
+        command=("/usr/bin/python3.10", "-I", "-B", "/mock-child.py"),
+        control=_child_control_bytes(),
+        timeout_seconds=0.5,
+    )
+
+    _assert_closed_child_failure(result)
+    assert signal.SIGKILL in kill_signals
+    assert process.wait_calls == 1
+    assert process.returncode == -signal.SIGKILL
+    assert group_live is False
+
+
+def test_chatbot_unproven_spawn_cleanup_raises_containment_error(monkeypatch):
+    process = _MockSpawnedChatbotChild(wait_fails=True)
+    group_probes = 0
+
+    def killpg(pgid, signum):
+        nonlocal group_probes
+        assert pgid == process.pid
+        if signum == 0:
+            group_probes += 1
+            return None
+        raise PermissionError(errno.EPERM, "injected kill failure")
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(
+        chatbot_gate,
+        "_bind_owned_child",
+        lambda _process: (_ for _ in ()).throw(OSError("bind failed")),
+    )
+
+    with pytest.raises(chatbot_gate.ChatbotChildContainmentError):
+        chatbot_gate._run_owned_chatbot_child(
+            command=("/usr/bin/python3.10", "-I", "-B", "/mock-child.py"),
+            control=_child_control_bytes(),
+            timeout_seconds=0.5,
+        )
+
+    assert process.wait_calls == 1
+    assert process.returncode is None
+    assert group_probes >= 1
 
 
 @pytest.mark.parametrize(

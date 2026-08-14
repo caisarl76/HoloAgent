@@ -122,6 +122,10 @@ class ChatbotReadinessTimeout(TimeoutError):
     """The single reviewed chatbot readiness deadline expired."""
 
 
+class ChatbotChildContainmentError(RuntimeError):
+    """A spawned chatbot child could not be proven reaped and contained."""
+
+
 class _WholeReadinessDeadline:
     def __init__(self, timeout_seconds: float) -> None:
         if (
@@ -1432,61 +1436,70 @@ def _process_group_exists(pgid: int) -> bool:
     return True
 
 
-def _signal_owned_group(
-    identity: _OwnedChildIdentity,
-    process: subprocess.Popen[bytes],
-    signum: int,
-) -> None:
-    if process.poll() is None and not _root_identity_matches(identity):
-        raise OSError("chatbot child root identity changed")
-    os.killpg(identity.pgid, signum)
-
-
-def _wait_for_owned_cleanup(
-    identity: _OwnedChildIdentity,
-    process: subprocess.Popen[bytes],
-    timeout_seconds: float,
-) -> bool:
+def _wait_for_group_absence(pgid: int, timeout_seconds: float) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        process.poll()
-        if process.returncode is not None and not _process_group_exists(identity.pgid):
+        if not _process_group_exists(pgid):
             return True
         time.sleep(CHATBOT_CHILD_POLL_SECONDS)
-    return False
+    return not _process_group_exists(pgid)
 
 
-def _cleanup_owned_child(
-    identity: _OwnedChildIdentity,
+def _finalize_owned_child(
     process: subprocess.Popen[bytes],
-) -> tuple[bool, bool]:
-    residual_group = process.poll() is not None and _process_group_exists(identity.pgid)
-    needs_termination = process.returncode is None or residual_group
-    try:
-        if needs_termination:
-            _signal_owned_group(identity, process, signal.SIGTERM)
-            if not _wait_for_owned_cleanup(
-                identity,
-                process,
-                CHATBOT_CHILD_TERM_GRACE_SECONDS,
-            ):
-                _signal_owned_group(identity, process, signal.SIGKILL)
-        clean = _wait_for_owned_cleanup(
-            identity,
-            process,
-            CHATBOT_CHILD_KILL_GRACE_SECONDS,
-        )
-        if process.returncode is None:
-            process.wait(timeout=CHATBOT_CHILD_KILL_GRACE_SECONDS)
-        final_absent = not _process_group_exists(identity.pgid)
-        return clean and process.returncode is not None and final_absent, residual_group
-    except (OSError, subprocess.SubprocessError):
+    _identity: _OwnedChildIdentity | None,
+) -> bool:
+    pid = getattr(process, "pid", None)
+    pgid = pid if type(pid) is int and pid > 1 else None
+    group_was_present = True
+    if pgid is not None:
         try:
-            process.kill()
-            process.wait(timeout=CHATBOT_CHILD_KILL_GRACE_SECONDS)
-        except (OSError, subprocess.SubprocessError):
+            group_was_present = _process_group_exists(pgid)
+        except BaseException:
             pass
-        return False, residual_group
+
+    wait_error = None
+    try:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError as error:
+                if error.errno != errno.ESRCH:
+                    raise
+            except BaseException:
+                pass
+    finally:
+        try:
+            process.wait(timeout=CHATBOT_CHILD_KILL_GRACE_SECONDS)
+        except BaseException as error:
+            wait_error = error
+
+    group_absent = False
+    if pgid is not None:
+        try:
+            if wait_error is None:
+                group_absent = _wait_for_group_absence(
+                    pgid,
+                    CHATBOT_CHILD_KILL_GRACE_SECONDS,
+                )
+            else:
+                group_absent = not _process_group_exists(pgid)
+        except BaseException:
+            pass
+    if wait_error is not None or process.returncode is None or not group_absent:
+        raise ChatbotChildContainmentError(
+            "chatbot child cleanup could not be proven"
+        ) from wait_error
+    return group_was_present
+
+
+def _close_chatbot_control_descriptor(descriptor: int) -> None:
+    if descriptor < 0:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -1524,46 +1537,59 @@ def _run_owned_chatbot_child(
     try:
         read_descriptor, write_descriptor = os.pipe2(os.O_CLOEXEC)
         with tempfile.TemporaryFile(mode="w+b") as result_file:
-            os.fchmod(result_file.fileno(), 0o600)
-            if os.fstat(result_file.fileno()).st_mode & 0o777 != 0o600:
-                raise OSError("chatbot child result file mode is invalid")
-            process = subprocess.Popen(
-                command,
-                stdin=read_descriptor,
-                stdout=result_file,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                start_new_session=True,
-            )
-            os.close(read_descriptor)
-            read_descriptor = -1
-            identity = _bind_owned_child(process)
-            if not hasattr(resource, "prlimit"):
-                raise OSError("chatbot child file limit is unavailable")
-            resource.prlimit(
-                identity.pid,
-                resource.RLIMIT_FSIZE,
-                (CHATBOT_CHILD_RESULT_MAX_BYTES, CHATBOT_CHILD_RESULT_MAX_BYTES),
-            )
-            _write_all(write_descriptor, control)
-            os.close(write_descriptor)
-            write_descriptor = -1
-            deadline = time.monotonic() + timeout_seconds
-            while process.poll() is None:
+            operation_failed = False
+            residual_group = False
+            try:
+                os.fchmod(result_file.fileno(), 0o600)
+                if os.fstat(result_file.fileno()).st_mode & 0o777 != 0o600:
+                    raise OSError("chatbot child result file mode is invalid")
+                process = subprocess.Popen(
+                    command,
+                    stdin=read_descriptor,
+                    stdout=result_file,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    start_new_session=True,
+                )
+                _close_chatbot_control_descriptor(read_descriptor)
+                read_descriptor = -1
+                identity = _bind_owned_child(process)
+                if not hasattr(resource, "prlimit"):
+                    raise OSError("chatbot child file limit is unavailable")
+                resource.prlimit(
+                    identity.pid,
+                    resource.RLIMIT_FSIZE,
+                    (
+                        CHATBOT_CHILD_RESULT_MAX_BYTES,
+                        CHATBOT_CHILD_RESULT_MAX_BYTES,
+                    ),
+                )
+                _write_all(write_descriptor, control)
+                _close_chatbot_control_descriptor(write_descriptor)
+                write_descriptor = -1
+                deadline = time.monotonic() + timeout_seconds
+                while process.poll() is None:
+                    if (
+                        os.fstat(result_file.fileno()).st_size
+                        > CHATBOT_CHILD_RESULT_MAX_BYTES
+                        or time.monotonic() >= deadline
+                        or not _root_identity_matches(identity)
+                    ):
+                        transport_failed = True
+                        break
+                    time.sleep(CHATBOT_CHILD_POLL_SECONDS)
                 if (
                     os.fstat(result_file.fileno()).st_size
                     > CHATBOT_CHILD_RESULT_MAX_BYTES
-                    or time.monotonic() >= deadline
-                    or not _root_identity_matches(identity)
                 ):
                     transport_failed = True
-                    break
-                time.sleep(CHATBOT_CHILD_POLL_SECONDS)
-            if os.fstat(result_file.fileno()).st_size > CHATBOT_CHILD_RESULT_MAX_BYTES:
-                transport_failed = True
-            clean, residual_group = _cleanup_owned_child(identity, process)
+            except Exception:
+                operation_failed = True
+            finally:
+                if process is not None:
+                    residual_group = _finalize_owned_child(process, identity)
             if (
-                not clean
+                operation_failed
                 or residual_group
                 or transport_failed
                 or process.returncode != 0
@@ -1572,23 +1598,13 @@ def _run_owned_chatbot_child(
             result_file.seek(0)
             payload = result_file.read(CHATBOT_CHILD_RESULT_MAX_BYTES + 1)
             return _decode_chatbot_child_result(payload)
+    except ChatbotChildContainmentError:
+        raise
     except Exception:
-        if process is not None and identity is not None:
-            _cleanup_owned_child(identity, process)
-        elif process is not None:
-            try:
-                process.kill()
-                process.wait(timeout=CHATBOT_CHILD_KILL_GRACE_SECONDS)
-            except (OSError, subprocess.SubprocessError):
-                pass
         return _closed_child_failure()
     finally:
         for descriptor in (read_descriptor, write_descriptor):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+            _close_chatbot_control_descriptor(descriptor)
 
 
 def run_chatbot_gates(
