@@ -28,5 +28,7 @@ scripts/holoagent0_setup/tests/test_strace_provisioner_revision13.py
 scripts/holoagent0_setup/tests/test_openclaw_provisioning.py
 scripts/holoagent0_setup/tests/test_openclaw_gate.py
 scripts/holoagent0_setup/tests/test_agentos_gate.py
+scripts/holoagent0_setup/tests/test_skills_gate.py
+scripts/holoagent0_setup/tests/test_chatbot_gate.py
 scripts/holoagent0_setup/tests/test_source_gate.py
 scripts/holoagent0_setup/tests/test_semantic_gate.py
