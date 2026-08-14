@@ -1226,7 +1226,9 @@ def _validate_dependency_child_gate(gate: dict[str, object]) -> None:
     import_names = tuple(f"{name}_importable" for name in REQUIRED_IMPORTS)
     import_count = 0
     while (
-        import_count < len(names) and names[import_count] == import_names[import_count]
+        import_count < len(names)
+        and import_count < len(import_names)
+        and names[import_count] == import_names[import_count]
     ):
         import_count += 1
     remaining_names = names[import_count:]
@@ -1245,6 +1247,8 @@ def _validate_dependency_child_gate(gate: dict[str, object]) -> None:
             or row["unit"] is not None
         ):
             raise ValueError("chatbot dependency evidence is invalid")
+    if remaining_names and not any(row["value"] for row in measurements[import_count:]):
+        raise ValueError("chatbot dependency side-effect evidence is untruthful")
     if gate["status"] == "PASS" and (
         import_count != len(REQUIRED_IMPORTS)
         or remaining_names
@@ -1270,6 +1274,7 @@ def _decode_chatbot_child_result(payload: bytes) -> ChatbotGateResult:
         type(document) is not dict
         or set(document) != {"exit_code", "gates", "label"}
         or _canonical_json_bytes(document) != payload
+        or type(document["exit_code"]) is not int
         or type(document["gates"]) is not list
         or len(document["gates"]) != 4
     ):

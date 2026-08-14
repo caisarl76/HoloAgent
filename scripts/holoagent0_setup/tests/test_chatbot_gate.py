@@ -507,6 +507,74 @@ def test_chatbot_child_result_acceptance_rejects_inconsistent_evidence(mutation)
         chatbot_gate._decode_chatbot_child_result(payload)
 
 
+@pytest.mark.parametrize("boolean_exit_code", [False, True])
+def test_chatbot_child_result_rejects_boolean_exit_codes(boolean_exit_code):
+    source = (
+        _passing_child_result_bytes()
+        if boolean_exit_code is False
+        else _child_result_bytes(chatbot_gate._closed_child_failure())
+    )
+    document = json.loads(source)
+    document["exit_code"] = boolean_exit_code
+    payload = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+    with pytest.raises(ValueError):
+        chatbot_gate._decode_chatbot_child_result(payload)
+
+
+def test_chatbot_child_result_rejects_all_false_dependency_side_effect_block():
+    document = json.loads(_child_result_bytes(chatbot_gate._closed_child_failure()))
+    document["gates"][0]["measurements"] = [
+        {"name": "process_spawn_attempted", "value": False, "unit": None},
+        {"name": "network_attempted", "value": False, "unit": None},
+        {"name": "microphone_attempted", "value": False, "unit": None},
+    ]
+    payload = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+    with pytest.raises(ValueError):
+        chatbot_gate._decode_chatbot_child_result(payload)
+
+
+def test_chatbot_child_result_accepts_caught_seventh_probe_side_effect():
+    cached_popen = subprocess.Popen
+    calls = []
+
+    def dependency_probe(name):
+        calls.append(name)
+        if name == REQUIRED_IMPORTS[-1]:
+            try:
+                cached_popen(["/definitely-missing-seventh-probe"])
+            except Exception:
+                return True
+            raise AssertionError("guarded process constructor did not raise")
+        return True
+
+    core_result = run_chatbot_gates(
+        pyproject_path=PYPROJECT,
+        configuration_path=CONFIG,
+        dependency_probe=dependency_probe,
+        audio_enumerator=lambda: _devices(audio=True),
+        startup_checker=lambda *_args: None,
+        environment={name: "present" for name in REQUIRED_PROVIDER_VARIABLES},
+    )
+
+    decoded = chatbot_gate._decode_chatbot_child_result(
+        chatbot_gate._encode_chatbot_child_result(core_result)
+    )
+
+    assert decoded == core_result
+    assert calls == list(REQUIRED_IMPORTS)
+    assert decoded.gates[0]["measurements"][-3:] == [
+        {"name": "process_spawn_attempted", "value": True, "unit": None},
+        {"name": "network_attempted", "value": False, "unit": None},
+        {"name": "microphone_attempted", "value": False, "unit": None},
+    ]
+
+
 def test_chatbot_child_transport_is_closed_private_and_credential_free(
     tmp_path, monkeypatch
 ):
@@ -681,7 +749,9 @@ def test_chatbot_rejects_success_until_residual_owned_process_group_is_empty(
     _assert_process_group_eventually_absent(int(pid_path.read_text(encoding="utf-8")))
 
 
-@pytest.mark.parametrize("defect", ["timeout", "signal", "malformed", "oversized"])
+@pytest.mark.parametrize(
+    "defect", ["timeout", "signal", "malformed", "noncanonical", "oversized"]
+)
 def test_chatbot_child_transport_defects_fail_closed_and_reap_group(tmp_path, defect):
     pid_path = tmp_path / f"{defect}.pid"
     setup = (
@@ -693,6 +763,9 @@ def test_chatbot_child_transport_defects_fail_closed_and_reap_group(tmp_path, de
         "timeout": "time.sleep(2.0)\n",
         "signal": "os.kill(os.getpid(),signal.SIGTERM)\n",
         "malformed": "sys.stdout.write('not-json\\n')\n",
+        "noncanonical": (
+            f"sys.stdout.buffer.write(b' '+{_passing_child_result_bytes()!r})\n"
+        ),
         "oversized": "sys.stdout.write('x'*70000);sys.stdout.flush();time.sleep(2.0)\n",
     }
     command = _write_child_fixture(tmp_path, setup + actions[defect])
