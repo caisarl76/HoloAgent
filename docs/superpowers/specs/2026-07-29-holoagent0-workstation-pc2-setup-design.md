@@ -928,10 +928,12 @@ may use the existing pathname constructor. `BootstrapRuntime` remains the sole
 creation authority: in production it calls the authority exactly once, uses
 `mkdir(run_basename, mode=0700, dir_fd=output_root_fd)`, opens the new directory
 with `O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW`, proves its owner/mode and identity
-against the expected absolute path, and consumes/closes the authority on every
-outcome. It never falls back to `Path.mkdir`. A collision, replayed authority,
-changed output-root identity, or pre-existing run path fails without reuse,
-deletion, renaming, or suffix retry.
+against the expected absolute path, and consumes the output-root authority on
+every outcome. On success it transfers the verified child FD into the retained
+binding defined below; on failure it closes every descriptor. It never falls
+back to `Path.mkdir`. A collision, replayed authority, changed output-root
+identity, or pre-existing run path fails without reuse, deletion, renaming, or
+suffix retry.
 
 `offline_cli.py` contains presentation and argument handling only.
 `offline_runtime.py` owns composition through a closed internal factory
@@ -1010,6 +1012,126 @@ tracer/normalizer/coordinator launcher, handoff and broker FD assembly,
 production `TracedCoordinator` and action-child composition, isolated
 loopback-namespace and semantic DDS execution, and live workstation acceptance.
 Those authorities cannot be supplied by a Task 13 CLI option or test factory.
+
+#### Task 13A retained run-root lifecycle amendment
+
+The run root remains identity-bound after creation. A successful
+`RunRootAuthority.create()` does not collapse the authority to a lexical
+`Path`; it consumes and closes the retained output-root descriptor and
+transfers the verified child descriptor into one exact, non-serializable,
+non-copyable `RunRootBinding`. The binding contains only an exact concrete
+display path, the retained directory FD, its device/inode identity, effective
+UID, and expected mode. Its display path is diagnostic metadata and a namespace
+consistency assertion. It is never a production I/O authority.
+
+The child directory is created with `mkdirat` beneath the retained output-root
+FD, opened with `O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW`, compared with the
+no-follow directory entry, and then set to mode `0700` with `fchmod` on that
+verified FD before its mode is accepted. The same identity-bound `fchmod`
+sequence applies when the final output-root component itself is newly created.
+This makes the result independent of the caller's umask. A failure after
+materialization leaves the created inode in place, closes every owned
+descriptor, and performs no deletion, repair, rename, reuse, or suffix retry.
+
+Every binding operation independently requires exact primitive or concrete
+types. The run ID is an exact `str`, not a subclass, and must equal the
+binding's generated basename. Stored and supplied paths are exact platform
+`PosixPath` values; comparison uses canonical primitive component tuples and
+never a caller-overloadable equality or filesystem-path method. Relative
+artifact names are exact safe POSIX component tuples with no empty, dot,
+dot-dot, absolute, NUL, slash-bearing component, or alternate separator. A
+successful method returns newly constructed trusted values, never a retained
+caller object. Direct construction, `object.__new__` field injection, path or
+string subclasses, serialization, copying, replay, and a second close cannot
+create or redirect authority.
+
+The binding supplies validated duplicate directory capabilities to production
+components. Each duplicate rechecks the retained FD's device, inode, UID,
+directory type, and `0700` mode before use and is independently closeable. The
+implementation attempts every descriptor close even if an earlier close
+fails, preserves the first cleanup error, and reports an aggregate closed
+cleanup failure after all attempts. No production component accepts a raw
+caller FD, `/proc/self/fd` pathname, or pathname-only fallback.
+
+Production storage is relative to those capabilities:
+
+- `LedgerStore.create_at` creates and publishes its staging directory with
+  `mkdirat`/`renameat` beneath the run-root FD and retains its own verified
+  ledger-directory FD for every generation.
+- `AppendOnlyJournal.create_at` opens its fixed file with `openat`, retains a
+  duplicate run-root FD for directory fsync, and never reopens its parent by
+  pathname while appending or sealing.
+- Bootstrap reports, host-observer artifacts, the trace, ledger-chain
+  manifest, and every other run artifact use the existing atomic no-replace
+  writers with an explicit parent FD and expected parent identity.
+- Trace retention and evidence binding use `openat` beneath a duplicate root
+  capability. `EvidenceBinder` accepts that capability directly instead of
+  reopening the display path. Run-tree inventory and secret scanning walk the
+  retained directory FD.
+- `AuthoritativeResultPublisher` and emergency publication after run-root
+  creation use the same binding. The old lexical
+  `invocation.run_root.mkdir(exist_ok=True)` emergency path is prohibited.
+  Failure before a binding exists produces only the already specified bounded
+  bootstrap diagnostic and cannot create a fallback run directory.
+
+`BootstrapState` owns the transferred binding after zero-state creation.
+Bootstrap closes it on every failure before state transfer. After transfer,
+the evidence supervisor owns closure across trace execution, recovery,
+mandatory finalization, ordinary or emergency result publication, and
+post-publication verification. Task 13B's `OfflineExecution` exposes no raw FD;
+it provides one secure result-read operation backed by a retained duplicate.
+`OfflineApplication` performs authoritative result readback before closing the
+execution context. The final close occurs only after readback succeeds or
+fails and attempts closure of the ledger, both journals, trace/binder/result
+handles, and the root binding. A binding or duplicate cannot outlive that
+closed execution context.
+
+Scenario-only supervisor tests may use a separate pathname adapter. The
+adapter is an exact non-production dependency and cannot be selected by the
+production constructor, public CLI, environment, entry point, import metadata,
+or runtime factory. Production state, finalizers, publishers, and result
+readback reject that adapter and require the exact retained binding.
+
+The binding reopens the absolute display path with the same no-follow
+component walk at each phase boundary and immediately before result
+publication and CLI readback. A missing, renamed, replaced, symlinked, or
+identity-different namespace entry is an evidence-binding defect. All artifact
+I/O still targets the retained original inode, so a replacement tree receives
+zero bytes even if replacement occurs after a boundary check. The supervisor
+does not rename the original back, delete or modify the replacement, search by
+inode, or publish into the replacement.
+
+When a stable result can still be published and read through the retained
+binding, namespace divergence sets `offline.evidence_binding` to `FAIL` with
+`EVIDENCE_BINDING_MISMATCH`; the existing mapping selects `FAIL_HARNESS` and
+exit `40` unless a recorded safety failure has precedence. Secure CLI readback
+first revalidates that the expected namespace path still names the retained
+root. If it does not, readback prints `primary_blocking_gate=UNAVAILABLE` and
+returns `40` even if the retained FD can still read the original result; it
+never treats a result found in the replacement as authoritative. This contract
+prevents redirection and detects availability loss. It does not claim that a
+malicious process with the same UID cannot mutate an inode it can otherwise
+open; retained artifact identities, modes, digests, and final binding checks
+remain responsible for detecting such mutation.
+
+Task 13A is accepted only with deterministic tests that inject namespace
+replacement or unlink/recreate at every authority handoff: after child
+creation; before ledger, journal, bootstrap-report, observer, trace, binder,
+and result creation; immediately before publication; and before CLI readback.
+Each test requires zero writes in the replacement tree, no lexical fallback,
+bounded cleanup, and the precedence-defined failure. Additional tests require
+exact-string run-ID rejection before materialization, deceptive path/string
+subclass rejection, umask `0777` mode correctness, all-descriptor cleanup after
+an injected close failure, public `OfflineInvocation.parse()` coverage, one
+successful publication/readback lifecycle, and unchanged scenario-only
+behavior. A production test makes every absolute run-root reopen fail after
+binding creation and still requires all authorized I/O through retained FDs.
+
+This amendment changes only Task 13A's evidence-directory authority and the
+production storage APIs that must consume it. It does not review the pending
+strace runtime, start a coordinator or action child, create a network
+namespace or ROS/DDS participant, provision OpenClaw, access audio, run MuJoCo,
+contact PC2, import Unitree SDK code, or authorize robot motion.
 
 ### 3. OpenClaw Installation and Lifecycle Isolation
 
