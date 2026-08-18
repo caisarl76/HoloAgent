@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 from importlib import import_module, metadata
 import inspect
+import json
 import math
 import os
 from pathlib import Path
@@ -949,6 +950,143 @@ def _require_pass_stage_bindings(
         raise _semantic_failure("semantic orientation differs from the pinned fixture")
 
 
+def _sha256_retained_asset_lock(paths: HandoverPaths) -> str:
+    paths.revalidate()
+    identity = _retained_identity(paths, "asset_lock")
+    directory_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(identity.path.anchor, directory_flags)
+    try:
+        for index, component in enumerate(identity.path.parts[1:]):
+            final = index == len(identity.path.parts[1:]) - 1
+            flags = (
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+                if final
+                else directory_flags
+            )
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+        ) != (identity.device, identity.inode, identity.mode):
+            raise AtomicIOError("retained asset lock identity changed")
+        observed: list[tuple[int, str]] = []
+        for _pass_index in range(2):
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                digest.update(chunk)
+            observed.append((size, digest.hexdigest()))
+        after = os.fstat(descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if (
+            tuple(getattr(before, field) for field in stable_fields)
+            != tuple(getattr(after, field) for field in stable_fields)
+            or observed[0] != observed[1]
+            or observed[0][0] != before.st_size
+        ):
+            raise AtomicIOError("retained asset lock changed while hashing")
+    except AtomicIOError:
+        raise
+    except OSError as error:
+        raise AtomicIOError("retained asset lock could not be hashed") from error
+    finally:
+        os.close(descriptor)
+    paths.revalidate()
+    return observed[0][1]
+
+
+def _require_authoritative_pass_documents(
+    documents: Mapping[str, dict[str, object]],
+    paths: HandoverPaths,
+    *,
+    accepted_implementation_commit: str | None,
+    source_verification: SourceVerification | None,
+    asset_verification: VerifiedAssetLock | None,
+    graph_counts: GraphCounts | None,
+    semantic_result: SemanticFixtureResult | None,
+) -> None:
+    if not isinstance(paths, HandoverPaths):
+        raise _semantic_failure("publisher requires authoritative HandoverPaths")
+    paths.revalidate()
+
+    source = documents[SOURCE_FILE]
+    if source.get("status") == "PASS":
+        if not isinstance(source_verification, SourceVerification):
+            raise _semantic_failure("source PASS requires SourceVerification")
+        expected_source = build_source_document(
+            paths,
+            status="PASS",
+            reason=source["reason"],
+            started_at=source["started_at"],
+            finished_at=source["finished_at"],
+            checkout_commit=accepted_implementation_commit,
+            verification=source_verification,
+        )
+        if source != expected_source:
+            raise _semantic_failure(
+                "source PASS differs from authoritative source observations"
+            )
+
+    asset = documents[ASSET_FILE]
+    if asset.get("status") == "PASS":
+        if not isinstance(asset_verification, VerifiedAssetLock):
+            raise _semantic_failure("asset PASS requires VerifiedAssetLock")
+        expected_asset = build_asset_document(
+            paths,
+            status="PASS",
+            reason=asset["reason"],
+            started_at=asset["started_at"],
+            finished_at=asset["finished_at"],
+            asset_lock_sha256=_sha256_retained_asset_lock(paths),
+            verification=asset_verification,
+        )
+        if asset != expected_asset:
+            raise _semantic_failure(
+                "asset PASS differs from authoritative asset observations"
+            )
+
+    query = documents[QUERY_FILE]
+    if query.get("status") == "PASS":
+        if not isinstance(graph_counts, GraphCounts) or not isinstance(
+            semantic_result, SemanticFixtureResult
+        ):
+            raise _semantic_failure(
+                "query PASS requires GraphCounts and SemanticFixtureResult"
+            )
+        expected_query = build_query_document(
+            status="PASS",
+            reason=query["reason"],
+            started_at=query["started_at"],
+            finished_at=query["finished_at"],
+            query_sha256=STRUCTURED_QUERY_SHA256,
+            graph_counts=graph_counts,
+            result=semantic_result,
+        )
+        if query != expected_query:
+            raise _semantic_failure(
+                "query PASS differs from authoritative semantic observations"
+            )
+    paths.revalidate()
+
+
 def _read_authoritative_file(
     authority: _RunDirectoryAuthority,
     filename: str,
@@ -1008,7 +1146,15 @@ def _remove_authoritative_terminal(
     authority: _RunDirectoryAuthority,
 ) -> Exception | None:
     try:
-        os.unlink(RESULT_FILE, dir_fd=authority.descriptor)
+        observed = os.stat(
+            RESULT_FILE,
+            dir_fd=authority.descriptor,
+            follow_symlinks=False,
+        )
+        if stat.S_ISDIR(observed.st_mode):
+            os.rmdir(RESULT_FILE, dir_fd=authority.descriptor)
+        else:
+            os.unlink(RESULT_FILE, dir_fd=authority.descriptor)
         os.fsync(authority.descriptor)
     except FileNotFoundError:
         return None
@@ -1021,6 +1167,66 @@ def _remove_authoritative_terminal(
     except OSError as error:
         return error
     return AtomicIOError("authoritative terminal filename still exists")
+
+
+def _cleanup_terminal_after_exception(
+    authority: _RunDirectoryAuthority,
+    terminal: dict[str, object],
+    proof: ArtifactDescriptor | None,
+) -> str:
+    """Remove every retained terminal name, quarantining only exact evidence."""
+
+    binding_error: Exception | None = None
+    try:
+        authority.revalidate()
+    except Exception as error:
+        binding_error = error
+    try:
+        os.stat(
+            RESULT_FILE,
+            dir_fd=authority.descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        try:
+            authority.revalidate()
+        except Exception:
+            return "ABSENT_BINDING_CHANGED"
+        return "ABSENT"
+    except OSError as error:
+        raise AtomicIOError("authoritative terminal could not be inspected") from error
+
+    observed_proof: ArtifactDescriptor | None = None
+    try:
+        if binding_error is not None:
+            raise AtomicIOError(
+                "run directory lexical binding changed"
+            ) from binding_error
+        value, observed_proof = read_json_secure(
+            authority.path / RESULT_FILE,
+            relative_to=authority.path,
+            directory_fd=authority.descriptor,
+        )
+        if value != terminal:
+            raise AtomicIOError("authoritative terminal content is not expected")
+        if proof is not None and observed_proof != proof:
+            raise AtomicIOError("authoritative terminal differs from publication proof")
+    except Exception:
+        removal_error = _remove_authoritative_terminal(authority)
+        if removal_error is not None:
+            raise AtomicIOError(
+                "unverified authoritative terminal could not be removed"
+            ) from removal_error
+        try:
+            authority.revalidate()
+        except Exception:
+            return "REMOVED_BINDING_CHANGED"
+        return "REMOVED"
+
+    if observed_proof is None:
+        raise AtomicIOError("authoritative terminal proof is absent")
+    _quarantine_ambiguous_terminal(authority, observed_proof, terminal)
+    return "QUARANTINED"
 
 
 def _quarantine_ambiguous_terminal(
@@ -1095,21 +1301,9 @@ def build_handover_result_document(
     }
 
 
-def publish_handover_evidence(
-    contract: ContractSet,
-    run_directory: Path,
+def _snapshot_stage_documents(
     stage_documents: Mapping[str, dict[str, object]],
-    *,
-    accepted_implementation_commit: str | None,
-    repository_root: PathIdentity,
-    data_root: PathIdentity,
-    run_directory_identity: PathIdentity,
-    cpu_gpu_label: str | None,
-    started_at: str,
-    finished_at: str,
-) -> ArtifactDescriptor:
-    """Publish all four stage files and then their digest-bound terminal record."""
-
+) -> dict[str, dict[str, object]]:
     if set(stage_documents) != set(EVIDENCE_ORDER):
         raise EvidencePublicationError(
             (
@@ -1122,8 +1316,10 @@ def publish_handover_evidence(
                 ),
             )
         )
+    snapshots: dict[str, dict[str, object]] = {}
     for filename in EVIDENCE_ORDER:
-        if type(stage_documents[filename]) is not dict:
+        document = stage_documents[filename]
+        if type(document) is not dict:
             raise EvidencePublicationError(
                 (
                     PublicationFailure(
@@ -1133,22 +1329,65 @@ def publish_handover_evidence(
                     ),
                 )
             )
-    derived_cpu_gpu_label = _environment_runtime_label(
-        stage_documents[ENVIRONMENT_FILE]
+        value = json.loads(canonical_json_bytes(document))
+        if type(value) is not dict:
+            raise EvidencePublicationError(
+                (
+                    PublicationFailure(
+                        filename,
+                        "input_validation",
+                        TypeError("stage snapshot must be an exact dict"),
+                    ),
+                )
+            )
+        snapshots[filename] = value
+    return snapshots
+
+
+def publish_handover_evidence(
+    contract: ContractSet,
+    run_directory: Path,
+    stage_documents: Mapping[str, dict[str, object]],
+    *,
+    paths: HandoverPaths,
+    source_verification: SourceVerification | None,
+    asset_verification: VerifiedAssetLock | None,
+    graph_counts: GraphCounts | None,
+    semantic_result: SemanticFixtureResult | None,
+    accepted_implementation_commit: str | None,
+    run_directory_identity: PathIdentity,
+    cpu_gpu_label: str | None,
+    started_at: str,
+    finished_at: str,
+) -> ArtifactDescriptor:
+    """Publish all four stage files and then their digest-bound terminal record."""
+
+    documents = _snapshot_stage_documents(stage_documents)
+    repository_root = _retained_identity(paths, "repository_root")
+    data_root = _retained_identity(paths, "data_root")
+    _require_repository_binding(
+        documents[ENVIRONMENT_FILE],
+        documents[SOURCE_FILE],
+        repository_root,
     )
+    _require_authoritative_pass_documents(
+        documents,
+        paths,
+        accepted_implementation_commit=accepted_implementation_commit,
+        source_verification=source_verification,
+        asset_verification=asset_verification,
+        graph_counts=graph_counts,
+        semantic_result=semantic_result,
+    )
+    derived_cpu_gpu_label = _environment_runtime_label(documents[ENVIRONMENT_FILE])
     if cpu_gpu_label != derived_cpu_gpu_label:
         raise _semantic_failure(
             "terminal CPU/GPU label disagrees with environment evidence"
         )
-    _require_repository_binding(
-        stage_documents[ENVIRONMENT_FILE],
-        stage_documents[SOURCE_FILE],
-        repository_root,
-    )
     _require_pass_stage_bindings(
-        stage_documents[SOURCE_FILE],
-        stage_documents[ASSET_FILE],
-        stage_documents[QUERY_FILE],
+        documents[SOURCE_FILE],
+        documents[ASSET_FILE],
+        documents[QUERY_FILE],
         accepted_implementation_commit=accepted_implementation_commit,
         authoritative_data_root=data_root,
     )
@@ -1161,7 +1400,7 @@ def publish_handover_evidence(
         descriptors: dict[str, ArtifactDescriptor] = {}
         failures: list[PublicationFailure] = []
         for filename in EVIDENCE_ORDER:
-            document = stage_documents[filename]
+            document = documents[filename]
             attempt_errors: list[Exception] = []
             try:
                 authority.revalidate()
@@ -1220,7 +1459,7 @@ def publish_handover_evidence(
                     authority,
                     _STAGE_SCHEMAS[filename],
                     filename,
-                    stage_documents[filename],
+                    documents[filename],
                     descriptors[filename],
                 )
             except Exception as error:
@@ -1249,9 +1488,9 @@ def publish_handover_evidence(
         ]
         first_blocking_reason = next(
             (
-                stage_documents[filename]["reason"]
+                documents[filename]["reason"]
                 for filename in BLOCKING_ORDER
-                if stage_documents[filename]["status"] != "PASS"
+                if documents[filename]["status"] != "PASS"
             ),
             None,
         )
@@ -1291,7 +1530,7 @@ def publish_handover_evidence(
                     authority,
                     _STAGE_SCHEMAS[filename],
                     filename,
-                    stage_documents[filename],
+                    documents[filename],
                     descriptors[filename],
                 )
                 for filename in EVIDENCE_ORDER
@@ -1325,33 +1564,37 @@ def publish_handover_evidence(
                 )
             authority.revalidate()
         except AtomicPublicationAmbiguity as error:
-            quarantine_error: Exception | None = None
+            cleanup_error: Exception | None = None
+            cleanup_result: str | None = None
             try:
-                _quarantine_ambiguous_terminal(
-                    authority, error.expected_artifact, terminal
+                cleanup_result = _cleanup_terminal_after_exception(
+                    authority,
+                    terminal,
+                    error.expected_artifact,
                 )
             except Exception as observed:
-                quarantine_error = observed
+                cleanup_error = observed
             detail = RuntimeError(
-                f"{error}; quarantine="
-                f"{'PROVEN' if quarantine_error is None else quarantine_error}"
+                f"{error}; cleanup="
+                f"{cleanup_result if cleanup_error is None else cleanup_error}"
             )
             raise EvidencePublicationError(
                 (PublicationFailure(RESULT_FILE, "ambiguous_terminal", detail),)
             ) from error
         except Exception as error:
-            quarantine_error: Exception | None = None
-            if terminal_descriptor is not None:
-                try:
-                    _quarantine_ambiguous_terminal(
-                        authority, terminal_descriptor, terminal
-                    )
-                except Exception as observed:
-                    quarantine_error = observed
+            cleanup_error: Exception | None = None
+            try:
+                _cleanup_terminal_after_exception(
+                    authority,
+                    terminal,
+                    terminal_descriptor,
+                )
+            except Exception as observed:
+                cleanup_error = observed
             detail = (
                 error
-                if quarantine_error is None
-                else RuntimeError(f"{error}; quarantine={quarantine_error}")
+                if cleanup_error is None
+                else RuntimeError(f"{error}; cleanup={cleanup_error}")
             )
             raise EvidencePublicationError(
                 (PublicationFailure(RESULT_FILE, "terminal", detail),)

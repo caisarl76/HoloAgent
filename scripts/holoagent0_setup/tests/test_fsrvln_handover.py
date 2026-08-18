@@ -4,6 +4,7 @@ import hashlib
 import importlib.machinery
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,7 +29,7 @@ from holoagent0_setup.handover_evidence import (
     build_query_document,
     build_source_document,
     path_identity_document,
-    publish_handover_evidence,
+    publish_handover_evidence as _publish_handover_evidence,
     qualify_environment,
     validate_and_publish_stage,
 )
@@ -46,6 +47,7 @@ from holoagent0_setup.source_gate import (
     HandoverPaths,
     PathIdentity,
     SourceVerification,
+    VerifiedAssetLock,
 )
 
 
@@ -53,7 +55,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 STARTED = "2026-08-18T00:00:00.1234567Z"
 FINISHED = "2026-08-18T00:00:01Z"
 GIT_SHA = "a" * 40
-LOCK_SHA256 = "b" * 64
+LOCK_SHA256 = hashlib.sha256(b"lock").hexdigest()
 
 EXPECTED_IMPORTS = (
     ("pytorch", "torch"),
@@ -202,6 +204,30 @@ def _pass_import_rows() -> list[dict[str, object]]:
     ]
 
 
+def _pass_source_verification() -> SourceVerification:
+    return SourceVerification(
+        commit="c" * 40,
+        verified_count=73,
+        provenance=((GIT_SHA, 72), ("d" * 40, 1)),
+    )
+
+
+def _pass_asset_verification() -> VerifiedAssetLock:
+    asset_specs = tuple(
+        SimpleNamespace(role=role) for role in ("graph", "dataset", "checkpoint")
+    )
+    manifests = tuple(
+        SimpleNamespace(file_count=index, byte_count=index * 10, sha256=digest)
+        for index, digest in enumerate(
+            (GRAPH_ROOT_SHA256, DATASET_ROOT_SHA256, CHECKPOINT_SHA256), start=1
+        )
+    )
+    return VerifiedAssetLock(
+        lock=SimpleNamespace(assets=asset_specs),
+        manifests=manifests,
+    )
+
+
 def _pass_documents(paths: HandoverPaths) -> dict[str, dict[str, object]]:
     environment = build_environment_document(
         status="PASS",
@@ -228,20 +254,7 @@ def _pass_documents(paths: HandoverPaths) -> dict[str, dict[str, object]]:
         started_at=STARTED,
         finished_at=FINISHED,
         checkout_commit=GIT_SHA,
-        verification=SourceVerification(
-            commit="c" * 40,
-            verified_count=73,
-            provenance=((GIT_SHA, 72), ("d" * 40, 1)),
-        ),
-    )
-    asset_specs = tuple(
-        SimpleNamespace(role=role) for role in ("graph", "dataset", "checkpoint")
-    )
-    manifests = tuple(
-        SimpleNamespace(file_count=index, byte_count=index * 10, sha256=digest)
-        for index, digest in enumerate(
-            (GRAPH_ROOT_SHA256, DATASET_ROOT_SHA256, CHECKPOINT_SHA256), start=1
-        )
+        verification=_pass_source_verification(),
     )
     asset = build_asset_document(
         paths,
@@ -250,9 +263,7 @@ def _pass_documents(paths: HandoverPaths) -> dict[str, dict[str, object]]:
         started_at=STARTED,
         finished_at=FINISHED,
         asset_lock_sha256=LOCK_SHA256,
-        verification=SimpleNamespace(
-            lock=SimpleNamespace(assets=asset_specs), manifests=manifests
-        ),
+        verification=_pass_asset_verification(),
     )
     query = build_query_document(
         status="PASS",
@@ -264,6 +275,96 @@ def _pass_documents(paths: HandoverPaths) -> dict[str, dict[str, object]]:
         result=_semantic_result(),
     )
     return dict(zip(EVIDENCE_ORDER, (environment, source, asset, query)))
+
+
+_AUTO_CONTEXT = object()
+
+
+def publish_handover_evidence(
+    contract,
+    run_directory,
+    documents,
+    *,
+    paths,
+    source_verification=_AUTO_CONTEXT,
+    asset_verification=_AUTO_CONTEXT,
+    graph_counts=_AUTO_CONTEXT,
+    semantic_result=_AUTO_CONTEXT,
+    **kwargs,
+):
+    """Test seam supplying the immutable PASS observations required by the API."""
+
+    if source_verification is _AUTO_CONTEXT:
+        source_verification = (
+            _pass_source_verification()
+            if documents[SOURCE_FILE]["status"] == "PASS"
+            else None
+        )
+    if asset_verification is _AUTO_CONTEXT:
+        asset_verification = (
+            _pass_asset_verification()
+            if documents[ASSET_FILE]["status"] == "PASS"
+            else None
+        )
+    if graph_counts is _AUTO_CONTEXT:
+        graph_counts = (
+            GraphCounts(1, 3, 497)
+            if documents[QUERY_FILE]["status"] == "PASS"
+            else None
+        )
+    if semantic_result is _AUTO_CONTEXT:
+        semantic_result = (
+            _semantic_result() if documents[QUERY_FILE]["status"] == "PASS" else None
+        )
+    return _publish_handover_evidence(
+        contract,
+        run_directory,
+        documents,
+        paths=paths,
+        source_verification=source_verification,
+        asset_verification=asset_verification,
+        graph_counts=graph_counts,
+        semantic_result=semantic_result,
+        **kwargs,
+    )
+
+
+def _publish_authoritative_pass(
+    contract,
+    run_directory,
+    documents,
+    paths,
+    *,
+    source_verification=None,
+    asset_verification=None,
+    graph_counts=None,
+    semantic_result=None,
+):
+    return publish_handover_evidence(
+        contract,
+        run_directory,
+        documents,
+        paths=paths,
+        source_verification=(
+            _pass_source_verification()
+            if source_verification is None
+            else source_verification
+        ),
+        asset_verification=(
+            _pass_asset_verification()
+            if asset_verification is None
+            else asset_verification
+        ),
+        graph_counts=GraphCounts(1, 3, 497) if graph_counts is None else graph_counts,
+        semantic_result=_semantic_result()
+        if semantic_result is None
+        else semantic_result,
+        accepted_implementation_commit=GIT_SHA,
+        run_directory_identity=_identity(run_directory),
+        cpu_gpu_label="CPU",
+        started_at=STARTED,
+        finished_at=FINISHED,
+    )
 
 
 @pytest.fixture
@@ -671,8 +772,7 @@ def test_publisher_rejects_schema_valid_one_row_pass_environment_before_any_writ
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -701,8 +801,7 @@ def test_publisher_rejects_terminal_cpu_gpu_disagreement_before_any_write(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -750,8 +849,7 @@ def test_cuda_build_missing_diagnostics_publish_terminal_environment_failure(
         run_directory,
         documents,
         accepted_implementation_commit=GIT_SHA,
-        repository_root=paths.identities[0],
-        data_root=paths.identities[1],
+        paths=paths,
         run_directory_identity=_identity(run_directory),
         cpu_gpu_label="GPU",
         started_at=STARTED,
@@ -794,8 +892,7 @@ def test_publisher_rejects_pass_environment_with_wrong_graph_origin(contract, tm
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -827,8 +924,7 @@ def test_publisher_rejects_coordinated_alternate_source_and_graph_root(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -854,8 +950,7 @@ def test_publisher_rejects_forged_source_repository_identity_field(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -886,13 +981,66 @@ def test_publisher_rejects_source_repository_identity_path_alias(contract, tmp_p
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
             finished_at=FINISHED,
         )
+
+    assert list(run_directory.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "field", ("path", "device", "inode", "file_count", "byte_count")
+)
+def test_publisher_rebuilds_every_asset_observation_field(contract, tmp_path, field):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    graph = documents[ASSET_FILE]["assets"][0]
+    if field == "path":
+        graph[field] = str(tmp_path / "forged-graph")
+    else:
+        graph[field] += 1
+
+    with pytest.raises(RuntimeError):
+        _publish_authoritative_pass(contract, run_directory, documents, paths)
+
+    assert list(run_directory.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "field", ("source_lock_commit", "verified_count", "provenance")
+)
+def test_publisher_rebuilds_every_source_verification_field(contract, tmp_path, field):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    if field == "source_lock_commit":
+        documents[SOURCE_FILE][field] = "e" * 40
+    elif field == "verified_count":
+        documents[SOURCE_FILE][field] += 1
+    else:
+        documents[SOURCE_FILE][field][0]["count"] += 1
+
+    with pytest.raises(RuntimeError):
+        _publish_authoritative_pass(contract, run_directory, documents, paths)
+
+    assert list(run_directory.iterdir()) == []
+
+
+def test_publisher_binds_asset_lock_digest_to_retained_lock_bytes(contract, tmp_path):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    documents[ASSET_FILE]["asset_lock_sha256"] = "f" * 64
+
+    with pytest.raises(RuntimeError):
+        _publish_authoritative_pass(contract, run_directory, documents, paths)
 
     assert list(run_directory.iterdir()) == []
 
@@ -910,8 +1058,7 @@ def test_publisher_rejects_accepted_commit_mismatch_before_any_write(
             run_directory,
             _pass_documents(paths),
             accepted_implementation_commit="e" * 40,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -940,8 +1087,7 @@ def test_publisher_rejects_asset_data_root_mismatch_before_any_write(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -974,8 +1120,7 @@ def test_publisher_rejects_asset_pass_roles_not_exactly_ordered_unique(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1022,8 +1167,7 @@ def test_publisher_rejects_each_pass_digest_mismatch(contract, tmp_path, mismatc
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1077,8 +1221,7 @@ def test_publisher_rejects_each_pass_semantic_mismatch(contract, tmp_path, misma
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1113,8 +1256,7 @@ def test_publisher_rejects_pass_execution_count_before_any_write(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1133,14 +1275,18 @@ def test_publisher_accepts_semantic_position_within_absolute_tolerance(
     paths = _fake_paths(tmp_path)
     documents = _pass_documents(paths)
     documents[QUERY_FILE]["result"]["position"][0] += 5e-7
+    observed_result = replace(
+        _semantic_result(),
+        position=tuple(documents[QUERY_FILE]["result"]["position"]),
+    )
 
     publish_handover_evidence(
         contract,
         run_directory,
         documents,
         accepted_implementation_commit=GIT_SHA,
-        repository_root=paths.identities[0],
-        data_root=paths.identities[1],
+        paths=paths,
+        semantic_result=observed_result,
         run_directory_identity=_identity(run_directory),
         cpu_gpu_label="CPU",
         started_at=STARTED,
@@ -1189,8 +1335,7 @@ def test_reserved_name_collision_rejects_before_first_write(
             run_directory,
             _pass_documents(paths),
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1199,6 +1344,56 @@ def test_reserved_name_collision_rejects_before_first_write(
 
     assert attempts == []
     assert tuple(run_directory.iterdir()) == (reserved,)
+
+
+def test_publisher_snapshots_caller_documents_before_first_write(
+    contract, monkeypatch, tmp_path
+):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    expected_query = json.loads(canonical_json_bytes(documents[QUERY_FILE]))
+    expected_asset = json.loads(canonical_json_bytes(documents[ASSET_FILE]))
+    real_write = evidence_module.atomic_write_json_no_replace
+    mutated = False
+
+    def mutate_caller_after_first_write(path, document, **kwargs):
+        nonlocal mutated
+        descriptor = real_write(path, document, **kwargs)
+        if not mutated:
+            mutated = True
+            documents[QUERY_FILE]["status"] = "FAIL"
+            documents[QUERY_FILE]["reason"] = "MUTATED_CALLER_DOCUMENT"
+            documents[QUERY_FILE]["query_sha256"] = "f" * 64
+            documents[QUERY_FILE]["result"]["structured_query_sha256"] = "f" * 64
+            documents[ASSET_FILE]["assets"][0]["role"] = "dataset"
+            documents[ASSET_FILE]["assets"][0]["sha256"] = "f" * 64
+        return descriptor
+
+    monkeypatch.setattr(
+        evidence_module,
+        "atomic_write_json_no_replace",
+        mutate_caller_after_first_write,
+    )
+
+    publish_handover_evidence(
+        contract,
+        run_directory,
+        documents,
+        accepted_implementation_commit=GIT_SHA,
+        paths=paths,
+        run_directory_identity=_identity(run_directory),
+        cpu_gpu_label="CPU",
+        started_at=STARTED,
+        finished_at=FINISHED,
+    )
+
+    assert json.loads((run_directory / QUERY_FILE).read_bytes()) == expected_query
+    assert json.loads((run_directory / ASSET_FILE).read_bytes()) == expected_asset
+    terminal = json.loads((run_directory / RESULT_FILE).read_bytes())
+    assert terminal["status"] == "PASS"
+    assert terminal["first_blocking_reason"] is None
 
 
 def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
@@ -1249,8 +1444,7 @@ def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
         run_directory,
         documents,
         accepted_implementation_commit=GIT_SHA,
-        repository_root=paths.identities[0],
-        data_root=paths.identities[1],
+        paths=paths,
         run_directory_identity=run_identity,
         cpu_gpu_label="CPU",
         started_at=STARTED,
@@ -1336,8 +1530,7 @@ def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=run_identity,
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1408,8 +1601,7 @@ def test_blocking_reason_uses_source_environment_asset_query_operational_order(
         run_directory,
         documents,
         accepted_implementation_commit=None,
-        repository_root=paths.identities[0],
-        data_root=paths.identities[1],
+        paths=paths,
         run_directory_identity=_identity(run_directory),
         cpu_gpu_label="CPU",
         started_at=STARTED,
@@ -1473,8 +1665,7 @@ def test_evidence_publisher_derives_fail_from_first_blocker_and_keeps_partial_ro
         run_directory,
         documents,
         accepted_implementation_commit=GIT_SHA,
-        repository_root=paths.identities[0],
-        data_root=paths.identities[1],
+        paths=paths,
         run_directory_identity=_identity(run_directory),
         cpu_gpu_label="CPU",
         started_at=STARTED,
@@ -1499,6 +1690,9 @@ def test_stage_validation_failure_attempts_every_later_stage_without_terminal(
     documents = _pass_documents(paths)
     run_directory = tmp_path / "run"
     run_directory.mkdir(mode=0o700)
+    if failed_filename == ASSET_FILE:
+        documents[ASSET_FILE]["status"] = "FAIL"
+        documents[ASSET_FILE]["reason"] = "INJECTED_SCHEMA_FAILURE"
     documents[failed_filename]["unreviewed"] = True
     calls = []
 
@@ -1523,8 +1717,7 @@ def test_stage_validation_failure_attempts_every_later_stage_without_terminal(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1568,8 +1761,7 @@ def test_stage_write_failure_attempts_all_four_writes_without_terminal(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1614,8 +1806,7 @@ def test_run_directory_replacement_fails_closed_and_later_attempts_keep_authorit
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=retained_identity,
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1667,8 +1858,7 @@ def test_stage_replacement_after_write_is_detected_before_terminal(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1709,8 +1899,7 @@ def test_post_terminal_stage_tamper_removes_authoritative_terminal(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1749,8 +1938,7 @@ def test_ambiguous_terminal_is_quarantined_and_never_returned_as_success(
             run_directory,
             documents,
             accepted_implementation_commit=GIT_SHA,
-            repository_root=paths.identities[0],
-            data_root=paths.identities[1],
+            paths=paths,
             run_directory_identity=_identity(run_directory),
             cpu_gpu_label="CPU",
             started_at=STARTED,
@@ -1762,3 +1950,46 @@ def test_ambiguous_terminal_is_quarantined_and_never_returned_as_success(
     assert len(quarantines) == 1
     quarantined = json.loads(quarantines[0].read_bytes())
     assert quarantined["status"] == "PASS"
+
+
+def test_late_terminal_collision_is_removed_from_retained_directory(
+    contract, monkeypatch, tmp_path
+):
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    real_write = evidence_module.atomic_write_json_no_replace
+
+    def collide_immediately_before_terminal_write(path, document, **kwargs):
+        if path.name == RESULT_FILE:
+            real_write(path, document, **kwargs)
+        return real_write(path, document, **kwargs)
+
+    monkeypatch.setattr(
+        evidence_module,
+        "atomic_write_json_no_replace",
+        collide_immediately_before_terminal_write,
+    )
+
+    with pytest.raises(RuntimeError):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            paths=paths,
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert not (run_directory / RESULT_FILE).exists()
+    quarantines = tuple(run_directory.glob(f".{RESULT_FILE}.quarantine-*"))
+    assert len(quarantines) == 1
+    quarantined = json.loads(quarantines[0].read_bytes())
+    assert quarantined["status"] == "PASS"
+    assert {
+        path.name for path in run_directory.iterdir() if not path.name.startswith(".")
+    } == set(EVIDENCE_ORDER)
