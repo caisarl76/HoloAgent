@@ -1,400 +1,253 @@
-# FSR-VLN and HoloAgent Handover
+# FSR-VLN Stage A Handover
 
-**Status date:** 2026-08-14
-**Outgoing owner:** Jihun
-**Incoming owner:** TBD
-**Scope:** FSR-VLN semantic mapping/retrieval and its HoloAgent/NavAgent integration
+This is the operator contract for transferring and qualifying the fixed-query
+FSR-VLN Stage A runtime on another workstation. It qualifies one detached
+source revision, three content-locked assets, one teammate-managed Python
+environment, and one observation-only query. It does not install software,
+choose a transfer tool, call an external LLM, start ROS, or authorize motion.
 
-## Executive Summary
+Acceptance state: **UNSIGNED — acceptance not yet performed**
 
-FSR-VLN is usable in this workspace as a precomputed HMSG semantic retriever.
-The strongest completed evidence is an observation-only query against the real
-`icra_ic4f` graph:
+## 1. Release and Source Identity
 
-```text
-Query:    Take me to the counter in the pantry
-Floor:    0
-Room:     0_0 Pantry
-Object:   0_0_81 counter
-Frame:    map
-Position: (-21.526786203133774,
-           -15.671372634872082,
-           -0.27579107548158116)
-```
+- Repository: `https://github.com/caisarl76/HoloAgent.git`
+- Release tag: `holoagent0-fsrvln-handover-v1`
+- Accepted implementation commit: UNSIGNED — acceptance not yet performed
+- Stage A source authority: `repository_root/fsr_vln`
+- Required graph-module origin:
+  `repository_root/fsr_vln/memory/hmsg/graph/graph.py`
+- Source lock:
+  `scripts/holoagent0_setup/locks/semantic-source-manifest-v1.json`
 
-This result exercises the real HMSG room/object retrieval and scene-graph to
-`map` coordinate transform. The external natural-language parser is bypassed
-in the deterministic offline fixture. It does **not** prove paper-level VLN
-accuracy, Nav2 goal completion, map alignment, or physical robot behavior.
+The accepted identity is the full 40-character implementation commit recorded
+above after owner acceptance. A branch or tag name alone is not sufficient.
+Until this record is signed with that commit, the commands below describe the
+acceptance procedure but do not assert a completed acceptance.
 
-The workspace also contains earlier multi-query results covering four scenes.
-Those outputs prove that queries completed and returned objects, but they do
-not contain ground-truth correctness, trajectory, SPL, or navigation-success
-metrics.
-
-## Current Readiness
-
-| Capability | Status | Evidence boundary |
-| --- | --- | --- |
-| Tracked FSR-VLN source and Python API | Available | `agentic_robot/fsr_vln/` |
-| Precomputed HMSG semantic retrieval | Reproduced | Four local scenes and fixed Stage 0 query |
-| Exact `icra_ic4f` source/asset lock | Implemented | 74 source paths; graph, dataset, and checkpoint manifests |
-| Static and interactive visualization | Available | PNG and PLY per retrieved candidate |
-| Deterministic external-language parsing | Not complete | Offline fixture bypasses the networked parser |
-| Raw RGB-D to repeatable HMSG rebuild | Not proven | Mapping code and local graph artifacts exist |
-| Paper quantitative result reproduction | Not proven | No ground-truth or trajectory metrics in result files |
-| Full `workstation_offline` acceptance | Not complete | Task 13 runner and Task 14 runbook are not present |
-| FSR-VLN pose sent through aligned Nav2 map | Not proven | Real HMSG and simulation map are deliberately separated |
-| Physical G1 reproduction | Not attempted by this evidence | Stage 0 had motion and Nav2 disabled |
-
-## What the Reproduced Result Contains
-
-### 1. Batch query summary
-
-`fsr_vln/outputs/holoagent_repro_summary.json` is the compact authoritative
-summary of the retained query outputs. It contains:
-
-- 84 primary `auto_region_slow_reasoning` queries across:
-  - `icra_ic3f`: 22 queries;
-  - `icra_ic4f`: 15 queries;
-  - `icra_ic7f`: 24 queries;
-  - `icra_sh3f`: 23 queries.
-- Weighted latency averages for total time, fast matching, object checking,
-  VLM rethinking, and LLM parsing.
-- Two additional `icra_ic4f` comparison modes:
-  - 15 `auto_region_fast_match` queries;
-  - 15 `human_assign_slow_reasoning` queries.
-- Warnings that:
-  - directories ending in `slow_reasonin` are typo runs and must be ignored;
-  - the fast-match code path produced valid rows but zero aggregate timing
-    fields;
-  - these artifacts cover FSR-VLN/NavAgent setup, not full AgentOS behavior.
-
-The six non-typo runs contain 114 query rows. Every retained row has at least
-one returned room and object. This is an execution-completeness observation,
-not a correctness score.
-
-### 2. Per-run `all_results.json`
-
-Each mode directory contains `all_results.json`. Its top-level fields are:
-
-```text
-average_total_time
-average_objectIncheck_time
-average_vlm_rethinking_time
-average_re_matching_time
-average_fastmatching_time
-average_llm_parse_time
-results
-```
-
-Each `results` row contains:
-
-```text
-query
-time_seconds
-floor_id
-rooms[]  -> room_id, name
-objects[] -> object_id
-```
-
-The file records what was returned and how long it took. It does not record
-whether the returned object is ground-truth correct.
-
-### 3. Visual result bundle
-
-`fsr_vln/outputs/fsrvln_eval_visual_report.html` is a static gallery. The
-machine-readable source is
-`fsr_vln/outputs/fsrvln_eval_visual_summary.json`.
-
-For each query, its result directory can contain:
-
-- `scene_0.png` through `scene_4.png`: static views of the top five candidates;
-- `scene_0.ply` through `scene_4.ply`: interactive point clouds;
-- `query_time_consumer.json`: per-stage timing;
-- optional VLM comparison/refinement images.
-
-`scene_0` is the top-ranked candidate, not camera view zero. For the verified
-counter query, `scene_0` corresponds to object `0_0_81`. The red sphere marks
-the retrieved object center in HMSG scene-graph coordinates. The result JSON
-contains the separately transformed `map` coordinate.
-
-The retained visualization is **not** an overlay on the Nav2 occupancy map.
-Do not place this pose on a different map until an explicit frame-alignment
-transform has been measured and validated.
-
-### 4. Reproduction archive
-
-`fsr_vln/outputs/fsr_vln_repro_results.tar.gz` is approximately 1 GB and
-contains 926 result entries. It packages the four canonical slow-reasoning
-output trees and their compact summary. It does not contain source code,
-datasets, or model checkpoints, so it is an output archive rather than a
-self-contained reproduction package.
-
-### 5. Stage 0 semantic recovery evidence
-
-`outputs/mujoco_holoagent/20260722T084234Z/` is the durable evidence directory
-for the observation-only ROS query. Important files are:
-
-- `result.json`: authoritative PASS result and qualification;
-- `query-flow.log`: query publication and captured `/object_pose`;
-- `object-pose.yaml`: captured pose;
-- `blob-verification.tsv`: source verification;
-- `final-verification.txt`: source, checkpoint, process, and no-motion checks;
-- `graph-before-query.txt` and `graph-after-query.txt`: ROS graph observations;
-- `goal-publisher.log`: full semantic-node runtime log.
-
-The result is `PASS_SEMANTIC_RECOVERY`. It records:
-
-- source commit `f164095abb0045a69c0b8eb23683063be3deaa38`;
-- 74 manifest entries and zero blob mismatches;
-- one floor, three rooms, and 497 objects in the selected graph;
-- `ROS_DOMAIN_ID=77` and localhost-only DDS;
-- `motion_enabled=false` and `nav2_started=false`;
-- a finite `map`-frame pose for the fixed query.
-
-It also records a crucial limitation: the ICRA parser called the configured
-chat-completion API even when `NAV_AGENT_USE_GPT=0`. That flag disables
-slow-reasoning retrieval, not language parsing.
-
-### 6. New pinned offline fixture
-
-The feature worktree
-`.worktrees/holoagent0-workstation-pc2-setup` contains the newer deterministic
-fixture implementation:
-
-```text
-scripts/holoagent0_setup/locks/semantic-source-manifest-v1.json
-scripts/holoagent0_setup/locks/icra_ic4f-assets-v1.json
-scripts/holoagent0_setup/holoagent0_setup/source_gate.py
-scripts/holoagent0_setup/holoagent0_setup/semantic_gate.py
-scripts/holoagent0_setup/holoagent0_setup/semantic_fixture_node.py
-```
-
-The lock pins:
-
-| Asset | Count/size | SHA-256 |
-| --- | --- | --- |
-| `icra_ic4f/graph_20260629211448` | 1,229 files | `6e8e27504598c0fe28836b2148ec77732be00ca9cf6d5640f7193332da98e050` |
-| `rgbd_datasets/icra_ic4f` | 5,360 files | `a28fea956a4520330a76d90f75a60f7781602bfd19cd13e510b2574d39b4a913` |
-| `open_clip_pytorch_model.bin` | 1,710,631,365 bytes | `5ddb47339f44e4fd9cace3d3960d38af1b51a25857440cfae90afc44706d7e2b` |
-
-The focused source/semantic tests passed on 2026-08-14: 50 passed. A direct
-real-graph rerun also selected room `0_0`, object `0_0_81`, and the exact pinned
-pose. The full offline CLI and authoritative `PASS_HOLOAGENT0_OFFLINE` result
-are still pending.
-
-## Module Boundaries
-
-### FSR-VLN mapping path
-
-```text
-G1 RGB-D sequence
-  -> OVO semantic instance mapping
-  -> floor/room/object/view segmentation
-  -> HMSG graph
-  -> semantic retrieval and visualization
-```
-
-The maintained tracked implementation is under `agentic_robot/fsr_vln/`.
-Its primary mapping entrypoint is `run_holoagent_mapping.py`; the reusable
-retrieval interface is `api.py::FsrVlnClient`.
-
-### HoloAgent navigation path
-
-```text
-structured semantic command on /chat_loc_pub
-  -> semantic_goal_node
-  -> FsrVlnClient / HMSG lookup
-  -> geometry_msgs/PoseStamped on /object_pose
-  -> nav_executor_node
-  -> Nav2 only after map/frame and safety validation
-```
-
-The tracked implementation is under
-`agentic_robot/core/src/navigation/semantic_goal/`. Its current ROS input is a
-comma-separated `floor, room, object` string; it is not an unrestricted
-natural-language interface.
-
-### Legacy recovered NavAgent path
-
-The untracked `nav_agent/` tree contains the older integration used by Stage 0.
-It loads `fsr_vln/memory/hmsg/graph/Graph` directly, accepts text on
-`/chat_loc_pub`, and publishes `/object_pose`. This path may invoke an external
-LLM parser.
-
-There are therefore two integration paths. The incoming owner should not make
-changes in both without first deciding which path is authoritative.
-
-## Workspace and Asset Warnings
-
-1. `fsr_vln/`, `nav_agent/`, and `outputs/` are untracked local trees on main.
-   A clean clone does not reproduce the demonstrated workspace.
-2. `fsr_vln/checkpoints` and `fsr_vln/rgbd_datasets` are symlinks into
-   `/mnt/data/jihun/HoloAgent/fsr_vln/`.
-3. The asset verifier intentionally requires the literal approved roots:
-   - graph under `/home/jihun/work/HoloAgent/fsr_vln/...`;
-   - dataset and checkpoint under `/mnt/data/jihun/HoloAgent/fsr_vln/...`.
-   Passing the workspace symlink spellings fails closed.
-4. The main worktree contains unrelated modifications and generated build
-   trees. Preserve them and do not use destructive Git cleanup commands.
-5. `.env` is untracked and may contain credentials. Never include it in logs,
-   archives, commits, or handover messages.
-6. The `fsrvln` Conda environment currently reports CUDA unavailable and falls
-   back to CPU. Loading and querying the 1.71 GB CLIP checkpoint can take time.
-7. The public Docker tag documented by NavAgent is `latest`, and no relevant
-   local container/image was present during the 2026-08-14 audit. Pin an image
-   digest before treating Docker setup as reproducible.
-
-## Safe Verification Commands
-
-### Open the visual report
+Clone without submodules, fetch the release tag without recursing into
+submodules, inspect the annotated tag, verify the recorded implementation
+commit is an ancestor of the release, then detach at that exact commit:
 
 ```bash
-xdg-open /home/jihun/work/HoloAgent/fsr_vln/outputs/fsrvln_eval_visual_report.html
+REPOSITORY_URL='https://github.com/caisarl76/HoloAgent.git'
+REPOSITORY_ROOT='<replace with an absolute checkout path>'
+ACCEPTED_IMPLEMENTATION_COMMIT='<replace with the signed 40-character commit>'
+git clone --no-recurse-submodules "$REPOSITORY_URL" "$REPOSITORY_ROOT"
+git -C "$REPOSITORY_ROOT" fetch --no-recurse-submodules origin tag holoagent0-fsrvln-handover-v1
+git -C "$REPOSITORY_ROOT" show --no-patch holoagent0-fsrvln-handover-v1
+git -C "$REPOSITORY_ROOT" merge-base --is-ancestor "$ACCEPTED_IMPLEMENTATION_COMMIT" holoagent0-fsrvln-handover-v1
+git -C "$REPOSITORY_ROOT" checkout --detach "$ACCEPTED_IMPLEMENTATION_COMMIT"
+test "$(git -C "$REPOSITORY_ROOT" rev-parse --verify HEAD)" = "$ACCEPTED_IMPLEMENTATION_COMMIT"
 ```
 
-### Open the verified counter render
+The final `rev-parse` value must equal the accepted implementation commit
+byte-for-byte. Do not continue from a branch tip, a different tag target, or a
+clone made with submodule recursion.
+
+## 2. Roots and Locked Assets
+
+Choose one absolute, normalized, teammate-controlled `data_root` outside the
+repository. Do not put either root inside the other and do not use a symlink
+alias. The CLI accepts only `repository_root` and `data_root`; it derives every
+asset role internally.
+
+| Role | Path | Locked size | Canonical SHA-256 |
+| --- | --- | ---: | --- |
+| Source | `repository_root/fsr_vln` | 73 reviewed paths | source manifest above |
+| Graph | `data_root/fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/graph_20260629211448` | 1,229 files; 150,066,065 bytes | `6e8e27504598c0fe28836b2148ec77732be00ca9cf6d5640f7193332da98e050` |
+| Dataset | `data_root/fsr_vln/rgbd_datasets/icra_ic4f` | 5,360 files; 2,391,476,669 bytes | `a28fea956a4520330a76d90f75a60f7781602bfd19cd13e510b2574d39b4a913` |
+| Checkpoint | `data_root/fsr_vln/checkpoints/open_clip_pytorch_model.bin` | 1 file; 1,710,631,365 bytes | `5ddb47339f44e4fd9cace3d3960d38af1b51a25857440cfae90afc44706d7e2b` |
+
+The complete per-file asset lock at
+`scripts/holoagent0_setup/locks/icra_ic4f-assets-v1.json` is authoritative;
+aggregate counts and root digests are only summaries.
+
+## 3. Transfer and Custody
+
+The custodian chooses and operates a reviewed transfer method; this handover
+does not prescribe a transfer tool. The known outgoing sources are:
+
+```text
+graph:      jihun@jihun-Z590-AORUS-ELITE:/home/jihun/work/HoloAgent/fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/graph_20260629211448
+dataset:    jihun@jihun-Z590-AORUS-ELITE:/mnt/data/jihun/HoloAgent/fsr_vln/rgbd_datasets/icra_ic4f
+checkpoint: jihun@jihun-Z590-AORUS-ELITE:/mnt/data/jihun/HoloAgent/fsr_vln/checkpoints/open_clip_pytorch_model.bin
+```
+
+Before transfer, both owners must confirm that internal transfer is permitted
+by the applicable source, dataset, and checkpoint licenses. Reserve at least 10 GB
+of free space for the assets and staging, excluding the Python environment and
+optional visualizations.
+
+Transfer into a new sibling staging location. Do not use destructive deletion
+against the source or an existing destination. Inspect destination collisions
+before copying, use only a verified resume mode after interruption, and promote
+the completed staging copy on the same filesystem when atomic rename is
+available. Run the verifier against the final paths. Keep Jihun's originals
+unchanged until PASS and custody sign-off, and retain a second verified asset
+copy before repurposing the outgoing workstation or its data disk. Never
+transfer credentials, `.env`, unrelated logs, build trees, or generated output.
+
+## 4. Teammate-Owned Environment Qualification
+
+The incoming owner chooses the environment manager and installation procedure.
+Neither environment YAML is an acceptance authority:
+`fsr_vln/environment.yaml` and `agentic_robot/fsr_vln/environment.yaml` are
+historical inputs only. Environment acceptance comes from observed imports,
+origins, versions, asset verification, and the fixed-query result.
+
+Before loading assets, the verifier attempts and records every required import:
+
+| Distribution | Import module |
+| --- | --- |
+| PyTorch | `torch` |
+| Open3D | `open3d` |
+| OpenCLIP | `open_clip` |
+| NumPy | `numpy` |
+| OmegaConf | `omegaconf` |
+| FAISS | `faiss` |
+| OpenCV | `cv2` |
+| NetworkX | `networkx` |
+| PyVista | `pyvista` |
+| scikit-fmm | `skfmm` |
+| OSS2 | `oss2` |
+| Segment Anything | `segment_anything` |
+
+It also records the OS, architecture, Python executable and version, PyTorch
+version, CUDA build and availability, CPU/GPU label, and exact root-level HMSG
+module origin. Missing or mis-originated dependencies fail qualification. No API
+token, `.env`, OSS credential, chat-completion credential, ROS installation, or
+robot SDK is required.
+
+## 5. Run the One Acceptance Command
+
+Choose a new absolute `run_directory` outside both roots. It must not exist, or
+must be an explicitly empty owner-controlled directory. From the detached
+checkout, run exactly this CLI with its three accepted flags:
 
 ```bash
-xdg-open "/home/jihun/work/HoloAgent/fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/fsrvln_result_online_auto_region_slow_reasoning/Take me to the counter in the pantry/scene_0.png"
+REPOSITORY_ROOT='<replace with the absolute detached checkout path>'
+DATA_ROOT='<replace with the absolute transferred data root>'
+RUN_DIRECTORY='<replace with a new absolute evidence directory>'
+PYTHONPATH="$REPOSITORY_ROOT/scripts/holoagent0_setup" \
+python -m holoagent0_setup.fsrvln_handover \
+  --repository-root "$REPOSITORY_ROOT" \
+  --data-root "$DATA_ROOT" \
+  --run-directory "$RUN_DIRECTORY"
 ```
 
-### Open the verified result interactively
+Do not add separate asset-role arguments or environment-variable fallbacks. The
+verifier checks the checkout and source lock, qualifies the environment,
+verifies the full asset inventory, loads the real root-level HMSG graph, and
+executes `Take me to the counter in the pantry` exactly once without a network
+parser.
 
-```bash
-cd "/home/jihun/work/HoloAgent/fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/fsrvln_result_online_auto_region_slow_reasoning/Take me to the counter in the pantry"
+## 6. Expected Outcome and Evidence
 
-/home/jihun/anaconda3/envs/fsrvln/bin/python -c \
-"import open3d as o3d; p=o3d.io.read_point_cloud('scene_0.ply'); o3d.visualization.draw_geometries([p], window_name='FSR-VLN: counter in pantry')"
-```
+The accepted observation is:
 
-### Re-run source and semantic contract tests
+- Graph counts: 1 floor, 3 rooms, 497 objects
+- Floor: `0`
+- Room: `0_0` (`Pantry`)
+- Object: `0_0_81` (`counter`)
+- Frame: `map`
+- Position:
+  `(-21.526786203133774, -15.671372634872082, -0.27579107548158116)`
+- Position absolute tolerance: `1e-6` per coordinate
+- Orientation: `(0.0, 0.0, 0.0, 1.0)`
 
-```bash
-cd /home/jihun/work/HoloAgent/.worktrees/holoagent0-workstation-pc2-setup
+The structured-query, graph, dataset, checkpoint, and room-name-mapping digests
+must match the reviewed locks. A qualifying run exits zero only after atomically
+publishing these five closed-schema canonical JSON files, with the terminal file
+published last:
 
-PYTHONDONTWRITEBYTECODE=1 \
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-PYTHONPATH=scripts/holoagent0_setup \
-/usr/bin/python3.10 -m pytest -q -p no:cacheprovider \
-  scripts/holoagent0_setup/tests/test_source_gate.py \
-  scripts/holoagent0_setup/tests/test_semantic_gate.py
-```
+1. `environment.json`
+2. `source-verification.json`
+3. `asset-verification.json`
+4. `query-result.json`
+5. `handover-result.json`
 
-Expected: 50 tests pass. This includes full asset-manifest remeasurement and
-may read several gigabytes.
+Optional PNG or PLY visualization is not acceptance evidence and is not a Nav2
+occupancy-map overlay.
 
-### Re-run the deterministic real-graph query
+## 7. Owner Sign-Off Record
 
-```bash
-mkdir -p /tmp/fsrvln-fixture-run /tmp/fsrvln-matplotlib
+Record facts only after both real acceptance runs complete. Do not fill this
+section with an assumed owner, date, path, digest, result, or environment.
 
-MPLCONFIGDIR=/tmp/fsrvln-matplotlib \
-PYTHONDONTWRITEBYTECODE=1 \
-PYTHONPATH="/home/jihun/work/HoloAgent/.worktrees/holoagent0-workstation-pc2-setup/scripts/holoagent0_setup" \
-/home/jihun/anaconda3/envs/fsrvln/bin/python - <<'PY'
-import json
-from pathlib import Path
+- Sign-off state: **UNSIGNED — acceptance not yet performed**
+- Outgoing owner: Jihun
+- Incoming owner: not recorded — acceptance not yet performed
+- Transfer date: not recorded — acceptance not yet performed
+- Acceptance date: not recorded — acceptance not yet performed
+- Accepted absolute `data_root`: not recorded — acceptance not yet performed
+- Environment summary and graph-module origin: not recorded — acceptance not yet performed
+- Evidence-bundle location and digest: not recorded — acceptance not yet performed
+- Final acceptance result: not recorded — acceptance not yet performed
+- Second verified asset copy: not recorded — acceptance not yet performed
 
-from holoagent0_setup.semantic_gate import (
-    EXPECTED_SEMANTIC,
-    evaluate_semantic_fixture,
-    load_real_hmsg_adapter,
-)
-from holoagent0_setup.source_gate import APPROVED_ASSET_ROOTS
+The accepted implementation commit remains the unsigned state at the top until
+the acceptance record is factual. The second-copy confirmation must identify a
+verified copy independent of the outgoing workstation slated for repurposing.
 
-repo = Path("/home/jihun/work/HoloAgent")
-setup = repo / ".worktrees/holoagent0-workstation-pc2-setup/scripts/holoagent0_setup"
+## 8. Failure Interpretation
 
-adapter = load_real_hmsg_adapter(
-    repository_root=repo,
-    asset_source=setup / "locks/icra_ic4f-assets-v1.json",
-    asset_roots=APPROVED_ASSET_ROOTS,
-    run_directory=Path("/tmp/fsrvln-fixture-run"),
-)
-result = evaluate_semantic_fixture(adapter, EXPECTED_SEMANTIC.query)
-print(json.dumps(result.to_document(), indent=2))
-PY
-```
+- Exit `0` means all stages and the terminal evidence policy passed. It is not a
+  paper-level accuracy, navigation, mapping, or robot qualification.
+- Exit `1` means an anticipated source, dependency, asset, graph, query, or
+  evidence failure after the safe run directory was established. Inspect the
+  first blocking reason and all five evidence files; diagnostic files are not
+  acceptance.
+- Exit `2` means command syntax or root/run-directory validation failed before
+  a safe evidence directory existed. Correct the invocation or ownership/path
+  condition; do not weaken a lock.
+- The verifier never repairs, searches for, downloads, or substitutes content.
+  A failed transfer does not authorize editing the lock, and a failed import
+  does not authorize changing the Stage A source tree.
 
-This command is read-only with respect to source/assets and writes only under
-`/tmp`. It does not initialize ROS, Nav2, AgentOS, or robot control.
+## 9. Stage B Boundary
 
-## Known Limitations and Risks
+Raw RGB-D to OVO to HMSG rebuilding, free-text parsing, Nav2 frame alignment,
+MuJoCo, PC2, and physical-robot execution are **NOT QUALIFIED BY THIS
+HANDOVER**. In particular, `agentic_robot/fsr_vln/` is a Stage B candidate and
+is **NOT QUALIFIED BY THIS HANDOVER** as the Stage A runtime. Stage B requires a
+separate design that selects and pins its maintained source, mapping models,
+raw-data layout, rebuild procedure, and comparison criteria.
 
-- **No accuracy claim:** nonempty top-k outputs do not establish correct
-  retrieval.
-- **No paper reproduction claim:** the retained results lack benchmark ground
-  truth and paper-table comparison.
-- **Parser dependence:** historical free-text runs depend on an external
-  chat-completion service; provider/model behavior can change.
-- **Fixture scope:** the deterministic fixture begins after parsing with fixed
-  room/object fields.
-- **Code divergence:** tracked `agentic_robot/fsr_vln/` and untracked
-  `fsr_vln/` are not identical.
-- **Map alignment:** the HMSG `map` frame must not be assumed identical to a
-  Nav2 or MuJoCo map with the same frame name.
-- **No robot evidence:** do not interpret static query evidence as authority to
-  start `g1_pubvel_node`, `g1_pubmove_node`, or `g1_pubcmd_node`.
-- **Incomplete offline integration:** absence of the Task 13 runner means no
-  current end-to-end offline gate order, evidence bundle, or final pass label.
+## Superseded Historical Evidence
 
-## Decisions to Preserve
+Everything below is comparison context, not Stage A authority or acceptance.
+The fixed-query runbook and locks above supersede the older host-bound paths,
+commands, source counts, and ROS result.
 
-1. Keep the real `icra_ic4f` query observation-only until map alignment is
-   independently validated.
-2. Keep natural-language parsing separate from deterministic HMSG retrieval.
-3. Preserve exact source and asset digests; never regenerate and automatically
-   bless a changed lock.
-4. Treat `scene_0` as the top-ranked candidate and `scene_1..4` as alternative
-   candidates, not multiple views of one object.
-5. Keep all robot-motion flags disabled during workstation and semantic tests.
+### Recovered source history
 
-## Recommended Continuation Plan
+The July Stage 0 record used unreachable stash commit
+`f164095abb0045a69c0b8eb23683063be3deaa38`, a 74-path source closure, and a
+host-specific tracked checkpoint symlink. The current lock instead anchors the
+same retained blobs at reachable commit
+`ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8`, removes the asset-location symlink,
+and retains the reviewed `nav_agent/README.md` override from
+`d862782b3661e2f2cf155d6e006f11c27063a6b0`. See the current source manifest and
+`docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md` for the
+explicit supersession record.
 
-- [ ] **P0 — Incoming owner, due TBD:** Decide and document the authoritative
-  FSR-VLN implementation: tracked `agentic_robot/fsr_vln/` or recovered
-  `fsr_vln/`. Define a migration plan for the other tree.
-- [ ] **P0 — Incoming owner, due TBD:** Finish Task 13 offline CLI integration
-  and Task 14 runtime acceptance; produce the first schema-valid authoritative
-  `PASS_HOLOAGENT0_OFFLINE` or explicit failure artifact.
-- [ ] **P0 — Incoming owner, due TBD:** Make the exact source closure and asset
-  acquisition reproducible from a clean clone without relying on undocumented
-  untracked workspace state.
-- [ ] **P1 — Incoming owner, due TBD:** Add ground-truth annotations and
-  correctness metrics for retained queries. Report retrieval accuracy separately
-  from latency.
-- [ ] **P1 — Incoming owner, due TBD:** Pin the LLM provider, model, request
-  schema, and cached parser fixtures, or provide a deterministic local parser.
-- [ ] **P1 — Incoming owner, due TBD:** Validate a transform between the HMSG
-  graph and the intended Nav2 map before creating an overlay or forwarding
-  `/object_pose` to Nav2.
-- [ ] **P2 — Incoming owner, due TBD:** Rebuild at least one HMSG from raw RGB-D
-  using the tracked OVO mapping path and compare graph structure and retrieval
-  quality against the pinned graph.
-- [ ] **P2 — Incoming owner, due TBD:** Pin the Docker image by immutable digest
-  and document an offline dependency/cache strategy.
+### Jihun-host ROS observation
 
-## Open Questions
+The 2026-07-22 observation on Jihun's host used ROS, `ROS_DOMAIN_ID=77`, a
+recovered NavAgent path, and Jihun-specific source and output locations. It
+returned pantry object `0_0_81` with a finite map-frame pose while motion and
+Nav2 were disabled. That result was useful recovery evidence, but its ROS graph,
+74-path identity, host paths, and `PASS_SEMANTIC_RECOVERY` label are superseded
+for this handover. They do not qualify a transferred workstation.
 
-1. Which code tree should own production retrieval after the feature branch is
-   merged?
-2. What ground truth defines a correct target: object instance, semantic class,
-   navigable approach point, or successful robot arrival?
-3. Is the intended next milestone semantic retrieval evaluation, simulator
-   navigation, or real-building map alignment?
-4. Which parser/provider is allowed for reproducible online slow reasoning?
-5. Where will the large datasets/checkpoints be distributed and versioned for
-   the incoming teammate?
+### Historical batch outputs
 
-## Primary References
+Earlier retained runs covered 114 query rows across `icra_ic3f`, `icra_ic4f`,
+`icra_ic7f`, and `icra_sh3f`. They demonstrate completed retrieval calls and
+latency observations, but contain no ground-truth correctness, trajectory, SPL,
+or navigation-success metric. They are not a substitute for the five-file
+Stage A evidence bundle.
 
-- `README.md`
-- `agentic_robot/fsr_vln/README.md`
-- `agentic_robot/fsr_vln/api.py`
-- `agentic_robot/core/src/navigation/README.md`
-- `docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md`
-- `docs/superpowers/plans/2026-07-22-holoagent-stage0-recovery.md`
-- `.worktrees/holoagent0-workstation-pc2-setup/docs/superpowers/specs/2026-07-29-holoagent0-workstation-pc2-setup-design.md`
-- `.worktrees/holoagent0-workstation-pc2-setup/docs/superpowers/plans/2026-08-05-holoagent0-workstation-offline.md`
+Authoritative implementation context is in
+`docs/superpowers/specs/2026-08-18-fsrvln-portable-workstation-handover-design.md`
+and the two reviewed lock files under `scripts/holoagent0_setup/locks/`.

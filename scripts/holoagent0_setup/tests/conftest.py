@@ -1,10 +1,45 @@
 """Shared test helpers for the HoloAgent0 setup package."""
 
+import ctypes
 import os
 from pathlib import Path
 import sys
 
+import pytest
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _child_subreaper_state() -> bool:
+    libc = ctypes.CDLL(None, use_errno=True)
+    value = ctypes.c_int(0)
+    if libc.prctl(37, ctypes.byref(value), 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    return value.value == 1
+
+
+def _set_child_subreaper_state(enabled: bool) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, int(enabled), 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+@pytest.fixture(autouse=True)
+def restore_embedded_provisioner_subreaper_state(request):
+    """Keep embedded provisioner tests from changing later process ownership."""
+
+    test_name = Path(str(request.node.fspath)).name
+    if not test_name.startswith("test_strace_provisioner"):
+        yield
+        return
+    initial_state = _child_subreaper_state()
+    try:
+        yield
+    finally:
+        if _child_subreaper_state() != initial_state:
+            _set_child_subreaper_state(initial_state)
 
 
 def manifest_test_paths(manifest_path: Path) -> tuple[Path, ...]:

@@ -126,6 +126,31 @@ def test_test_manifest_lists_existing_tests_and_rejects_empty_manifest(
         manifest_test_paths(missing_manifest)
 
 
+def test_test_manifest_exactly_lists_every_tracked_test() -> None:
+    package_root = Path(__file__).parents[1]
+    repository_root = package_root.parents[1]
+    tracked = subprocess.run(
+        [
+            "/usr/bin/git",
+            "ls-files",
+            "--",
+            "scripts/holoagent0_setup/tests/test_*.py",
+        ],
+        cwd=repository_root,
+        env={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    ).stdout.splitlines()
+    listed = [
+        str(path.relative_to(repository_root))
+        for path in manifest_test_paths(package_root / "test-manifest-v1.txt")
+    ]
+
+    assert listed == sorted(tracked, key=os.fsencode)
+
+
 @pytest.mark.parametrize("manifest_contents", ["", "\n# no selected tests\n"])
 def test_manifest_entrypoint_rejects_zero_selected_tests(
     tmp_path: Path,

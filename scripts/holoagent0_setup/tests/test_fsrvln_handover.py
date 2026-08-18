@@ -7,6 +7,7 @@ import json
 import os
 from dataclasses import replace
 from pathlib import Path
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -59,6 +60,7 @@ from holoagent0_setup.source_gate import (
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = PACKAGE_ROOT.parents[1]
 STARTED = "2026-08-18T00:00:00.1234567Z"
 FINISHED = "2026-08-18T00:00:01Z"
 GIT_SHA = "a" * 40
@@ -78,6 +80,82 @@ EXPECTED_IMPORTS = (
     ("oss2", "oss2"),
     ("segment-anything", "segment_anything"),
 )
+
+
+def test_documentation_defines_the_closed_unsigned_stage_a_contract():
+    document = (REPOSITORY_ROOT / "docs/FSR_VLN_HOLOAGENT_HANDOVER.md").read_text(
+        encoding="utf-8"
+    )
+    stage_a, marker, history = document.partition("## Superseded Historical Evidence")
+
+    assert marker
+    required_stage_a = (
+        "holoagent0-fsrvln-handover-v1",
+        "Accepted implementation commit: UNSIGNED — acceptance not yet performed",
+        "git clone --no-recurse-submodules",
+        "repository_root/fsr_vln",
+        "fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/graph_20260629211448",
+        "fsr_vln/rgbd_datasets/icra_ic4f",
+        "fsr_vln/checkpoints/open_clip_pytorch_model.bin",
+        GRAPH_ROOT_SHA256,
+        DATASET_ROOT_SHA256,
+        CHECKPOINT_SHA256,
+        "Take me to the counter in the pantry",
+        "Room: `0_0` (`Pantry`)",
+        "Object: `0_0_81` (`counter`)",
+        "(-21.526786203133774, -15.671372634872082, -0.27579107548158116)",
+        "environment.json",
+        "source-verification.json",
+        "asset-verification.json",
+        "query-result.json",
+        "handover-result.json",
+        "at least 10 GB",
+        "Outgoing owner:",
+        "Incoming owner:",
+        "Second verified asset copy:",
+        "UNSIGNED — acceptance not yet performed",
+        "agentic_robot/fsr_vln/",
+        "NOT QUALIFIED BY THIS HANDOVER",
+    )
+    for required in required_stage_a:
+        assert required in stage_a
+
+    command_match = re.search(
+        r"```bash\n(?P<command>[^`]*python -m "
+        r"holoagent0_setup\.fsrvln_handover[^`]*)\n```",
+        stage_a,
+    )
+    assert command_match is not None
+    command = command_match.group("command")
+    assert re.findall(r"--[a-z][a-z-]*", command) == [
+        "--repository-root",
+        "--data-root",
+        "--run-directory",
+    ]
+
+    for forbidden in (
+        "--recursive",
+        "--graph",
+        "--dataset",
+        "--checkpoint",
+        "--asset-lock",
+        "Stage A source: `agentic_robot/fsr_vln`",
+        "Stage A runtime: `agentic_robot/fsr_vln`",
+        "Incoming owner: TBD",
+        "Status: PASS",
+        "Final result: PASS",
+        ".worktrees/holoagent0-workstation-pc2-setup/docs/",
+    ):
+        assert forbidden not in stage_a
+
+    assert "fsr_vln/environment.yaml" in stage_a
+    assert "agentic_robot/fsr_vln/environment.yaml" in stage_a
+    assert "Neither environment YAML is an acceptance authority" in stage_a
+    assert "does not prescribe a transfer tool" in stage_a
+    assert "f164095abb0045a69c0b8eb23683063be3deaa38" in history
+    assert "74" in history
+    assert "ROS" in history
+    assert "Jihun" in history
 
 
 def _identity(path: Path) -> PathIdentity:
