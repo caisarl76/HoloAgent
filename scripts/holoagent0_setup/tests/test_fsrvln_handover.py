@@ -2268,6 +2268,50 @@ def test_cli_outer_audit_tamper_is_recorded_once_and_still_publishes_five_record
     assert terminal["first_blocking_reason"] == "RUNTIME_IMPORT_AUDIT_INVALID"
 
 
+def test_cli_source_blocker_survives_outer_audit_tamper_and_publishes_five_records(
+    monkeypatch, tmp_path, contract
+):
+    cli, _paths, run_directory, calls, captured, _adapter, argv = _install_cli_fakes(
+        monkeypatch, tmp_path, contract
+    )
+    original_import_module = importlib.import_module
+
+    def tamper_import_hook_then_fail(_repository, _lock):
+        calls.append("source_worktree")
+        importlib.import_module = lambda *_args, **_kwargs: None
+        raise SourceGateError("SOURCE_FIRST_BLOCKER", "injected")
+
+    monkeypatch.setattr(cli, "verify_source_worktree", tamper_import_hook_then_fail)
+
+    assert cli.main(argv) == 1
+
+    assert importlib.import_module is original_import_module
+    assert calls == [
+        "paths",
+        "run_directory",
+        "checkout_identity",
+        "source_git_objects",
+        "source_worktree",
+        "environment_evidence",
+        "source_evidence",
+        "asset_evidence",
+        "query_evidence",
+        "terminal_evidence",
+    ]
+    documents = captured["documents"]
+    assert documents[SOURCE_FILE]["status"] == "FAIL"
+    assert documents[SOURCE_FILE]["reason"] == "SOURCE_FIRST_BLOCKER"
+    for filename in (ENVIRONMENT_FILE, ASSET_FILE, QUERY_FILE):
+        assert documents[filename]["status"] == "NOT_RUN"
+        assert documents[filename]["reason"] == "SOURCE_FIRST_BLOCKER"
+    assert sorted(path.name for path in run_directory.iterdir()) == sorted(
+        (*EVIDENCE_ORDER, RESULT_FILE)
+    )
+    terminal = json.loads((run_directory / RESULT_FILE).read_bytes())
+    assert terminal["status"] == "FAIL"
+    assert terminal["first_blocking_reason"] == "SOURCE_FIRST_BLOCKER"
+
+
 @pytest.mark.parametrize(
     "failure",
     (

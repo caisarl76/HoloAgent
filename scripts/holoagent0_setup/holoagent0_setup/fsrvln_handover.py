@@ -105,17 +105,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     runtime_import_audit = RuntimeImportAudit()
     runtime_import_audit.__enter__()
-    runtime_import_audit_blocker_recorded = False
-
-    def require_runtime_imports_allowed() -> None:
-        nonlocal runtime_import_audit_blocker_recorded
-        try:
-            runtime_import_audit.require_allowed()
-        except SemanticGateError as error:
-            if error.reason == "RUNTIME_IMPORT_AUDIT_INVALID":
-                runtime_import_audit_blocker_recorded = True
-            raise
-
     try:
         try:
             paths.revalidate()
@@ -134,7 +123,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "SOURCE_VERIFICATION_MISMATCH",
                     "Git-object and worktree verification results differ",
                 )
-            require_runtime_imports_allowed()
+            runtime_import_audit.require_allowed()
             source_verification = git_verification
             source_status = "PASS"
         except _ANTICIPATED_ERRORS as error:
@@ -144,7 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if blocker is None:
             try:
                 environment_observation = qualify_environment(paths)
-                require_runtime_imports_allowed()
+                runtime_import_audit.require_allowed()
                 environment_status = _stage_status(environment_observation)
                 if environment_status == "FAIL":
                     blocker = _document_reason(environment_observation)
@@ -160,7 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 paths.revalidate()
                 asset_verification = verify_asset_lock(paths)
                 asset_lock_sha256 = sha256_retained_asset_lock(paths)
-                require_runtime_imports_allowed()
+                runtime_import_audit.require_allowed()
                 asset_status = "PASS"
             except _ANTICIPATED_ERRORS as error:
                 blocker = _stable_reason(error)
@@ -180,7 +169,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise
                 else:
                     adapter.__exit__(None, None, None)
-                require_runtime_imports_allowed()
+                runtime_import_audit.require_allowed()
                 forbidden = _new_forbidden_module(initially_loaded)
                 if forbidden is not None:
                     blocker = f"FORBIDDEN_RUNTIME_MODULE: {forbidden}"
@@ -194,9 +183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_import_audit.__exit__(type(error), error, error.__traceback__)
         raise
     else:
-        runtime_import_audit._close(
-            primary_active=runtime_import_audit_blocker_recorded
-        )
+        runtime_import_audit._close(primary_active=blocker is not None)
 
     finished_at = _utc_timestamp()
     source_reason = _stage_reason(source_status, blocker)
