@@ -120,6 +120,16 @@ def _fake_graph_module(origin: Path, graph_type=object):
     return module
 
 
+def _fake_omega_module(origin: Path, omega_conf=None):
+    module = ModuleType("omegaconf")
+    module.OmegaConf = object() if omega_conf is None else omega_conf
+    module.__file__ = str(origin)
+    module.__spec__ = importlib.machinery.ModuleSpec(
+        "omegaconf", loader=None, origin=str(origin)
+    )
+    return module
+
+
 def _memory_module_snapshot():
     return {
         name: module
@@ -399,7 +409,7 @@ def test_root_hmsg_runtime_import_uses_exact_root_origin_and_restores_sys_path(
         if name == "memory.hmsg.graph.graph":
             return graph_module
         if name == "omegaconf":
-            return SimpleNamespace(OmegaConf=omega_conf)
+            return _fake_omega_module(tmp_path / "environment/omegaconf.py", omega_conf)
         raise AssertionError(name)
 
     monkeypatch.setattr(
@@ -429,7 +439,7 @@ def test_root_hmsg_runtime_rejects_agentic_origin(tmp_path, monkeypatch):
     def import_module(name):
         if name == "memory.hmsg.graph.graph":
             return _fake_graph_module(wrong)
-        return SimpleNamespace(OmegaConf=object())
+        return _fake_omega_module(tmp_path / "environment/omegaconf.py")
 
     monkeypatch.setattr(
         "holoagent0_setup.semantic_gate.importlib.import_module", import_module
@@ -452,7 +462,7 @@ def test_root_hmsg_runtime_ignores_and_restores_stale_cached_wrong_module(
     monkeypatch.setitem(
         sys.modules,
         "omegaconf",
-        SimpleNamespace(OmegaConf=object()),
+        _fake_omega_module(tmp_path / "environment/omegaconf.py"),
     )
 
     stale_module = sys.modules["memory.hmsg.graph.graph"]
@@ -479,8 +489,7 @@ def test_root_hmsg_runtime_does_not_execute_competing_regular_memory_package(
     )
     for name in tuple(_memory_module_snapshot()):
         monkeypatch.delitem(sys.modules, name)
-    omega_module = ModuleType("omegaconf")
-    omega_module.OmegaConf = object()
+    omega_module = _fake_omega_module(tmp_path / "environment/omegaconf.py")
     monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
     monkeypatch.syspath_prepend(str(hostile))
     before_path = tuple(sys.path)
@@ -525,6 +534,131 @@ def test_root_hmsg_runtime_does_not_execute_untracked_local_omegaconf_shadow(
     assert tuple(sys.path) == before_path
 
 
+def test_root_hmsg_runtime_excludes_descendant_omegaconf_shadow_and_restores_state(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    fsr_root = paths.repository_root / "fsr_vln"
+    vendor = fsr_root / "vendor"
+    vendor.mkdir()
+    shadow_marker = tmp_path / "vendor-omegaconf-executed"
+    (vendor / "omegaconf.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(shadow_marker)!r}).write_text('executed')\n"
+        "raise RuntimeError('vendor OmegaConf shadow executed')\n",
+        encoding="utf-8",
+    )
+    environment = tmp_path / "environment"
+    environment.mkdir()
+    (environment / "omegaconf.py").write_text(
+        "class OmegaConf:\n    SOURCE = 'environment'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delitem(sys.modules, "omegaconf", raising=False)
+    monkeypatch.syspath_prepend(str(environment))
+    monkeypatch.syspath_prepend(str(vendor))
+    before_path = tuple(sys.path)
+    before_modules = dict(sys.modules)
+
+    graph_module, omega_conf, _origin = import_root_hmsg_runtime(paths)
+
+    assert graph_module.SOURCE == "root"
+    assert omega_conf.SOURCE == "environment"
+    assert not shadow_marker.exists()
+    assert tuple(sys.path) == before_path
+    assert set(sys.modules) == set(before_modules)
+    assert all(sys.modules[name] is module for name, module in before_modules.items())
+
+
+def test_root_hmsg_runtime_replaces_cached_local_omegaconf_then_restores_it(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    fsr_root = paths.repository_root / "fsr_vln"
+    local_omega_path = fsr_root / "omegaconf.py"
+    local_marker = tmp_path / "cached-local-omegaconf-executed"
+    local_omega_path.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(local_marker)!r}).write_text('executed')\n",
+        encoding="utf-8",
+    )
+
+    class CachedLocalOmegaConf:
+        SOURCE = "cached local"
+
+    cached_local = _fake_omega_module(local_omega_path, CachedLocalOmegaConf)
+    monkeypatch.setitem(sys.modules, "omegaconf", cached_local)
+    environment = tmp_path / "environment"
+    environment.mkdir()
+    (environment / "omegaconf.py").write_text(
+        "class OmegaConf:\n    SOURCE = 'environment'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(environment))
+    before_path = tuple(sys.path)
+    before_modules = dict(sys.modules)
+
+    graph_module, omega_conf, _origin = import_root_hmsg_runtime(paths)
+
+    assert graph_module.SOURCE == "root"
+    assert omega_conf.SOURCE == "environment"
+    assert not local_marker.exists()
+    assert tuple(sys.path) == before_path
+    assert set(sys.modules) == set(before_modules)
+    assert all(sys.modules[name] is module for name, module in before_modules.items())
+    assert sys.modules["omegaconf"] is cached_local
+
+
+def test_root_hmsg_runtime_handles_missing_and_non_path_sys_path_entries(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    fsr_root = paths.repository_root / "fsr_vln"
+    environment = tmp_path / "environment"
+    environment.mkdir()
+    (environment / "omegaconf.py").write_text(
+        "class OmegaConf:\n    SOURCE = 'environment'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delitem(sys.modules, "omegaconf", raising=False)
+    opaque_entry = object()
+    before_path = (
+        str(fsr_root / "missing-vendor"),
+        opaque_entry,
+        str(environment),
+        *sys.path,
+    )
+    monkeypatch.setattr(sys, "path", list(before_path))
+
+    graph_module, omega_conf, _origin = import_root_hmsg_runtime(paths)
+
+    assert graph_module.SOURCE == "root"
+    assert omega_conf.SOURCE == "environment"
+    assert tuple(sys.path) == before_path
+
+
+def test_root_hmsg_runtime_requires_omegaconf_filesystem_origin(tmp_path, monkeypatch):
+    paths = _portable_handover_paths(tmp_path)
+    expected = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    graph_module = _fake_graph_module(expected)
+    originless_omega = ModuleType("omegaconf")
+    originless_omega.OmegaConf = object()
+
+    def import_module(name):
+        if name == "memory.hmsg.graph.graph":
+            return graph_module
+        if name == "omegaconf":
+            return originless_omega
+        raise AssertionError(name)
+
+    monkeypatch.setattr(
+        "holoagent0_setup.semantic_gate.importlib.import_module", import_module
+    )
+
+    with pytest.raises(SemanticGateError, match="OmegaConf module.*origin"):
+        import_root_hmsg_runtime(paths)
+
+
 def test_root_hmsg_runtime_isolates_exact_local_perception_from_competing_package(
     tmp_path, monkeypatch
 ):
@@ -550,8 +684,7 @@ def test_root_hmsg_runtime_isolates_exact_local_perception_from_competing_packag
     )
     for name in tuple(_perception_module_snapshot()):
         monkeypatch.delitem(sys.modules, name)
-    omega_module = ModuleType("omegaconf")
-    omega_module.OmegaConf = object()
+    omega_module = _fake_omega_module(tmp_path / "environment/omegaconf.py")
     monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
     monkeypatch.syspath_prepend(str(hostile))
     before_path = tuple(sys.path)
@@ -574,8 +707,7 @@ def test_root_hmsg_runtime_ignores_mixed_cache_and_restores_exact_objects(
     stale_leaf = _fake_graph_module(tmp_path / "stale/graph.py")
     monkeypatch.setitem(sys.modules, "memory", stale_root)
     monkeypatch.setitem(sys.modules, "memory.hmsg.graph.graph", stale_leaf)
-    omega_module = ModuleType("omegaconf")
-    omega_module.OmegaConf = object()
+    omega_module = _fake_omega_module(tmp_path / "environment/omegaconf.py")
     monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
     before_modules = _memory_module_snapshot()
     before_path = tuple(sys.path)
@@ -609,8 +741,7 @@ def test_root_hmsg_runtime_ignores_and_restores_stale_perception_cache(
     stale_helper.SOURCE = "stale perception"
     monkeypatch.setitem(sys.modules, "perception", stale_root)
     monkeypatch.setitem(sys.modules, "perception.helpers", stale_helper)
-    omega_module = ModuleType("omegaconf")
-    omega_module.OmegaConf = object()
+    omega_module = _fake_omega_module(tmp_path / "environment/omegaconf.py")
     monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
     before_modules = _perception_module_snapshot()
     before_path = tuple(sys.path)
@@ -657,8 +788,7 @@ def test_root_hmsg_runtime_restores_state_when_repository_root_drifts_at_boundar
     stale_perception = ModuleType("perception")
     monkeypatch.setitem(sys.modules, "memory", stale_memory)
     monkeypatch.setitem(sys.modules, "perception", stale_perception)
-    omega_module = ModuleType("omegaconf")
-    omega_module.OmegaConf = object()
+    omega_module = _fake_omega_module(tmp_path / "environment/omegaconf.py")
     monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
     before_memory = _memory_module_snapshot()
     before_perception = _perception_module_snapshot()
@@ -715,8 +845,7 @@ def test_root_hmsg_runtime_restores_the_entire_module_cache(tmp_path, monkeypatc
     )
     monkeypatch.delitem(sys.modules, "transient_dependency", raising=False)
     monkeypatch.syspath_prepend(str(environment))
-    omega_module = ModuleType("omegaconf")
-    omega_module.OmegaConf = object()
+    omega_module = _fake_omega_module(tmp_path / "environment/omegaconf.py")
     monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
     before = dict(sys.modules)
 

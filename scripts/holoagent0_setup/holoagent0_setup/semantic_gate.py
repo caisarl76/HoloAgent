@@ -555,6 +555,46 @@ def _validate_root_namespace_module(
         )
 
 
+def _module_filesystem_origins(module: Any) -> tuple[Path, ...]:
+    specification = getattr(module, "__spec__", None)
+    candidates = (
+        getattr(specification, "origin", None),
+        getattr(module, "__file__", None),
+    )
+    origins: list[Path] = []
+    for candidate in candidates:
+        if candidate in {None, "built-in", "frozen", "namespace"}:
+            continue
+        if not isinstance(candidate, str):
+            continue
+        origin = Path(candidate)
+        if not origin.is_absolute():
+            continue
+        resolved = origin.resolve(strict=False)
+        if resolved not in origins:
+            origins.append(resolved)
+    return tuple(origins)
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _environment_import_path_allowed(entry: Any, fsr_root: Path) -> bool:
+    if not isinstance(entry, str):
+        return False
+    try:
+        resolved = Path(entry or ".").resolve(strict=True)
+    except FileNotFoundError:
+        try:
+            resolved = Path(entry or ".").resolve(strict=False)
+        except (OSError, RuntimeError):
+            return False
+    except (OSError, RuntimeError):
+        return False
+    return not _path_is_within(resolved, fsr_root)
+
+
 def import_root_hmsg_runtime(
     paths: HandoverPaths,
 ) -> tuple[Any, Any, Path]:
@@ -606,13 +646,36 @@ def import_root_hmsg_runtime(
                 "HANDOVER_PATH_IDENTITY_CHANGED",
                 f"repository-local HMSG source root: {error}",
             ) from error
+        cached_local_omega = {
+            name
+            for name, module in sys.modules.items()
+            if (name == "omegaconf" or name.startswith("omegaconf."))
+            and any(
+                _path_is_within(origin, fsr_resolved)
+                for origin in _module_filesystem_origins(module)
+            )
+        }
+        if "omegaconf" in cached_local_omega:
+            cached_local_omega = {
+                name
+                for name in sys.modules
+                if name == "omegaconf" or name.startswith("omegaconf.")
+            }
+        for name in cached_local_omega:
+            sys.modules.pop(name, None)
         sys.path[:] = [
             entry
             for entry in sys.path
-            if Path(entry or ".").resolve(strict=False) != fsr_resolved
+            if _environment_import_path_allowed(entry, fsr_resolved)
         ]
         graph_module = importlib.import_module("memory.hmsg.graph.graph")
-        OmegaConf = importlib.import_module("omegaconf").OmegaConf
+        omega_module = importlib.import_module("omegaconf")
+        omega_origins = _module_filesystem_origins(omega_module)
+        if not omega_origins:
+            raise ValueError("OmegaConf module has no filesystem origin")
+        if any(_path_is_within(origin, fsr_resolved) for origin in omega_origins):
+            raise ValueError(f"unexpected OmegaConf module origin: {omega_origins!r}")
+        OmegaConf = omega_module.OmegaConf
         specification = getattr(graph_module, "__spec__", None)
         raw_origin = getattr(specification, "origin", None) or getattr(
             graph_module, "__file__", None
