@@ -15,7 +15,6 @@ from typing import Callable, Literal, NoReturn, Sequence
 
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _RUN_ID_PATTERN = re.compile(r"workstation-offline-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}\Z")
-_RUN_ROOT_AUTHORITY_SEAL = object()
 
 
 class InvocationError(ValueError):
@@ -141,30 +140,14 @@ class RunRootAuthority:
         "_consumed",
         "_effective_uid",
         "_expected_run_root",
+        "_output_root",
         "_output_root_fd",
         "_output_root_identity",
         "_run_basename",
     )
 
-    def __init__(
-        self,
-        *,
-        output_root_fd: int,
-        output_root_identity: tuple[int, int],
-        expected_run_root: Path,
-        run_basename: str,
-        effective_uid: int,
-        _seal: object | None = None,
-    ) -> None:
-        self._consumed = True
-        if _seal is not _RUN_ROOT_AUTHORITY_SEAL:
-            raise InvocationError("run root authority construction is private")
-        self._output_root_fd = output_root_fd
-        self._output_root_identity = output_root_identity
-        self._expected_run_root = expected_run_root
-        self._run_basename = run_basename
-        self._effective_uid = effective_uid
-        self._consumed = False
+    def __new__(cls, *_args: object, **_kwargs: object) -> "RunRootAuthority":
+        raise InvocationError("run root authority must be opened")
 
     @classmethod
     def open(
@@ -190,14 +173,16 @@ class RunRootAuthority:
                 effective_uid=observed_uid,
                 create_final=True,
             )
-            return cls(
-                output_root_fd=descriptor,
-                output_root_identity=identity,
-                expected_run_root=absolute_root / run_basename,
-                run_basename=run_basename,
-                effective_uid=observed_uid,
-                _seal=_RUN_ROOT_AUTHORITY_SEAL,
-            )
+            authority = object.__new__(RunRootAuthority)
+            authority._consumed = True
+            authority._effective_uid = observed_uid
+            authority._expected_run_root = absolute_root / run_basename
+            authority._output_root = absolute_root
+            authority._output_root_fd = descriptor
+            authority._output_root_identity = identity
+            authority._run_basename = run_basename
+            authority._consumed = False
+            return authority
         except Exception:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -212,6 +197,14 @@ class RunRootAuthority:
         return self._consumed
 
     def _validate_retained_output_root(self, descriptor: int) -> None:
+        if (
+            type(self._effective_uid) is not int
+            or self._effective_uid != os.geteuid()
+            or type(self._output_root_identity) is not tuple
+            or len(self._output_root_identity) != 2
+            or any(type(value) is not int for value in self._output_root_identity)
+        ):
+            raise InvocationError("retained output root authority is invalid")
         retained = os.fstat(descriptor)
         _validate_output_root(retained, self._effective_uid)
         if (retained.st_dev, retained.st_ino) != self._output_root_identity:
@@ -219,7 +212,7 @@ class RunRootAuthority:
         observed_fd = -1
         try:
             observed_fd, observed_identity = _open_output_root(
-                self._expected_run_root.parent,
+                self._output_root,
                 effective_uid=self._effective_uid,
                 create_final=False,
             )
@@ -230,15 +223,21 @@ class RunRootAuthority:
                 os.close(observed_fd)
 
     def create(self, expected_run_root: Path | str) -> Path:
-        if self._consumed:
+        if getattr(self, "_consumed", True):
             raise InvocationError("run root authority is already consumed")
         self._consumed = True
-        descriptor = self._output_root_fd
+        descriptor = getattr(self, "_output_root_fd", -1)
         self._output_root_fd = -1
         child_fd = -1
         try:
             if (
-                not isinstance(expected_run_root, (str, os.PathLike))
+                type(self._run_basename) is not str
+                or _RUN_ID_PATTERN.fullmatch(self._run_basename) is None
+                or not isinstance(self._output_root, Path)
+                or not self._output_root.is_absolute()
+                or not isinstance(self._expected_run_root, Path)
+                or self._expected_run_root != self._output_root / self._run_basename
+                or not isinstance(expected_run_root, (str, os.PathLike))
                 or Path(expected_run_root) != self._expected_run_root
             ):
                 raise InvocationError("run root path is not authorized")
@@ -263,7 +262,7 @@ class RunRootAuthority:
             return self._expected_run_root
         except InvocationError:
             raise
-        except OSError as error:
+        except (AttributeError, OSError, TypeError, ValueError) as error:
             raise InvocationError("run root creation failed") from error
         finally:
             if child_fd >= 0:
@@ -272,10 +271,10 @@ class RunRootAuthority:
                 os.close(descriptor)
 
     def close(self) -> None:
-        if self._consumed:
+        if getattr(self, "_consumed", True):
             return
         self._consumed = True
-        descriptor = self._output_root_fd
+        descriptor = getattr(self, "_output_root_fd", -1)
         self._output_root_fd = -1
         if descriptor >= 0:
             os.close(descriptor)

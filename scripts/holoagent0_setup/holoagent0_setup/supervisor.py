@@ -106,7 +106,7 @@ _TRACKED_MANIFEST_AUTHORITY_REPO_PATH = (
 )
 _TRACKED_MANIFEST_SELF_OID = "SELF"
 _TRACKED_FILE_MANIFEST_SHA256 = (
-    "ab50d0f51cd1c5856a571361e58cbc43e98fac0badba4d41672164e3c9de69bc"
+    "078767f5e5a4e571dda8b7f640e80de0fa7306d58bbfcc838e76f9cf64abcf13"
 )
 _SAFETY_FACT_REASONS = {
     "safety.workstation_preflight": frozenset(
@@ -1643,20 +1643,21 @@ class BootstrapRuntime:
     def run(self, invocation: BootstrapInvocation) -> BootstrapState:
         if type(invocation) is not BootstrapInvocation:
             raise SupervisorError("bootstrap invocation is not exact")
-        run_root = Path(invocation.run_root)
+        authority: RunRootAuthority | None = None
         signal_runtime: SupervisorSignalRuntime | None = None
-        started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        started_monotonic = time.monotonic()
         try:
+            authority = invocation.run_root_authority
+            run_root = Path(invocation.run_root)
+            started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            started_monotonic = time.monotonic()
             if (
                 self._require_run_root_authority
-                and type(invocation.run_root_authority) is not RunRootAuthority
+                and type(authority) is not RunRootAuthority
             ):
                 raise SupervisorError("production run root authority is missing")
             if (
                 self._require_run_root_authority
-                and invocation.run_id
-                != invocation.run_root_authority.expected_run_root.name
+                and invocation.run_id != authority.expected_run_root.name
             ):
                 raise SupervisorError("production run id authority is inconsistent")
             signal_runtime = (
@@ -1669,7 +1670,7 @@ class BootstrapRuntime:
             if self._require_complete_report:
                 _validate_bootstrap_report_inputs(invocation.bootstrap_report)
             if self._require_run_root_authority:
-                run_root = invocation.run_root_authority.create(run_root)
+                run_root = authority.create(run_root)
             else:
                 run_root.mkdir(mode=0o700, parents=False, exist_ok=False)
             ledger = LedgerStore.create(
@@ -1747,7 +1748,6 @@ class BootstrapRuntime:
             )
         except Exception as error:
             cleanup_error: BaseException | None = None
-            authority = invocation.run_root_authority
             if (
                 self._require_run_root_authority
                 and type(authority) is RunRootAuthority

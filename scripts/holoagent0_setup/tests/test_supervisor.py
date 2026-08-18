@@ -711,6 +711,41 @@ def test_production_bootstrap_binds_run_id_to_run_root_authority(
     assert not run_root.exists()
 
 
+class _ExplodingRunRoot:
+    def __fspath__(self):
+        raise RuntimeError("injected run-root conversion failure")
+
+
+@pytest.mark.parametrize("invalid_run_root", [None, _ExplodingRunRoot()])
+def test_production_bootstrap_closes_authority_when_run_root_conversion_fails(
+    tmp_path, reviewed_trace_contract, invalid_run_root
+):
+    run_root, run_id, authority = _production_run_root(
+        tmp_path, f"invalid-run-root-{type(invalid_run_root).__name__}"
+    )
+    descriptor = authority._output_root_fd
+
+    with pytest.raises(SupervisorError, match="zero-state"):
+        BootstrapRuntime(
+            reviewed_trace_contract,
+            require_run_root_authority=True,
+        ).run(
+            BootstrapInvocation(
+                run_root=invalid_run_root,
+                run_id=run_id,
+                run_nonce="a" * 64,
+                facts=BootstrapFacts.clean(),
+                bootstrap_report=_complete_bootstrap_inputs(),
+                run_root_authority=authority,
+            )
+        )
+
+    assert authority.consumed is True
+    assert not run_root.exists()
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
 def test_bootstrap_state_retains_dynamic_owned_tracee_authority(
     tmp_path, process_identities
 ):

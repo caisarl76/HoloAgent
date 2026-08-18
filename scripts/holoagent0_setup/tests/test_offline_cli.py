@@ -21,6 +21,7 @@ from holoagent0_setup.invocation import (
 
 
 _RUN_ID = "workstation-offline-20260818T010203Z-0123456789abcdef0123456789abcdef"
+_OTHER_RUN_ID = "workstation-offline-20260818T010203Z-fedcba9876543210fedcba9876543210"
 
 
 def _owned_output_root(parent: Path, name: str = "offline-output") -> Path:
@@ -276,15 +277,105 @@ def test_run_root_authority_cannot_be_forged_by_direct_construction(tmp_path):
     expected = authority.expected_run_root
     effective_uid = authority._effective_uid
     authority.close()
+    exposed_seal = getattr(invocation_module, "_RUN_ROOT_AUTHORITY_SEAL", None)
+    constructor_fields = {
+        "output_root_fd": descriptor,
+        "output_root_identity": identity,
+        "expected_run_root": expected,
+        "run_basename": _RUN_ID,
+        "effective_uid": effective_uid,
+    }
+    if exposed_seal is not None:
+        constructor_fields["_seal"] = exposed_seal
 
     with pytest.raises(InvocationError):
-        RunRootAuthority(
-            output_root_fd=descriptor,
-            output_root_identity=identity,
-            expected_run_root=expected,
-            run_basename=_RUN_ID,
-            effective_uid=effective_uid,
-        )
+        RunRootAuthority(**constructor_fields)
+
+
+def _forge_run_root_authority(
+    output_root: Path,
+    *,
+    run_basename: str,
+    expected_run_root: Path,
+    identity_offset: int = 0,
+) -> tuple[RunRootAuthority, int]:
+    descriptor = os.open(
+        output_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    observed = os.fstat(descriptor)
+    authority = object.__new__(RunRootAuthority)
+    authority._consumed = False
+    authority._effective_uid = os.geteuid()
+    authority._expected_run_root = expected_run_root
+    authority._output_root_fd = descriptor
+    authority._output_root_identity = (
+        observed.st_dev,
+        observed.st_ino + identity_offset,
+    )
+    authority._run_basename = run_basename
+    if "_output_root" in RunRootAuthority.__slots__:
+        authority._output_root = output_root
+    return authority, descriptor
+
+
+def test_run_root_authority_revalidates_forged_unsafe_basename_before_mkdir(
+    tmp_path,
+):
+    output_root = _owned_output_root(tmp_path)
+    invalid_run_root = output_root / "not-a-generated-run-id"
+    authority, descriptor = _forge_run_root_authority(
+        output_root,
+        run_basename=invalid_run_root.name,
+        expected_run_root=invalid_run_root,
+    )
+
+    with pytest.raises(InvocationError):
+        authority.create(invalid_run_root)
+
+    assert authority.consumed is True
+    assert not invalid_run_root.exists()
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_run_root_authority_recomputes_forged_expected_path_before_mkdir(tmp_path):
+    output_root = _owned_output_root(tmp_path)
+    actual_run_root = output_root / _RUN_ID
+    claimed_run_root = output_root / _OTHER_RUN_ID
+    authority, descriptor = _forge_run_root_authority(
+        output_root,
+        run_basename=_RUN_ID,
+        expected_run_root=claimed_run_root,
+    )
+
+    with pytest.raises(InvocationError):
+        authority.create(claimed_run_root)
+
+    assert authority.consumed is True
+    assert not actual_run_root.exists()
+    assert not claimed_run_root.exists()
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_run_root_authority_revalidates_forged_identity_before_mkdir(tmp_path):
+    output_root = _owned_output_root(tmp_path)
+    run_root = output_root / _RUN_ID
+    authority, descriptor = _forge_run_root_authority(
+        output_root,
+        run_basename=_RUN_ID,
+        expected_run_root=run_root,
+        identity_offset=1,
+    )
+
+    with pytest.raises(InvocationError):
+        authority.create(run_root)
+
+    assert authority.consumed is True
+    assert not run_root.exists()
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
 def test_run_root_authority_creates_exact_mode_and_consumes_descriptor(tmp_path):
