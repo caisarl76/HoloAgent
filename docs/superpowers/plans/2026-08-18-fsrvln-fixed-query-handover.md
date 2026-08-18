@@ -670,7 +670,7 @@ This must fail on the currently omitted `test_offline_cli.py` and the new `test_
 
 - [ ] **Step 2: Add a documentation command-contract test**
 
-Require the handover’s Stage A section to contain the literal module entry point and all three allowed flags, the exact tag, source implementation SHA field, graph/dataset/checkpoint relative paths and digests, expected room/object/pose, five evidence filenames, `--no-recurse-submodules`, and explicit `NOT QUALIFIED BY THIS HANDOVER` language for Stage B. Assert it does not call either environment YAML authoritative, instruct `--recursive`, expose individual role flags, or say `agentic_robot/fsr_vln` is Stage A.
+Require the handover’s Stage A section to contain the literal module entry point and all three allowed flags, the exact tag, source implementation SHA field, graph/dataset/checkpoint relative paths and digests, expected room/object/pose, five evidence filenames, `--no-recurse-submodules`, and explicit `NOT QUALIFIED BY THIS HANDOVER` language for Stage B. Assert it does not call either environment YAML authoritative, instruct `--recursive`, expose individual role flags, say `agentic_robot/fsr_vln` is Stage A, or retain a legacy reference to a file that does not exist.
 
 - [ ] **Step 3: Run the tests and confirm manifest/docs failures**
 
@@ -708,6 +708,8 @@ Rewrite the top of `docs/FSR_VLN_HOLOAGENT_HANDOVER.md` into this operator order
 
 Do not invent an incoming owner, transfer date, data root, or PASS. Before actual sign-off, label the record `UNSIGNED — acceptance not yet performed`; this is a state, not a placeholder. Preserve useful historical results only below the authoritative Stage A runbook and clearly label old `f164095…`, 74-path, ROS, and Jihun-host paths as superseded history.
 
+Remove absent legacy file references rather than carrying them into the rewritten handover. A replacement is allowed only when the referenced file exists and is the correct authority for the surrounding statement.
+
 - [ ] **Step 5: Run the documentation and manifest tests**
 
 ```bash
@@ -732,12 +734,13 @@ git add scripts/holoagent0_setup/test-manifest-v1.txt \
 git commit -m "docs: publish FSR-VLN Stage A handover runbook"
 ```
 
-## Task 9: Qualify the Complete Suite and Real Transferred Assets
+## Task 9: Freeze the Implementation and Qualify the Real Handover
 
 **Files:**
 
-- Modify if defects are found: only the files already listed in Tasks 2–8
-- Modify after an actual accepted run: `docs/FSR_VLN_HOLOAGENT_HANDOVER.md`
+- Modify before the freeze if defects are found: only the files already listed in Tasks 2–8
+- Verify after the freeze: every file changed in Tasks 1–8
+- Do not modify after the freeze: any repository file, including the handover
 - Do not commit: the external data root or run-directory evidence
 
 - [ ] **Step 1: Run the complete tracked test manifest**
@@ -749,9 +752,26 @@ PYTHONPATH=scripts/holoagent0_setup \
   scripts/holoagent0_setup/test-manifest-v1.txt
 ```
 
-Expected: zero failures and no deselected tracked test files. If a failure exposes a defect, add the narrowest regression test, fix it, rerun the affected file, then rerun the manifest and commit that focused fix.
+Expected: zero failures and no deselected tracked test files. If a failure exposes a defect, add the narrowest regression test, fix it, rerun the affected file, then rerun the manifest and commit that focused fix before continuing.
 
-- [ ] **Step 2: Have the asset custodian prepare the unified external data root**
+- [ ] **Step 2: Freeze and capture the candidate implementation commit**
+
+```bash
+WORKTREE_STATUS="$(git status --short)"
+printf '%s' "$WORKTREE_STATUS"
+test -z "$WORKTREE_STATUS"
+IMPLEMENTATION_SHA="$(git rev-parse HEAD)"
+printf '%s\n' "$IMPLEMENTATION_SHA"
+printf '%s\n' "$IMPLEMENTATION_SHA" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
+git merge-base --is-ancestor ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8 "$IMPLEMENTATION_SHA"
+git merge-base --is-ancestor d862782b3661e2f2cf155d6e006f11c27063a6b0 "$IMPLEMENTATION_SHA"
+```
+
+Expected: the worktree is clean, one literal 40-character candidate SHA is printed, and both provenance commits are reachable. Copy that exact printed value into the acceptance record outside the repository. Every later `IMPLEMENTATION_SHA` assignment must use that captured literal; do not recalculate it from a branch that could move.
+
+This successful check starts the acceptance freeze. Do not edit, stage, commit, merge, or otherwise change any repository file until the clean-clone qualification, Jihun run, and incoming-owner run below have all completed against this exact SHA. If any code, lock, test, or runbook implementation defect is found, invalidate all evidence for this candidate, make and commit the focused fix, then restart Task 9 at Step 1 with a new candidate SHA and repeat every acceptance run.
+
+- [ ] **Step 3: Have the asset custodian prepare the unified external data root**
 
 This is an explicit owner-operation checkpoint, not an automated repository step. The custodian chooses the safe copy/resume tool, stages without destructive deletion, inspects collisions, promotes the complete copy, retains Jihun’s originals, and reports the final absolute `data_root`. For the current workstation qualification, the intended root is:
 
@@ -769,33 +789,47 @@ Before continuing, these exact derived paths must exist as real, non-aliased ent
 
 Do not create repository symlinks. Do not proceed if transfer permission/license confirmation or the required second-copy plan is unresolved.
 
-- [ ] **Step 3: Run the real CLI in Jihun’s historical environment as a comparison qualification**
+- [ ] **Step 4: Qualify a clean detached clone and run Jihun’s real comparison**
+
+Replace the quoted instruction value below with the exact literal SHA captured in Step 2 before running the block.
 
 ```bash
-FSRVLN_REPOSITORY=/home/jihun/work/HoloAgent/.worktrees/holoagent0-workstation-pc2-setup
+IMPLEMENTATION_SHA='<paste the exact 40-character SHA printed in Step 2>'
+printf '%s\n' "$IMPLEMENTATION_SHA" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
+CLEAN_PARENT="$(mktemp -d /tmp/fsrvln-clean-clone.XXXXXX)"
+CLEAN_REPOSITORY="$CLEAN_PARENT/HoloAgent"
 FSRVLN_DATA=/mnt/data/jihun/HoloAgent
 FSRVLN_RUN="$(mktemp -d /tmp/fsrvln-handover-jihun.XXXXXX)"
 
+git clone --no-recurse-submodules --no-local \
+  /home/jihun/work/HoloAgent "$CLEAN_REPOSITORY"
+git -C "$CLEAN_REPOSITORY" checkout --detach "$IMPLEMENTATION_SHA"
+test "$(git -C "$CLEAN_REPOSITORY" rev-parse HEAD)" = "$IMPLEMENTATION_SHA"
+git -C "$CLEAN_REPOSITORY" merge-base --is-ancestor \
+  ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8 HEAD
+git -C "$CLEAN_REPOSITORY" submodule status
+
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$CLEAN_REPOSITORY/scripts/holoagent0_setup" \
+/usr/bin/python3.10 "$CLEAN_REPOSITORY/scripts/holoagent0_setup/tests/conftest.py" \
+  "$CLEAN_REPOSITORY/scripts/holoagent0_setup/test-manifest-v1.txt"
+
 MPLCONFIGDIR="$FSRVLN_RUN/.matplotlib" \
 PYTHONDONTWRITEBYTECODE=1 \
-PYTHONPATH="$FSRVLN_REPOSITORY/scripts/holoagent0_setup" \
+PYTHONPATH="$CLEAN_REPOSITORY/scripts/holoagent0_setup" \
 /home/jihun/anaconda3/envs/fsrvln/bin/python -m holoagent0_setup.fsrvln_handover \
-  --repository-root "$FSRVLN_REPOSITORY" \
+  --repository-root "$CLEAN_REPOSITORY" \
   --data-root "$FSRVLN_DATA" \
   --run-directory "$FSRVLN_RUN"
-```
 
-Expected: exit 0 after reading all 6,590 locked asset files and the 1.71 GB checkpoint; no ROS/LLM/robot process starts; the run directory contains the five required JSON files.
-
-- [ ] **Step 4: Independently inspect the real result and canonical evidence**
-
-```bash
-/home/jihun/anaconda3/envs/fsrvln/bin/python - "$FSRVLN_RUN" <<'PY'
+/home/jihun/anaconda3/envs/fsrvln/bin/python - \
+  "$FSRVLN_RUN" "$IMPLEMENTATION_SHA" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 root = Path(sys.argv[1])
+implementation_sha = sys.argv[2]
 names = (
     "environment.json",
     "source-verification.json",
@@ -805,7 +839,10 @@ names = (
 )
 assert tuple(path.name for path in sorted(root.glob("*.json"))) == tuple(sorted(names))
 documents = {name: json.loads((root / name).read_text()) for name in names}
-assert documents["handover-result.json"]["status"] == "PASS"
+assert documents["source-verification.json"]["checkout_commit"] == implementation_sha
+terminal = documents["handover-result.json"]
+assert terminal["accepted_implementation_commit"] == implementation_sha
+assert terminal["status"] == "PASS"
 query = documents["query-result.json"]
 assert query["execution_count"] == 1
 assert query["result"]["room"] == {"id": "0_0", "name": "Pantry"}
@@ -815,81 +852,126 @@ assert query["result"]["position"] == [
     -15.671372634872082,
     -0.27579107548158116,
 ]
-print(documents["handover-result.json"]["bundle_sha256"])
+print(implementation_sha)
+print(terminal["bundle_sha256"])
 PY
+
+test "$(git -C "$CLEAN_REPOSITORY" rev-parse HEAD)" = "$IMPLEMENTATION_SHA"
+test -z "$(git -C "$CLEAN_REPOSITORY" status --short)"
 ```
 
-Expected: assertions pass and one bundle SHA-256 is printed.
+Expected: the exact candidate is detached in a clean non-recursive clone, the complete manifest passes there, and the CLI exits 0 after reading all 6,590 locked asset files and the 1.71 GB checkpoint. No ROS/LLM/robot process starts. The five canonical evidence files record the exact candidate SHA, fixed query result, terminal PASS, and printed bundle digest.
 
-- [ ] **Step 5: Repeat on the incoming owner’s machine and actual non-Jihun root**
+- [ ] **Step 5: Repeat the real run from the exact candidate on the incoming owner’s machine**
 
-The incoming owner uses their chosen Python executable and transferred absolute `data_root`, but the documented module command and three flags remain unchanged. Acceptance requires a second exit-0 bundle whose graph, dataset, checkpoint, structured-query, and room-mapping digests match the lock. Record the actual incoming owner, transfer/acceptance dates, repository URL, exact data root, environment summary, graph-module origin, evidence-bundle location/digest, PASS state, and second-copy confirmation in the handover.
-
-If the incoming-owner run is unavailable, stop here. Unit tests and Jihun’s comparison run do not authorize a signed release on the teammate’s behalf.
-
-- [ ] **Step 6: Commit only the factual acceptance record**
+The incoming owner must replace all five quoted instruction values below. `IMPLEMENTATION_SHA` is the exact literal captured in Step 2, not the current tip of a branch. `REPOSITORY_SOURCE` is an authorized URL, Git bundle, or repository path that already contains that exact candidate; obtaining it must not change the frozen candidate.
 
 ```bash
-git add docs/FSR_VLN_HOLOAGENT_HANDOVER.md
-git diff --cached --check
-git commit -m "docs: record accepted FSR-VLN handover run"
+IMPLEMENTATION_SHA='<paste the exact 40-character SHA printed in Step 2>'
+REPOSITORY_SOURCE='<authorized source containing the exact candidate>'
+REPOSITORY_URL='https://github.com/caisarl76/HoloAgent.git'
+PYTHON='<incoming owner qualified Python executable>'
+DATA_ROOT='<incoming owner absolute transferred data root>'
+printf '%s\n' "$IMPLEMENTATION_SHA" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
+CLONE_PARENT="$(mktemp -d /tmp/fsrvln-owner-clone.XXXXXX)"
+OWNER_REPOSITORY="$CLONE_PARENT/HoloAgent"
+RUN_DIRECTORY="$(mktemp -d /tmp/fsrvln-handover-owner.XXXXXX)"
+
+git clone --no-recurse-submodules "$REPOSITORY_SOURCE" "$OWNER_REPOSITORY"
+git -C "$OWNER_REPOSITORY" checkout --detach "$IMPLEMENTATION_SHA"
+test "$(git -C "$OWNER_REPOSITORY" rev-parse HEAD)" = "$IMPLEMENTATION_SHA"
+
+MPLCONFIGDIR="$RUN_DIRECTORY/.matplotlib" \
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH="$OWNER_REPOSITORY/scripts/holoagent0_setup" \
+"$PYTHON" -m holoagent0_setup.fsrvln_handover \
+  --repository-root "$OWNER_REPOSITORY" \
+  --data-root "$DATA_ROOT" \
+  --run-directory "$RUN_DIRECTORY"
+
+"$PYTHON" - "$RUN_DIRECTORY" "$IMPLEMENTATION_SHA" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+implementation_sha = sys.argv[2]
+source = json.loads((root / "source-verification.json").read_text())
+terminal = json.loads((root / "handover-result.json").read_text())
+assert source["checkout_commit"] == implementation_sha
+assert terminal["accepted_implementation_commit"] == implementation_sha
+assert terminal["status"] == "PASS"
+print(implementation_sha)
+print(terminal["bundle_sha256"])
+PY
+
+test "$(git -C "$OWNER_REPOSITORY" rev-parse HEAD)" = "$IMPLEMENTATION_SHA"
+test -z "$(git -C "$OWNER_REPOSITORY" status --short)"
 ```
 
-Expected: the commit contains factual sign-off metadata only; it contains no transferred assets, evidence bundle, credentials, environment dump, placeholder, or unrelated workspace file. This commit becomes the candidate accepted implementation commit.
+Acceptance requires this second exit-0 bundle to record the exact candidate SHA and to match the lock’s graph, dataset, checkpoint, structured-query, and room-mapping digests. Preserve outside the repository the actual incoming owner, transfer/acceptance dates, repository URL, exact data root, environment summary, graph-module origin, evidence-bundle location/digest, PASS state, and second-copy confirmation.
 
-## Task 10: Verify a Clean Clone and Publish the Immutable Release
+If the incoming-owner run is unavailable, stop here. The manifest, clean-clone qualification, and Jihun comparison do not authorize a signed release on the teammate’s behalf.
 
-**Files:**
+- [ ] **Step 6: Confirm the frozen candidate and acceptance gate**
 
-- Modify: `docs/FSR_VLN_HOLOAGENT_HANDOVER.md`
-- Verify: every file changed in Tasks 1–9
-
-- [ ] **Step 1: Capture and audit the candidate implementation commit**
-
-```bash
-git status --short
-IMPLEMENTATION_SHA="$(git rev-parse HEAD)"
-test "$(printf '%s' "$IMPLEMENTATION_SHA" | wc -c)" -eq 40
-git merge-base --is-ancestor ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8 "$IMPLEMENTATION_SHA"
-git merge-base --is-ancestor d862782b3661e2f2cf155d6e006f11c27063a6b0 "$IMPLEMENTATION_SHA"
-```
-
-Expected: clean worktree, a 40-character commit, and both provenance commits reachable.
-
-- [ ] **Step 2: Test the implementation commit from a clean non-recursive clone**
-
-```bash
-IMPLEMENTATION_SHA="$(git rev-parse HEAD)"
-CLEAN_PARENT="$(mktemp -d /tmp/fsrvln-clean-clone.XXXXXX)"
-git clone --no-recurse-submodules --no-local \
-  --branch feat/holoagent0-workstation-pc2-setup \
-  /home/jihun/work/HoloAgent "$CLEAN_PARENT/HoloAgent"
-cd "$CLEAN_PARENT/HoloAgent"
-git checkout --detach "$IMPLEMENTATION_SHA"
-git merge-base --is-ancestor ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8 HEAD
-git submodule status
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts/holoagent0_setup \
-/usr/bin/python3.10 scripts/holoagent0_setup/tests/conftest.py \
-  scripts/holoagent0_setup/test-manifest-v1.txt
-```
-
-Expected: detached exact implementation commit, source provenance resolvable without a stash/local-only ref, submodule remains uninitialized, and complete manifest passes. Run the real CLI from this clone against the accepted external data root as well; it must produce the same fixed-query identities and bound asset digests.
-
-- [ ] **Step 3: Record the literal implementation SHA in a docs-only commit**
-
-Return to the feature worktree. Replace the handover’s `accepted implementation commit` field with the literal 40-character value printed in Step 1 and add the exact clean-clone/evidence bundle verification facts. Then verify the staged diff contains only documentation:
+Return to the feature worktree and replace the quoted instruction value with the same Step 2 literal:
 
 ```bash
 cd /home/jihun/work/HoloAgent/.worktrees/holoagent0-workstation-pc2-setup
-git add docs/FSR_VLN_HOLOAGENT_HANDOVER.md
-git diff --cached --name-only
-git diff --cached --check
-git commit -m "docs: bind FSR-VLN handover release identity"
+IMPLEMENTATION_SHA='<paste the exact 40-character SHA printed in Step 2>'
+printf '%s\n' "$IMPLEMENTATION_SHA" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
+test "$(git rev-parse HEAD)" = "$IMPLEMENTATION_SHA"
+test -z "$(git status --short)"
 ```
 
-Expected: `git diff --cached --name-only` lists only `docs/FSR_VLN_HOLOAGENT_HANDOVER.md`. This documentation release commit is not the implementation identity.
+Expected: the feature worktree is still clean at the frozen candidate. Independently compare the clean-clone, Jihun, and incoming-owner evidence with the captured SHA and lock. Do not edit the handover until the complete manifest, clean-clone qualification, Jihun real run, and incoming-owner real run are all PASS for this same candidate.
 
-- [ ] **Step 4: Create and locally verify the annotated tag**
+## Task 10: Record Acceptance and Publish the Immutable Release
+
+**Files:**
+
+- Modify once: `docs/FSR_VLN_HOLOAGENT_HANDOVER.md`
+- Verify: every file changed in Tasks 1–9
+
+- [ ] **Step 1: Add the factual sign-off after the acceptance gate**
+
+Return to the clean feature worktree and replace the quoted instruction value with the exact Task 9 candidate:
+
+```bash
+cd /home/jihun/work/HoloAgent/.worktrees/holoagent0-workstation-pc2-setup
+IMPLEMENTATION_SHA='<paste the accepted 40-character SHA from Task 9>'
+printf '%s\n' "$IMPLEMENTATION_SHA" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
+test "$(git rev-parse HEAD)" = "$IMPLEMENTATION_SHA"
+test -z "$(git status --short)"
+```
+
+Only after that check and all four Task 9 gates pass, edit `docs/FSR_VLN_HOLOAGENT_HANDOVER.md` once. Replace `UNSIGNED — acceptance not yet performed` with the factual sign-off, write the accepted implementation commit as the literal `IMPLEMENTATION_SHA`, and record the clean-clone facts plus both real evidence-bundle digests and custody confirmation. Do not include assets, evidence bundles, credentials, environment dumps, or placeholders.
+
+This release edit may change factual sign-off and verification metadata only. A code, lock, test, command, or instructional runbook correction is an implementation change: abandon the candidate, make a new implementation commit, and repeat all of Task 9 before creating any release commit.
+
+- [ ] **Step 2: Create the single documentation-only release commit**
+
+Replace the quoted instruction value with the same literal used in Step 1:
+
+```bash
+IMPLEMENTATION_SHA='<paste the accepted 40-character SHA from Task 9>'
+test "$(git rev-parse HEAD)" = "$IMPLEMENTATION_SHA"
+git add docs/FSR_VLN_HOLOAGENT_HANDOVER.md
+test "$(git diff --cached --name-only)" = 'docs/FSR_VLN_HOLOAGENT_HANDOVER.md'
+test "$(git status --short)" = 'M  docs/FSR_VLN_HOLOAGENT_HANDOVER.md'
+git diff --cached --check
+git diff --cached -- docs/FSR_VLN_HOLOAGENT_HANDOVER.md
+git commit -m "docs: bind FSR-VLN handover release identity"
+DOCS_RELEASE_SHA="$(git rev-parse HEAD)"
+test "$(git rev-parse HEAD^)" = "$IMPLEMENTATION_SHA"
+git merge-base --is-ancestor "$IMPLEMENTATION_SHA" "$DOCS_RELEASE_SHA"
+test -z "$(git status --short)"
+```
+
+Expected: exactly one documentation-only commit contains the factual sign-off and literal accepted implementation SHA. The docs release commit is the tag target, but it is not the reproduction identity; its direct parent, `IMPLEMENTATION_SHA`, remains the accepted implementation commit.
+
+- [ ] **Step 3: Create and locally verify the annotated tag**
 
 ```bash
 git show-ref --verify --quiet refs/tags/holoagent0-fsrvln-handover-v1
@@ -898,17 +980,20 @@ git show-ref --verify --quiet refs/tags/holoagent0-fsrvln-handover-v1
 Expected before creation: exit 1. If it exists, stop and inspect; do not move or overwrite a published tag.
 
 ```bash
+DOCUMENTED_SHA="$(sed -n 's/^Accepted implementation commit: `\([0-9a-f]\{40\}\)`$/\1/p' docs/FSR_VLN_HOLOAGENT_HANDOVER.md)"
+DOCS_RELEASE_SHA="$(git rev-parse HEAD)"
+test "$DOCUMENTED_SHA" = "$(git rev-parse HEAD^)"
 git tag -a holoagent0-fsrvln-handover-v1 \
   -m "FSR-VLN fixed-query workstation handover v1"
-git show holoagent0-fsrvln-handover-v1 --no-patch --decorate=full
-DOCUMENTED_SHA="$(sed -n 's/^Accepted implementation commit: `\([0-9a-f]\{40\}\)`$/\1/p' docs/FSR_VLN_HOLOAGENT_HANDOVER.md)"
+test "$(git rev-parse holoagent0-fsrvln-handover-v1^{commit})" = "$DOCS_RELEASE_SHA"
 git merge-base --is-ancestor "$DOCUMENTED_SHA" \
   holoagent0-fsrvln-handover-v1^{commit}
+git show holoagent0-fsrvln-handover-v1 --no-patch --decorate=full
 ```
 
-Expected: annotated tag points to the docs-only release commit and the literal implementation commit is its ancestor.
+Expected: the annotated tag points to the single docs-only release commit, and the documented implementation SHA is that commit’s direct parent and ancestor.
 
-- [ ] **Step 5: Test discovery by tag and detachment at the documented SHA**
+- [ ] **Step 4: Test discovery by tag and detachment at the documented SHA**
 
 ```bash
 TAG_PARENT="$(mktemp -d /tmp/fsrvln-tag-clone.XXXXXX)"
@@ -918,9 +1003,10 @@ git clone --no-recurse-submodules --branch holoagent0-fsrvln-handover-v1 \
   "$TAG_PARENT/HoloAgent"
 cd "$TAG_PARENT/HoloAgent"
 DOCUMENTED_SHA="$(sed -n 's/^Accepted implementation commit: `\([0-9a-f]\{40\}\)`$/\1/p' docs/FSR_VLN_HOLOAGENT_HANDOVER.md)"
-test "$(printf '%s' "$DOCUMENTED_SHA" | wc -c)" -eq 40
+printf '%s\n' "$DOCUMENTED_SHA" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
 git merge-base --is-ancestor "$DOCUMENTED_SHA" HEAD
 git checkout --detach "$DOCUMENTED_SHA"
+test "$(git rev-parse HEAD)" = "$DOCUMENTED_SHA"
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 PYTHONPATH=scripts/holoagent0_setup \
 /usr/bin/python3.10 -m pytest -q -p no:cacheprovider \
@@ -929,11 +1015,11 @@ PYTHONPATH=scripts/holoagent0_setup \
   scripts/holoagent0_setup/tests/test_fsrvln_handover.py
 ```
 
-Expected: the documented SHA is literal and reachable from the tag; focused tests pass from detached HEAD.
+Expected: the implementation SHA is discoverable from the tag and is the exact detached reproduction identity; focused tests pass there.
 
-- [ ] **Step 6: Obtain explicit approval before external publication**
+- [ ] **Step 5: Obtain explicit approval before external publication**
 
-Present the implementation SHA, docs release SHA, annotated tag target, full test-manifest result, Jihun comparison evidence digest, incoming-owner acceptance evidence digest, and `git status --short`. Ask the repository owner to approve pushing the feature/release commits and the new tag. Do not push without that approval.
+Present the implementation SHA, docs release SHA, annotated tag target, full test-manifest result, clean-clone result, Jihun comparison evidence digest, incoming-owner acceptance evidence digest, and `git status --short`. Ask the repository owner to approve pushing the feature/release commits and the new tag. Do not push without that approval.
 
 After approval, use the already configured repository remote and push the reviewed branch followed by the single tag. Never force-push and never use `--tags`:
 
@@ -955,6 +1041,7 @@ Expected: `origin` has first been reconfirmed as `https://github.com/caisarl76/H
 - [ ] The fixed query executes once and returns one floor, three rooms, 497 objects, `0_0 Pantry`, `0_0_81 counter`, frame `map`, identity orientation, and the accepted position within `1e-6` per coordinate.
 - [ ] No ROS, Nav2, AgentOS, external LLM call/parser, or robot-control process participates; the transitive but unused OpenAI import is recorded as a historical Graph limitation.
 - [ ] All five evidence files are canonical, schema-valid, digest-bound, and terminal PASS is written last.
+- [ ] The clean clone and both real acceptance bundles record the same frozen implementation SHA before the factual handover release edit.
 - [ ] The handover records factual owners, dates, paths, environment, module origin, implementation SHA, evidence digest, PASS, and second-copy custody confirmation with no placeholders.
 - [ ] The annotated tag is only a discovery pointer; the documented 40-character implementation commit is reachable and is the detached reproduction identity.
 - [ ] Stage B graph rebuilding, maintained `agentic_robot/fsr_vln`, public artifact equivalence, Nav2 alignment, and robot execution remain explicitly unqualified.

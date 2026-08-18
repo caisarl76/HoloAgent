@@ -105,9 +105,10 @@ The current source lock names the unreachable stash commit
 `f164095abb0045a69c0b8eb23683063be3deaa38`. The same 73 non-README baseline
 entries have identical Git blob identities at the reachable feature commit
 `ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8`. The implementation updates source
-provenance to that reachable commit while preserving every approved baseline
-blob identity. The existing reviewed `nav_agent/README.md` override remains
-bound to `d862782b3661e2f2cf155d6e006f11c27063a6b0`.
+provenance to that reachable commit. After removal of `fsr_vln/checkpoints`,
+every retained baseline blob identity is preserved. The existing reviewed
+`nav_agent/README.md` override remains bound to
+`d862782b3661e2f2cf155d6e006f11c27063a6b0`.
 
 The host-specific tracked symlink `fsr_vln/checkpoints` is removed from the
 Stage A source closure and from the accepted release. Its target is an asset

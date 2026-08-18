@@ -394,7 +394,6 @@ This command is read-only with respect to source/assets and writes only under
 - `agentic_robot/fsr_vln/README.md`
 - `agentic_robot/fsr_vln/api.py`
 - `agentic_robot/core/src/navigation/README.md`
-- `nav_agent/DEPLOY_UNITREE_G1.md`
 - `docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md`
 - `docs/superpowers/plans/2026-07-22-holoagent-stage0-recovery.md`
 - `.worktrees/holoagent0-workstation-pc2-setup/docs/superpowers/specs/2026-07-29-holoagent0-workstation-pc2-setup-design.md`
