@@ -12,12 +12,13 @@ Acceptance state: **UNSIGNED — acceptance not yet performed**
 
 - Repository: `https://github.com/caisarl76/HoloAgent.git`
 - Release tag: `holoagent0-fsrvln-handover-v1`
-- Accepted implementation commit: UNSIGNED — acceptance not yet performed
 - Stage A source authority: `repository_root/fsr_vln`
 - Required graph-module origin:
   `repository_root/fsr_vln/memory/hmsg/graph/graph.py`
 - Source lock:
   `scripts/holoagent0_setup/locks/semantic-source-manifest-v1.json`
+
+Accepted implementation commit: UNSIGNED — acceptance not yet performed
 
 The accepted identity is the full 40-character implementation commit recorded
 above after owner acceptance. A branch or tag name alone is not sufficient.

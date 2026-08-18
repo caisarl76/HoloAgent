@@ -158,6 +158,35 @@ def test_documentation_defines_the_closed_unsigned_stage_a_contract():
     assert "Jihun" in history
 
 
+def test_documentation_commit_field_supports_release_identity_extraction():
+    document = (REPOSITORY_ROOT / "docs/FSR_VLN_HOLOAGENT_HANDOVER.md").read_text(
+        encoding="utf-8"
+    )
+    unsigned = "Accepted implementation commit: UNSIGNED — acceptance not yet performed"
+    implementation_sha = "a" * 40
+    assert document.splitlines().count(unsigned) == 1
+    signed = document.replace(
+        unsigned,
+        f"Accepted implementation commit: `{implementation_sha}`",
+        1,
+    )
+
+    completed = subprocess.run(
+        [
+            "/usr/bin/sed",
+            "-n",
+            r"s/^Accepted implementation commit: `\([0-9a-f]\{40\}\)`$/\1/p",
+        ],
+        input=signed,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+
+    assert completed.stdout == implementation_sha + "\n"
+
+
 def _identity(path: Path) -> PathIdentity:
     observed = path.stat()
     return PathIdentity(path, observed.st_dev, observed.st_ino, observed.st_mode)
