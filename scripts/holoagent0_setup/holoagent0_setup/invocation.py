@@ -15,6 +15,7 @@ from typing import Callable, Literal, NoReturn, Sequence
 
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 _RUN_ID_PATTERN = re.compile(r"workstation-offline-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}\Z")
+_CONCRETE_PATH_TYPE = type(Path("/"))
 
 
 class InvocationError(ValueError):
@@ -35,6 +36,11 @@ class _InvocationSources:
 
 
 def _lexical_absolute(path: Path | str, *, cwd: Path) -> Path:
+    if (
+        type(path) not in {str, _CONCRETE_PATH_TYPE}
+        or type(cwd) is not _CONCRETE_PATH_TYPE
+    ):
+        raise InvocationError("offline output root is invalid")
     encoded = os.fspath(path)
     cwd_encoded = os.fspath(cwd)
     if (
@@ -230,27 +236,35 @@ class RunRootAuthority:
         self._output_root_fd = -1
         child_fd = -1
         try:
+            output_root = self._output_root
+            stored_run_root = self._expected_run_root
+            run_basename = self._run_basename
             if (
-                type(self._run_basename) is not str
-                or _RUN_ID_PATTERN.fullmatch(self._run_basename) is None
-                or not isinstance(self._output_root, Path)
-                or not self._output_root.is_absolute()
-                or not isinstance(self._expected_run_root, Path)
-                or self._expected_run_root != self._output_root / self._run_basename
-                or not isinstance(expected_run_root, (str, os.PathLike))
-                or Path(expected_run_root) != self._expected_run_root
+                type(run_basename) is not str
+                or _RUN_ID_PATTERN.fullmatch(run_basename) is None
+                or type(output_root) is not _CONCRETE_PATH_TYPE
+                or not output_root.is_absolute()
+                or type(stored_run_root) is not _CONCRETE_PATH_TYPE
+                or type(expected_run_root) is not _CONCRETE_PATH_TYPE
+            ):
+                raise InvocationError("run root path is not authorized")
+            authorized_run_root = _CONCRETE_PATH_TYPE(output_root, run_basename)
+            authorized_parts = authorized_run_root.parts
+            if (
+                stored_run_root.parts != authorized_parts
+                or expected_run_root.parts != authorized_parts
             ):
                 raise InvocationError("run root path is not authorized")
             self._validate_retained_output_root(descriptor)
-            os.mkdir(self._run_basename, mode=0o700, dir_fd=descriptor)
+            os.mkdir(run_basename, mode=0o700, dir_fd=descriptor)
             child_fd = os.open(
-                self._run_basename,
+                run_basename,
                 _DIRECTORY_OPEN_FLAGS,
                 dir_fd=descriptor,
             )
             opened = os.fstat(child_fd)
             named = os.stat(
-                self._run_basename,
+                run_basename,
                 dir_fd=descriptor,
                 follow_symlinks=False,
             )
@@ -259,7 +273,7 @@ class RunRootAuthority:
             _validate_output_root(opened, self._effective_uid)
             _validate_output_root(named, self._effective_uid)
             self._validate_retained_output_root(descriptor)
-            return self._expected_run_root
+            return _CONCRETE_PATH_TYPE(*authorized_parts)
         except InvocationError:
             raise
         except (AttributeError, OSError, TypeError, ValueError) as error:
