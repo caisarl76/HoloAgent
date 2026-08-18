@@ -111,10 +111,15 @@ class _ImportBoundaryAudit:
         return self
 
     def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
         if self._original_builtin_import is not None:
             builtins.__import__ = self._original_builtin_import
+            self._original_builtin_import = None
         if self._original_import_module is not None:
             importlib.import_module = self._original_import_module
+            self._original_import_module = None
 
     def require_allowed(self) -> None:
         forbidden = sorted(
@@ -531,11 +536,13 @@ class RealHMSGRetrievalAdapter:
         graph_identity: str,
         run_authority: HandoverRunDirectoryAuthority | None = None,
         llm_guard: _ExternalLLMGuard | None = None,
+        import_audit: _ImportBoundaryAudit | None = None,
     ) -> None:
         self._graph = graph
         self._graph_identity = graph_identity
         self._run_authority = run_authority
         self._llm_guard = llm_guard
+        self._import_audit = import_audit
         self._closed = False
 
     def _revalidate_run_authority(self) -> None:
@@ -551,17 +558,32 @@ class RealHMSGRetrievalAdapter:
             raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
 
     def close(self) -> None:
+        active_exception = sys.exc_info()[0] is not None
         self._closed = True
         guard = self._llm_guard
         self._llm_guard = None
         authority = self._run_authority
         self._run_authority = None
+        audit = self._import_audit
+        self._import_audit = None
         try:
-            if guard is not None:
-                guard.close()
-        finally:
-            if authority is not None:
-                authority.close()
+            try:
+                if guard is not None:
+                    guard.close()
+            finally:
+                if authority is not None:
+                    authority.close()
+        except BaseException:
+            if audit is not None:
+                audit.close()
+            raise
+        else:
+            if audit is not None:
+                try:
+                    if not active_exception:
+                        audit.require_allowed()
+                finally:
+                    audit.close()
 
     def __enter__(self) -> "RealHMSGRetrievalAdapter":
         self._revalidate_run_authority()
@@ -579,20 +601,26 @@ class RealHMSGRetrievalAdapter:
     def graph_counts(self) -> GraphCounts:
         self._revalidate_run_authority()
         try:
-            return GraphCounts(
+            counts = GraphCounts(
                 floors=len(self._graph.floors),
                 rooms=len(self._graph.rooms),
                 objects=len(self._graph.objects),
             )
         finally:
             self._revalidate_run_authority()
+        if self._import_audit is not None:
+            self._import_audit.require_allowed()
+        return counts
 
     def retrieve_structured(self, query: StructuredQuery) -> HMSGSelection:
         self._revalidate_run_authority()
         try:
-            return self._retrieve_structured(query)
+            selection = self._retrieve_structured(query)
         finally:
             self._revalidate_run_authority()
+        if self._import_audit is not None:
+            self._import_audit.require_allowed()
+        return selection
 
     def _retrieve_structured(self, query: StructuredQuery) -> HMSGSelection:
         if query.canonical_json() != EXPECTED_SEMANTIC.query.canonical_json():
@@ -886,10 +914,27 @@ def load_real_hmsg_adapter(
     except (AssetGateError, OSError, ValueError) as error:
         raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
 
-    graph_module, OmegaConf, _module_origin = import_root_hmsg_runtime(paths)
-    llm_guard = _guard_external_llm_seams(graph_module)
+    import_audit = _ImportBoundaryAudit()
+    import_audit.__enter__()
+    llm_guard: _ExternalLLMGuard | None = None
     run_authority: HandoverRunDirectoryAuthority | None = None
+
+    def close_loading_resources() -> None:
+        try:
+            if llm_guard is not None:
+                llm_guard.close()
+        finally:
+            try:
+                if run_authority is not None:
+                    run_authority.close()
+            finally:
+                import_audit.close()
+
     try:
+        graph_module, OmegaConf, _module_origin = import_root_hmsg_runtime(paths)
+        import_audit.require_allowed()
+        llm_guard = _guard_external_llm_seams(graph_module)
+        import_audit.require_allowed()
         paths.revalidate()
         run_authority = open_handover_run_directory(paths, run_identity)
         with open_handover_asset_use(paths, verification) as asset_authority:
@@ -901,37 +946,35 @@ def load_real_hmsg_adapter(
                 )
             )
             graph = graph_module.Graph(configuration)
+            import_audit.require_allowed()
             run_authority.revalidate()
             asset_authority.revalidate()
             graph.load_graph(str(asset_authority.descriptor_path("graph")))
+            import_audit.require_allowed()
             run_authority.revalidate()
             asset_authority.revalidate()
             graph.set_room_names(room_names=list(verification.lock.room_name_mapping))
+            import_audit.require_allowed()
     except SemanticGateError:
-        if run_authority is not None:
-            run_authority.close()
-        if llm_guard is not None:
-            llm_guard.close()
+        close_loading_resources()
         raise
     except AssetGateError as error:
-        if run_authority is not None:
-            run_authority.close()
-        if llm_guard is not None:
-            llm_guard.close()
+        close_loading_resources()
         raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
-    except Exception as error:
-        if run_authority is not None:
-            run_authority.close()
-        if llm_guard is not None:
-            llm_guard.close()
+    except (AttributeError, ImportError, RuntimeError, ValueError) as error:
+        close_loading_resources()
         raise SemanticGateError(
             "SEMANTIC_DEPENDENCY_UNAVAILABLE", str(error)
         ) from error
+    except BaseException:
+        close_loading_resources()
+        raise
     return RealHMSGRetrievalAdapter(
         graph,
         graph_identity=verification.lock.graph_identity,
         run_authority=run_authority,
         llm_guard=llm_guard,
+        import_audit=import_audit,
     )
 
 

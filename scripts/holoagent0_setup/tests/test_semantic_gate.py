@@ -130,6 +130,24 @@ def _fake_omega_module(origin: Path, omega_conf=None):
     return module
 
 
+def _install_transient_forbidden_probe(tmp_path, monkeypatch):
+    environment = tmp_path / "transient-forbidden-import"
+    package = environment / "rclpy"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "transient_probe.py").write_text("PROBED = True\n", encoding="utf-8")
+    monkeypatch.delitem(sys.modules, "rclpy", raising=False)
+    monkeypatch.delitem(sys.modules, "rclpy.transient_probe", raising=False)
+    monkeypatch.syspath_prepend(str(environment))
+
+    def trigger():
+        importlib.import_module("rclpy.transient_probe")
+        sys.modules.pop("rclpy.transient_probe", None)
+        sys.modules.pop("rclpy", None)
+
+    return trigger
+
+
 def _memory_module_snapshot():
     return {
         name: module
@@ -1103,6 +1121,262 @@ def test_real_adapter_uses_verified_paths_configuration_and_room_mapping(
         os.fstat(run_descriptor)
     with pytest.raises(SemanticGateError, match="SEMANTIC_ASSET_UNAVAILABLE"):
         adapter.graph_counts()
+
+
+@pytest.mark.parametrize("phase", ("construction", "load"))
+def test_real_adapter_rejects_transient_forbidden_import_during_loading(
+    phase, tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    trigger = _install_transient_forbidden_probe(tmp_path, monkeypatch)
+    run_descriptors = []
+
+    class FakeGraph:
+        def __init__(self, configuration):
+            run_descriptors.append(int(Path(configuration["main"]["save_path"]).name))
+            if phase == "construction":
+                trigger()
+
+        def load_graph(self, _graph_path):
+            if phase == "load":
+                trigger()
+
+        def set_room_names(self, *, room_names):
+            pass
+
+    origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "import_root_hmsg_runtime",
+        lambda _bound: (
+            _fake_graph_module(origin, FakeGraph),
+            SimpleNamespace(create=lambda value: value),
+            origin,
+        ),
+    )
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+
+    with pytest.raises(
+        SemanticGateError,
+        match="FORBIDDEN_RUNTIME_MODULE: rclpy.transient_probe",
+    ):
+        load_real_hmsg_adapter(paths, tmp_path / "run")
+
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+    assert "rclpy" not in sys.modules
+    assert "rclpy.transient_probe" not in sys.modules
+    assert run_descriptors
+    for descriptor in run_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_real_adapter_restores_lifecycle_audit_without_masking_programmer_exception(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    run_descriptors = []
+
+    class FakeGraph:
+        def __init__(self, configuration):
+            run_descriptors.append(int(Path(configuration["main"]["save_path"]).name))
+            raise AssertionError("programmer failure")
+
+    origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "import_root_hmsg_runtime",
+        lambda _bound: (
+            _fake_graph_module(origin, FakeGraph),
+            SimpleNamespace(create=lambda value: value),
+            origin,
+        ),
+    )
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+
+    with pytest.raises(AssertionError, match="programmer failure"):
+        load_real_hmsg_adapter(paths, tmp_path / "run")
+
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+    assert run_descriptors
+    for descriptor in run_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_real_adapter_rejects_transient_forbidden_import_during_fixed_query(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    trigger = _install_transient_forbidden_probe(tmp_path, monkeypatch)
+    query_calls = []
+
+    class FakeGraph:
+        def __init__(self, _configuration):
+            self.floors = [object()]
+            self.rooms = [
+                SimpleNamespace(floor_id="0", room_id="0_0", name="Pantry"),
+                SimpleNamespace(floor_id="0", room_id="0_1", name="Office"),
+                SimpleNamespace(floor_id="0", room_id="0_2", name="Hallway"),
+            ]
+            selected = SimpleNamespace(
+                object_id="0_0_81",
+                name="counter",
+                pcd=SimpleNamespace(
+                    get_center=lambda: (
+                        -21.526786203133774,
+                        -0.27579107548158116,
+                        15.671372634872082,
+                    )
+                ),
+            )
+            self.objects = [selected, *[object() for _ in range(496)]]
+
+        def load_graph(self, _graph_path):
+            pass
+
+        def set_room_names(self, *, room_names):
+            pass
+
+        def query_hmsg_room(self, query, **kwargs):
+            query_calls.append(("room", query, kwargs))
+            trigger()
+            return [0]
+
+        def query_hmsg_object(self, query, **kwargs):
+            query_calls.append(("object", query, kwargs))
+            return ([0], [0], [0.9])
+
+    origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "import_root_hmsg_runtime",
+        lambda _bound: (
+            _fake_graph_module(origin, FakeGraph),
+            SimpleNamespace(create=lambda value: value),
+            origin,
+        ),
+    )
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+    adapter = load_real_hmsg_adapter(paths, tmp_path / "run")
+
+    try:
+        with pytest.raises(
+            SemanticGateError,
+            match="FORBIDDEN_RUNTIME_MODULE: rclpy.transient_probe",
+        ):
+            evaluate_semantic_fixture(adapter, EXPECTED_SEMANTIC.query)
+        assert [call[0] for call in query_calls] == ["room", "object"]
+        assert semantic_gate_module.builtins.__import__ is not original_builtin_import
+        assert importlib.import_module is not original_import_module
+    finally:
+        with pytest.raises(
+            SemanticGateError,
+            match="FORBIDDEN_RUNTIME_MODULE: rclpy.transient_probe",
+        ):
+            adapter.close()
+
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+    assert "rclpy" not in sys.modules
+    assert "rclpy.transient_probe" not in sys.modules
+
+
+def test_real_adapter_close_does_not_mask_query_programmer_exception_after_forbidden_import(
+    tmp_path, monkeypatch
+):
+    trigger = _install_transient_forbidden_probe(tmp_path, monkeypatch)
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+    audit = semantic_gate_module._ImportBoundaryAudit()
+    audit.__enter__()
+    read_descriptor, write_descriptor = os.pipe()
+
+    class DescriptorAuthority:
+        def revalidate(self):
+            os.fstat(read_descriptor)
+
+        def close(self):
+            os.close(read_descriptor)
+
+    def query_room(*_args, **_kwargs):
+        trigger()
+        raise AssertionError("query programmer failure")
+
+    graph = SimpleNamespace(query_hmsg_room=query_room)
+    adapter = RealHMSGRetrievalAdapter(
+        graph,
+        graph_identity=EXPECTED_SEMANTIC.graph_identity,
+        run_authority=DescriptorAuthority(),
+        import_audit=audit,
+    )
+
+    try:
+        with pytest.raises(AssertionError, match="query programmer failure"):
+            try:
+                adapter.retrieve_structured(EXPECTED_SEMANTIC.query)
+            finally:
+                adapter.close()
+    finally:
+        os.close(write_descriptor)
+        audit.close()
+
+    with pytest.raises(OSError):
+        os.fstat(read_descriptor)
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+    assert "rclpy" not in sys.modules
+    assert "rclpy.transient_probe" not in sys.modules
+
+
+def test_real_adapter_rejects_transient_forbidden_import_during_close_and_restores_hooks(
+    tmp_path, monkeypatch
+):
+    trigger = _install_transient_forbidden_probe(tmp_path, monkeypatch)
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+    audit = semantic_gate_module._ImportBoundaryAudit()
+    audit.__enter__()
+    authority_closes = []
+    adapter = RealHMSGRetrievalAdapter(
+        SimpleNamespace(),
+        graph_identity=EXPECTED_SEMANTIC.graph_identity,
+        run_authority=SimpleNamespace(close=lambda: authority_closes.append(True)),
+        llm_guard=SimpleNamespace(close=trigger),
+        import_audit=audit,
+    )
+
+    with pytest.raises(
+        SemanticGateError,
+        match="FORBIDDEN_RUNTIME_MODULE: rclpy.transient_probe",
+    ):
+        adapter.close()
+
+    assert authority_closes == [True]
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+    assert "rclpy" not in sys.modules
+    assert "rclpy.transient_probe" not in sys.modules
 
 
 def test_real_adapter_detects_checkpoint_drift_during_graph_construction(

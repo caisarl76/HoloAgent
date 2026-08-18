@@ -2488,6 +2488,105 @@ def test_cli_rejects_transient_forbidden_import_restored_by_real_graph_boundary(
     )
 
 
+def test_cli_rejects_transient_forbidden_import_across_real_adapter_lifecycle(
+    monkeypatch, tmp_path, contract
+):
+    cli, _paths, run_directory, _calls, captured, _adapter, argv = _install_cli_fakes(
+        monkeypatch, tmp_path, contract
+    )
+    environment = tmp_path / "runtime-import-environment"
+    package = environment / "rclpy"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "transient_probe.py").write_text("PROBED = True\n", encoding="utf-8")
+    monkeypatch.delitem(sys.modules, "rclpy", raising=False)
+    monkeypatch.delitem(sys.modules, "rclpy.transient_probe", raising=False)
+    monkeypatch.syspath_prepend(str(environment))
+    lifecycle = {}
+    query_calls = []
+
+    def transient_import():
+        importlib.import_module("rclpy.transient_probe")
+        sys.modules.pop("rclpy.transient_probe", None)
+        sys.modules.pop("rclpy", None)
+
+    selected = SimpleNamespace(
+        object_id="0_0_81",
+        name="counter",
+        pcd=SimpleNamespace(
+            get_center=lambda: (
+                -21.526786203133774,
+                -0.27579107548158116,
+                15.671372634872082,
+            )
+        ),
+    )
+    graph = SimpleNamespace(
+        floors=[object()],
+        rooms=[
+            SimpleNamespace(floor_id="0", room_id="0_0", name="Pantry"),
+            SimpleNamespace(floor_id="0", room_id="0_1", name="Office"),
+            SimpleNamespace(floor_id="0", room_id="0_2", name="Hallway"),
+        ],
+        objects=[selected, *[object() for _ in range(496)]],
+    )
+
+    def query_room(query, **kwargs):
+        query_calls.append(("room", query, kwargs))
+        transient_import()
+        return [0]
+
+    def query_object(query, **kwargs):
+        query_calls.append(("object", query, kwargs))
+        return ([0], [0], [0.9])
+
+    graph.query_hmsg_room = query_room
+    graph.query_hmsg_object = query_object
+
+    def load_adapter(_actual_paths, _actual_run):
+        audit = semantic_gate_module._ImportBoundaryAudit()
+        audit.__enter__()
+        authority_closes = []
+        adapter = semantic_gate_module.RealHMSGRetrievalAdapter(
+            graph,
+            graph_identity=EXPECTED_SEMANTIC.graph_identity,
+            run_authority=SimpleNamespace(
+                close=lambda: authority_closes.append(True), revalidate=lambda: None
+            ),
+            import_audit=audit,
+        )
+        lifecycle.update(
+            audit=audit,
+            adapter=adapter,
+            authority_closes=authority_closes,
+        )
+        return adapter
+
+    monkeypatch.setattr(cli, "load_real_hmsg_adapter", load_adapter)
+    monkeypatch.setattr(
+        cli, "evaluate_semantic_fixture", semantic_gate_module.evaluate_semantic_fixture
+    )
+
+    try:
+        assert cli.main(argv) == 1
+    finally:
+        audit = lifecycle.get("audit")
+        if audit is not None:
+            audit.close()
+
+    assert [call[0] for call in query_calls] == ["room", "object"]
+    assert lifecycle["authority_closes"] == [True]
+    assert "rclpy" not in sys.modules
+    assert "rclpy.transient_probe" not in sys.modules
+    query = captured["documents"][QUERY_FILE]
+    assert query["status"] == "FAIL"
+    assert query["reason"] == "FORBIDDEN_RUNTIME_MODULE: rclpy.transient_probe"
+    assert query["execution_count"] == 1
+    terminal = json.loads((run_directory / RESULT_FILE).read_bytes())
+    assert terminal["status"] == "FAIL"
+    assert terminal["first_blocking_reason"] == query["reason"]
+
+
 @pytest.mark.parametrize("operation", ("import", "help"))
 def test_cli_import_and_help_are_light_and_non_ros_in_a_fresh_process(operation):
     package_root = PACKAGE_ROOT
