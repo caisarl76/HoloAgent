@@ -106,7 +106,7 @@ _TRACKED_MANIFEST_AUTHORITY_REPO_PATH = (
 )
 _TRACKED_MANIFEST_SELF_OID = "SELF"
 _TRACKED_FILE_MANIFEST_SHA256 = (
-    "7306778504ccbc55862e4bcefbad6a027f0fd9cbbcf6a566d770df1f5ab4dcab"
+    "87d0a76faa8bd76e1f8660eed786a00153344db4e6b331f96cc0bd91da8e2da4"
 )
 _SAFETY_FACT_REASONS = {
     "safety.workstation_preflight": frozenset(

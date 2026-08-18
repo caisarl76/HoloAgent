@@ -30,6 +30,7 @@ from .semantic_gate import (
     FORBIDDEN_RUNTIME_MODULE_PREFIXES,
     STRUCTURED_QUERY_SHA256,
     GraphCounts,
+    RuntimeImportAudit,
     SemanticFixtureResult,
     SemanticGateError,
     evaluate_semantic_fixture,
@@ -102,71 +103,82 @@ def main(argv: Sequence[str] | None = None) -> int:
         paths.repository_root
         / "scripts/holoagent0_setup/locks/semantic-source-manifest-v1.json"
     )
+    runtime_import_audit = RuntimeImportAudit()
+    runtime_import_audit.__enter__()
     try:
-        paths.revalidate()
-        source_lock = load_source_lock(source_lock_path)
-        checkout_commit = verify_checkout_identity(paths.repository_root, source_lock)
-        git_verification = verify_manifest_git_objects(
-            paths.repository_root, source_lock
-        )
-        worktree_verification = verify_source_worktree(
-            paths.repository_root, source_lock
-        )
-        if git_verification != worktree_verification:
-            raise SourceGateError(
-                "SOURCE_VERIFICATION_MISMATCH",
-                "Git-object and worktree verification results differ",
-            )
-        source_verification = git_verification
-        source_status = "PASS"
-    except _ANTICIPATED_ERRORS as error:
-        blocker = _stable_reason(error)
-        source_status = "FAIL"
-
-    if blocker is None:
-        try:
-            environment_observation = qualify_environment(paths)
-            environment_status = _stage_status(environment_observation)
-            if environment_status == "FAIL":
-                blocker = _document_reason(environment_observation)
-        except _ANTICIPATED_ERRORS as error:
-            blocker = _stable_reason(error)
-            environment_status = "FAIL"
-            environment_observation = _failed_environment_observation(
-                blocker, started_at
-            )
-
-    if blocker is None:
         try:
             paths.revalidate()
-            asset_verification = verify_asset_lock(paths)
-            asset_lock_sha256 = sha256_retained_asset_lock(paths)
-            asset_status = "PASS"
-        except _ANTICIPATED_ERRORS as error:
-            blocker = _stable_reason(error)
-            asset_status = "FAIL"
-
-    if blocker is None:
-        adapter = None
-        try:
-            adapter = load_real_hmsg_adapter(paths, arguments.run_directory)
-            try:
-                query_execution_count = 1
-                semantic_result = evaluate_semantic_fixture(
-                    adapter, EXPECTED_SEMANTIC.query
+            source_lock = load_source_lock(source_lock_path)
+            checkout_commit = verify_checkout_identity(
+                paths.repository_root, source_lock
+            )
+            git_verification = verify_manifest_git_objects(
+                paths.repository_root, source_lock
+            )
+            worktree_verification = verify_source_worktree(
+                paths.repository_root, source_lock
+            )
+            if git_verification != worktree_verification:
+                raise SourceGateError(
+                    "SOURCE_VERIFICATION_MISMATCH",
+                    "Git-object and worktree verification results differ",
                 )
-                graph_counts = adapter.graph_counts()
-            finally:
-                adapter.close()
-            forbidden = _new_forbidden_module(initially_loaded)
-            if forbidden is not None:
-                blocker = f"FORBIDDEN_RUNTIME_MODULE: {forbidden}"
-                query_status = "FAIL"
-            else:
-                query_status = "PASS"
+            runtime_import_audit.require_allowed()
+            source_verification = git_verification
+            source_status = "PASS"
         except _ANTICIPATED_ERRORS as error:
             blocker = _stable_reason(error)
-            query_status = "FAIL"
+            source_status = "FAIL"
+
+        if blocker is None:
+            try:
+                environment_observation = qualify_environment(paths)
+                runtime_import_audit.require_allowed()
+                environment_status = _stage_status(environment_observation)
+                if environment_status == "FAIL":
+                    blocker = _document_reason(environment_observation)
+            except _ANTICIPATED_ERRORS as error:
+                blocker = _stable_reason(error)
+                environment_status = "FAIL"
+                environment_observation = _failed_environment_observation(
+                    blocker, started_at
+                )
+
+        if blocker is None:
+            try:
+                paths.revalidate()
+                asset_verification = verify_asset_lock(paths)
+                asset_lock_sha256 = sha256_retained_asset_lock(paths)
+                runtime_import_audit.require_allowed()
+                asset_status = "PASS"
+            except _ANTICIPATED_ERRORS as error:
+                blocker = _stable_reason(error)
+                asset_status = "FAIL"
+
+        if blocker is None:
+            adapter = None
+            try:
+                adapter = load_real_hmsg_adapter(paths, arguments.run_directory)
+                try:
+                    query_execution_count = 1
+                    semantic_result = evaluate_semantic_fixture(
+                        adapter, EXPECTED_SEMANTIC.query
+                    )
+                    graph_counts = adapter.graph_counts()
+                finally:
+                    adapter.close()
+                runtime_import_audit.require_allowed()
+                forbidden = _new_forbidden_module(initially_loaded)
+                if forbidden is not None:
+                    blocker = f"FORBIDDEN_RUNTIME_MODULE: {forbidden}"
+                    query_status = "FAIL"
+                else:
+                    query_status = "PASS"
+            except _ANTICIPATED_ERRORS as error:
+                blocker = _stable_reason(error)
+                query_status = "FAIL"
+    finally:
+        runtime_import_audit.close()
 
     finished_at = _utc_timestamp()
     source_reason = _stage_reason(source_status, blocker)

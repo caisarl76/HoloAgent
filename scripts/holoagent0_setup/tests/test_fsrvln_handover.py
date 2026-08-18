@@ -2488,6 +2488,117 @@ def test_cli_rejects_transient_forbidden_import_restored_by_real_graph_boundary(
     )
 
 
+def test_cli_rejects_transient_forbidden_import_from_passing_environment_gate(
+    monkeypatch, tmp_path, contract
+):
+    cli, paths, run_directory, calls, captured, adapter, argv = _install_cli_fakes(
+        monkeypatch, tmp_path, contract
+    )
+    environment_root = tmp_path / "environment-import-root"
+    package = environment_root / "rclpy"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "transient_environment.py").write_text(
+        "PROBED = True\n", encoding="utf-8"
+    )
+    monkeypatch.delitem(sys.modules, "rclpy", raising=False)
+    monkeypatch.delitem(sys.modules, "rclpy.transient_environment", raising=False)
+    monkeypatch.syspath_prepend(str(environment_root))
+    passing_environment = _pass_documents(paths)[ENVIRONMENT_FILE]
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+
+    def hostile_environment(_actual_paths):
+        calls.append("environment")
+        importlib.import_module("rclpy.transient_environment")
+        sys.modules.pop("rclpy.transient_environment", None)
+        sys.modules.pop("rclpy", None)
+        return passing_environment
+
+    monkeypatch.setattr(cli, "qualify_environment", hostile_environment)
+
+    assert cli.main(argv) == 1
+
+    reason = "FORBIDDEN_RUNTIME_MODULE: rclpy.transient_environment"
+    assert calls == [
+        "paths",
+        "run_directory",
+        "checkout_identity",
+        "source_git_objects",
+        "source_worktree",
+        "environment",
+        "environment_evidence",
+        "source_evidence",
+        "asset_evidence",
+        "query_evidence",
+        "terminal_evidence",
+    ]
+    documents = captured["documents"]
+    assert documents[SOURCE_FILE]["status"] == "PASS"
+    assert documents[ENVIRONMENT_FILE]["status"] == "FAIL"
+    assert documents[ENVIRONMENT_FILE]["reason"] == reason
+    assert documents[ASSET_FILE]["status"] == "NOT_RUN"
+    assert documents[ASSET_FILE]["reason"] == reason
+    assert documents[QUERY_FILE]["status"] == "NOT_RUN"
+    assert documents[QUERY_FILE]["reason"] == reason
+    assert documents[QUERY_FILE]["execution_count"] == 0
+    assert not adapter.closed
+    terminal = json.loads((run_directory / RESULT_FILE).read_bytes())
+    assert terminal["status"] == "FAIL"
+    assert terminal["first_blocking_reason"] == reason
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+    assert "rclpy" not in sys.modules
+    assert "rclpy.transient_environment" not in sys.modules
+
+
+def test_cli_environment_import_audit_does_not_mask_programmer_exception(
+    monkeypatch, tmp_path, contract
+):
+    cli, _paths, run_directory, calls, _captured, adapter, argv = _install_cli_fakes(
+        monkeypatch, tmp_path, contract
+    )
+    environment_root = tmp_path / "failing-environment-import-root"
+    package = environment_root / "rclpy"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "transient_environment.py").write_text(
+        "PROBED = True\n", encoding="utf-8"
+    )
+    monkeypatch.delitem(sys.modules, "rclpy", raising=False)
+    monkeypatch.delitem(sys.modules, "rclpy.transient_environment", raising=False)
+    monkeypatch.syspath_prepend(str(environment_root))
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+
+    def hostile_environment(_actual_paths):
+        calls.append("environment")
+        importlib.import_module("rclpy.transient_environment")
+        sys.modules.pop("rclpy.transient_environment", None)
+        sys.modules.pop("rclpy", None)
+        raise AssertionError("environment programmer failure")
+
+    monkeypatch.setattr(cli, "qualify_environment", hostile_environment)
+
+    with pytest.raises(AssertionError, match="environment programmer failure"):
+        cli.main(argv)
+
+    assert calls == [
+        "paths",
+        "run_directory",
+        "checkout_identity",
+        "source_git_objects",
+        "source_worktree",
+        "environment",
+    ]
+    assert not adapter.closed
+    assert list(run_directory.iterdir()) == []
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+    assert "rclpy" not in sys.modules
+    assert "rclpy.transient_environment" not in sys.modules
+
+
 def test_cli_rejects_transient_forbidden_import_across_real_adapter_lifecycle(
     monkeypatch, tmp_path, contract
 ):

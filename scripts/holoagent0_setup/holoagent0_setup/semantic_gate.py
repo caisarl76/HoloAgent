@@ -78,7 +78,7 @@ class SemanticGateError(RuntimeError):
         super().__init__(f"{reason}: {detail}")
 
 
-class _ImportBoundaryAudit:
+class RuntimeImportAudit:
     """Record every requested import even when the module cache is restored."""
 
     def __init__(self) -> None:
@@ -86,7 +86,7 @@ class _ImportBoundaryAudit:
         self._original_builtin_import = None
         self._original_import_module = None
 
-    def __enter__(self) -> "_ImportBoundaryAudit":
+    def __enter__(self) -> "RuntimeImportAudit":
         original_builtin_import = builtins.__import__
         original_import_module = importlib.import_module
         self._original_builtin_import = original_builtin_import
@@ -132,6 +132,9 @@ class _ImportBoundaryAudit:
                 "FORBIDDEN_RUNTIME_MODULE",
                 forbidden[0],
             )
+
+
+_ImportBoundaryAudit = RuntimeImportAudit
 
 
 class _ExternalLLMGuard:
@@ -536,7 +539,7 @@ class RealHMSGRetrievalAdapter:
         graph_identity: str,
         run_authority: HandoverRunDirectoryAuthority | None = None,
         llm_guard: _ExternalLLMGuard | None = None,
-        import_audit: _ImportBoundaryAudit | None = None,
+        import_audit: RuntimeImportAudit | None = None,
     ) -> None:
         self._graph = graph
         self._graph_identity = graph_identity
@@ -841,7 +844,7 @@ def import_root_hmsg_runtime(
             for entry in sys.path
             if _environment_import_path_allowed(entry, fsr_resolved)
         ]
-        audit = _ImportBoundaryAudit()
+        audit = RuntimeImportAudit()
         with audit:
             graph_module = importlib.import_module("memory.hmsg.graph.graph")
             omega_module = importlib.import_module("omegaconf")
@@ -914,7 +917,7 @@ def load_real_hmsg_adapter(
     except (AssetGateError, OSError, ValueError) as error:
         raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
 
-    import_audit = _ImportBoundaryAudit()
+    import_audit = RuntimeImportAudit()
     import_audit.__enter__()
     llm_guard: _ExternalLLMGuard | None = None
     run_authority: HandoverRunDirectoryAuthority | None = None
