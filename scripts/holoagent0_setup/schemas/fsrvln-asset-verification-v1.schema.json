@@ -31,8 +31,42 @@
     }
   },
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "PASS"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "asset_lock_sha256": {"$ref": "#/$defs/sha256"},
+          "assets": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/asset"}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"status": {"const": "NOT_RUN"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "asset_lock_sha256": {"type": "null"},
+          "assets": {"type": "null"}
+        }
+      }
+    }
+  ],
   "$defs": {
-    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "nullableSha256": {
       "oneOf": [
         {"type": "null"},

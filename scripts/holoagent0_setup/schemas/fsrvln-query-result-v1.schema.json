@@ -28,8 +28,39 @@
     }
   },
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "PASS"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "execution_count": {"const": 1},
+          "result": {"$ref": "#/$defs/result"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"status": {"const": "NOT_RUN"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "execution_count": {"const": 0},
+          "result": {"type": "null"}
+        }
+      }
+    }
+  ],
   "$defs": {
-    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "graphCounts": {
       "type": "object",
       "required": ["floors", "rooms", "objects"],

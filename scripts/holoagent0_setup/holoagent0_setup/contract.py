@@ -96,6 +96,10 @@ _TRACE_DECODED_ADDRESS_SYSCALLS = (
     "recvmmsg",
 )
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_UTC_RFC3339_PATTERN = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]+)?Z$"
+)
 
 
 @dataclass(frozen=True)
@@ -1737,7 +1741,7 @@ def _is_number(value: object) -> bool:
 
 
 def _is_datetime(value: str) -> bool:
-    if not value.endswith("Z"):
+    if _UTC_RFC3339_PATTERN.fullmatch(value) is None:
         return False
     try:
         datetime.fromisoformat(value[:-1] + "+00:00")

@@ -35,8 +35,46 @@
     }
   },
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "PASS"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "checkout_commit": {"$ref": "#/$defs/gitSha"},
+          "source_lock_commit": {"$ref": "#/$defs/gitSha"},
+          "verified_count": {"type": "integer", "minimum": 0},
+          "provenance": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/provenance"}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"status": {"const": "NOT_RUN"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "checkout_commit": {"type": "null"},
+          "source_lock_commit": {"type": "null"},
+          "verified_count": {"type": "null"},
+          "provenance": {"type": "null"}
+        }
+      }
+    }
+  ],
   "$defs": {
-    "gitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "gitSha": {
+      "type": "string",
+      "minLength": 40,
+      "maxLength": 40,
+      "pattern": "^[0-9a-f]{40}$"
+    },
     "nullableGitSha": {
       "oneOf": [
         {"type": "null"},

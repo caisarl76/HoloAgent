@@ -52,6 +52,48 @@
     }
   },
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "PASS"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "os_release": {"type": "string", "minLength": 1},
+          "machine_architecture": {"type": "string", "minLength": 1},
+          "python": {"$ref": "#/$defs/python"},
+          "accelerator": {"$ref": "#/$defs/accelerator"},
+          "imports": {
+            "type": "array",
+            "items": {"$ref": "#/$defs/import"}
+          },
+          "graph_module_origin": {
+            "type": "string",
+            "pattern": "^/",
+            "minLength": 2,
+            "maxLength": 4096
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"status": {"const": "NOT_RUN"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "os_release": {"type": "null"},
+          "machine_architecture": {"type": "null"},
+          "python": {"type": "null"},
+          "accelerator": {"type": "null"},
+          "imports": {"type": "null"},
+          "graph_module_origin": {"type": "null"}
+        }
+      }
+    }
+  ],
   "$defs": {
     "python": {
       "type": "object",

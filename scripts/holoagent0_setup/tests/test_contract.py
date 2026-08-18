@@ -694,14 +694,186 @@ def test_fsrvln_query_vectors_have_exact_finite_cardinality(
     assert not contract.validate_document("fsrvln-query-result-v1", document).ok
 
 
-def test_fsrvln_stage_and_terminal_status_enums_are_distinct(contract: ContractSet):
-    stage = _fsrvln_documents()["fsrvln-environment-v1"]
-    stage["status"] = "NOT_RUN"
-    assert contract.validate_document("fsrvln-environment-v1", stage).ok
+@pytest.mark.parametrize(
+    ("schema_name", "field"),
+    (
+        ("fsrvln-environment-v1", "os_release"),
+        ("fsrvln-environment-v1", "machine_architecture"),
+        ("fsrvln-environment-v1", "python"),
+        ("fsrvln-environment-v1", "accelerator"),
+        ("fsrvln-environment-v1", "imports"),
+        ("fsrvln-environment-v1", "graph_module_origin"),
+        ("fsrvln-source-verification-v1", "checkout_commit"),
+        ("fsrvln-source-verification-v1", "source_lock_commit"),
+        ("fsrvln-source-verification-v1", "verified_count"),
+        ("fsrvln-source-verification-v1", "provenance"),
+        ("fsrvln-asset-verification-v1", "asset_lock_sha256"),
+        ("fsrvln-asset-verification-v1", "assets"),
+        ("fsrvln-query-result-v1", "result"),
+    ),
+)
+def test_fsrvln_pass_requires_concrete_observations(
+    contract: ContractSet, schema_name: str, field: str
+):
+    document = _fsrvln_documents()[schema_name]
+    document[field] = None
 
+    assert not contract.validate_document(schema_name, document).ok
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"), (("execution_count", 0), ("result", None))
+)
+def test_fsrvln_query_pass_requires_one_execution_and_result(
+    contract: ContractSet, field: str, replacement: object
+):
+    document = _fsrvln_documents()["fsrvln-query-result-v1"]
+    document[field] = replacement
+
+    assert not contract.validate_document("fsrvln-query-result-v1", document).ok
+
+
+@pytest.mark.parametrize("schema_name", tuple(FSRVLN_SCHEMA_IDS)[:-1])
+def test_fsrvln_not_run_requires_absent_observations(
+    contract: ContractSet, schema_name: str
+):
+    document = _fsrvln_documents()[schema_name]
+    document["status"] = "NOT_RUN"
+
+    assert not contract.validate_document(schema_name, document).ok
+
+
+@pytest.mark.parametrize(
+    ("schema_name", "null_fields", "updates"),
+    (
+        (
+            "fsrvln-environment-v1",
+            (
+                "os_release",
+                "machine_architecture",
+                "python",
+                "accelerator",
+                "imports",
+                "graph_module_origin",
+            ),
+            {},
+        ),
+        (
+            "fsrvln-source-verification-v1",
+            (
+                "checkout_commit",
+                "source_lock_commit",
+                "verified_count",
+                "provenance",
+            ),
+            {},
+        ),
+        (
+            "fsrvln-asset-verification-v1",
+            ("asset_lock_sha256", "assets"),
+            {},
+        ),
+        (
+            "fsrvln-query-result-v1",
+            ("result",),
+            {"execution_count": 0},
+        ),
+    ),
+)
+def test_fsrvln_not_run_accepts_explicit_null_observations(
+    contract: ContractSet,
+    schema_name: str,
+    null_fields: tuple[str, ...],
+    updates: dict[str, object],
+):
+    document = _fsrvln_documents()[schema_name]
+    document["status"] = "NOT_RUN"
+    document.update(updates)
+    for field in null_fields:
+        document[field] = None
+
+    decision = contract.validate_document(schema_name, document)
+
+    assert decision.ok, decision.errors
+
+
+def test_fsrvln_terminal_does_not_accept_not_run(contract: ContractSet):
     terminal = _fsrvln_documents()["fsrvln-handover-result-v1"]
     terminal["status"] = "NOT_RUN"
     assert not contract.validate_document("fsrvln-handover-result-v1", terminal).ok
+
+
+@pytest.mark.parametrize(
+    ("schema_name", "path"),
+    (
+        ("fsrvln-source-verification-v1", ("checkout_commit",)),
+        ("fsrvln-asset-verification-v1", ("asset_lock_sha256",)),
+        ("fsrvln-query-result-v1", ("query_sha256",)),
+        ("fsrvln-handover-result-v1", ("bundle_sha256",)),
+    ),
+)
+@pytest.mark.parametrize("suffix", ("\n", "0"))
+def test_fsrvln_digests_and_git_shas_reject_trailing_characters(
+    contract: ContractSet,
+    schema_name: str,
+    path: tuple[str, ...],
+    suffix: str,
+):
+    document = _fsrvln_documents()[schema_name]
+    target = document
+    for field in path[:-1]:
+        target = target[field]
+    target[path[-1]] += suffix
+
+    assert not contract.validate_document(schema_name, document).ok
+
+
+def test_fsrvln_digest_definitions_have_explicit_exact_lengths(contract: ContractSet):
+    for name, schema in contract.schemas.items():
+        if not name.startswith("fsrvln-"):
+            continue
+        for definition_name, definition in schema.get("$defs", {}).items():
+            if definition_name == "sha256":
+                assert definition["minLength"] == 64
+                assert definition["maxLength"] == 64
+            elif definition_name == "gitSha":
+                assert definition["minLength"] == 40
+                assert definition["maxLength"] == 40
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    (
+        "2026-08-18Z",
+        "2026-08-18T00Z",
+        "2026-08-18T00:00Z",
+        "2026-08-18T00:00:00+00:00",
+        "2026-08-18T00:00:00Z\n",
+        "2026-02-30T00:00:00Z",
+        "2026-08-18T24:00:00Z",
+    ),
+)
+def test_fsrvln_timestamps_require_strict_utc_rfc3339_seconds(
+    contract: ContractSet, timestamp: str
+):
+    document = _fsrvln_documents()["fsrvln-environment-v1"]
+    document["started_at"] = timestamp
+
+    assert not contract.validate_document("fsrvln-environment-v1", document).ok
+
+
+@pytest.mark.parametrize(
+    "timestamp", ("2026-08-18T00:00:00Z", "2026-08-18T00:00:00.123456Z")
+)
+def test_fsrvln_timestamps_accept_whole_or_fractional_utc_seconds(
+    contract: ContractSet, timestamp: str
+):
+    document = _fsrvln_documents()["fsrvln-environment-v1"]
+    document["started_at"] = timestamp
+
+    decision = contract.validate_document("fsrvln-environment-v1", document)
+
+    assert decision.ok, decision.errors
 
 
 @pytest.mark.parametrize("mode", tuple(PROFILE_GATES))
