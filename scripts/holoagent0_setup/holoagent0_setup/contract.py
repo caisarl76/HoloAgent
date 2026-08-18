@@ -1740,29 +1740,29 @@ def _is_number(value: object) -> bool:
     )
 
 
-def _is_datetime(value: str) -> bool:
+def _parse_utc_rfc3339_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
     match = _UTC_RFC3339_PATTERN.fullmatch(value)
     if match is None:
-        return False
+        return None
     fractional_seconds = match.group(1)
     normalized = value[:-1] + "+00:00"
     if fractional_seconds is not None:
         microseconds = fractional_seconds[:6].ljust(6, "0")
         normalized = f"{value[:19]}.{microseconds}+00:00"
     try:
-        datetime.fromisoformat(normalized)
+        return datetime.fromisoformat(normalized)
     except ValueError:
-        return False
-    return True
+        return None
+
+
+def _is_datetime(value: str) -> bool:
+    return _parse_utc_rfc3339_datetime(value) is not None
 
 
 def _parse_datetime(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.endswith("Z"):
-        return None
-    try:
-        return datetime.fromisoformat(value[:-1] + "+00:00")
-    except ValueError:
-        return None
+    return _parse_utc_rfc3339_datetime(value)
 
 
 def _is_uri(value: str) -> bool:

@@ -1593,6 +1593,86 @@ def test_result_timestamps_cannot_be_reversed(contract: ContractSet, mode: str):
     assert not contract.validate_result(value).ok
 
 
+def test_result_fractional_timestamps_cannot_bypass_reversed_order(
+    contract: ContractSet,
+):
+    value = make_pass_result("pc2_inventory")
+    value["started_at"] = "2026-08-05T00:00:00.2Z"
+    value["ended_at"] = "2026-08-05T00:00:00.1Z"
+
+    decision = contract.validate_result(value)
+
+    assert not decision.ok
+    assert "$.started_at/ended_at: result timestamps are reversed" in decision.errors
+
+
+def test_result_fractional_timestamps_preserve_valid_order(contract: ContractSet):
+    value = make_pass_result("pc2_inventory")
+    value["started_at"] = "2026-08-05T00:00:00.1Z"
+    value["ended_at"] = "2026-08-05T00:00:00.12Z"
+
+    decision = contract.validate_result(value)
+
+    assert decision.ok, decision.errors
+
+
+@pytest.mark.parametrize(
+    ("started", "sample", "ended", "expected_error"),
+    (
+        (
+            "2026-08-05T00:00:00.1Z",
+            "2026-08-05T00:00:00.12Z",
+            "2026-08-05T00:00:00.1234Z",
+            None,
+        ),
+        (
+            "2026-08-05T00:00:00.0000001Z",
+            "2026-08-05T00:00:00.1Z",
+            "2026-08-05T00:00:00.1234567Z",
+            None,
+        ),
+        (
+            "2026-08-05T00:00:00.12Z",
+            "2026-08-05T00:00:00.1Z",
+            "2026-08-05T00:00:00.1234Z",
+            "$.pc2_evidence.monitor_samples: sample is outside action window",
+        ),
+        (
+            "2026-08-05T00:00:00.1Z",
+            "2026-08-05T00:00:00.1234Z",
+            "2026-08-05T00:00:00.12Z",
+            "$.pc2_evidence.monitor_samples: sample is outside action window",
+        ),
+        (
+            "2026-08-05T00:00:00.12Z",
+            "2026-08-05T00:00:00.1234Z",
+            "2026-08-05T00:00:00.1Z",
+            "$.pc2_evidence: action window timestamps are reversed",
+        ),
+    ),
+)
+def test_pc2_fractional_window_and_sample_chronology(
+    contract: ContractSet,
+    started: str,
+    sample: str,
+    ended: str,
+    expected_error: str | None,
+):
+    value = make_pass_result("pc2_inventory")
+    evidence = value["pc2_evidence"]
+    evidence["action_window_started_at"] = started
+    evidence["monitor_samples"][0]["timestamp"] = sample
+    evidence["action_window_ended_at"] = ended
+
+    decision = contract.validate_result(value)
+
+    if expected_error is None:
+        assert decision.ok, decision.errors
+    else:
+        assert not decision.ok
+        assert expected_error in decision.errors
+
+
 def test_agentos_plan_semantics_are_closed(contract: ContractSet):
     plan = {
         "schema_version": "holoagent.agentos.plan.v1",
