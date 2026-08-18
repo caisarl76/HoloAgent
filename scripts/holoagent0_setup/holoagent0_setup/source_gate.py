@@ -31,6 +31,9 @@ REVIEWED_GIT = Path("/usr/bin/git")
 READ_CHUNK_BYTES = 1024 * 1024
 GIT_TIMEOUT_SECONDS = 15
 GIT_OUTPUT_LIMIT_BYTES = 1024 * 1024
+# TODO(Task 4): remove this temporary host-bound compatibility constant together
+# with the Mapping branches in measure_approved_asset_roots/verify_asset_lock.
+# New callers must construct HandoverPaths from the two deployment roots.
 APPROVED_ASSET_ROOTS = {
     "graph": Path(
         "/home/jihun/work/HoloAgent/fsr_vln/scene_graphs_opensource/horizon/"
@@ -86,6 +89,218 @@ class AssetGateError(RuntimeError):
     def __init__(self, reason: str, detail: str) -> None:
         self.reason = reason
         super().__init__(f"{reason}: {detail}")
+
+
+@dataclass(frozen=True)
+class PathIdentity:
+    path: Path
+    device: int
+    inode: int
+    mode: int
+
+
+@dataclass(frozen=True, init=False)
+class HandoverPaths:
+    repository_root: Path
+    data_root: Path
+    graph: Path
+    dataset: Path
+    checkpoint: Path
+    asset_lock: Path
+    identities: tuple[PathIdentity, ...]
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        raise TypeError("HandoverPaths must be constructed with from_roots")
+
+    @classmethod
+    def from_roots(cls, repository_root: Path, data_root: Path) -> "HandoverPaths":
+        """Derive and retain the complete path closure from exactly two roots."""
+        repository = _normalized_absolute_path(
+            repository_root, "repository_root", "HANDOVER"
+        )
+        data = _normalized_absolute_path(data_root, "data_root", "HANDOVER")
+        root_specs = (
+            ("repository_root", repository, "directory"),
+            ("data_root", data, "directory"),
+        )
+        root_identities = tuple(
+            _snapshot_handover_path(path, role, kind) for role, path, kind in root_specs
+        )
+        if _paths_overlap(repository, data):
+            raise AssetGateError(
+                "HANDOVER_PATH_OVERLAP",
+                "repository_root and data_root must be disjoint",
+            )
+
+        graph = (
+            data
+            / "fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/graph_20260629211448"
+        )
+        dataset = data / "fsr_vln/rgbd_datasets/icra_ic4f"
+        checkpoint = data / "fsr_vln/checkpoints/open_clip_pytorch_model.bin"
+        asset_lock = (
+            repository / "scripts/holoagent0_setup/locks/icra_ic4f-assets-v1.json"
+        )
+        derived_specs = (
+            ("graph", graph, "directory"),
+            ("dataset", dataset, "directory"),
+            ("checkpoint", checkpoint, "regular_file"),
+            ("asset_lock", asset_lock, "regular_file"),
+        )
+        derived_identities = tuple(
+            _snapshot_handover_path(path, role, kind)
+            for role, path, kind in derived_specs
+        )
+        instance = object.__new__(cls)
+        for field, value in (
+            ("repository_root", repository),
+            ("data_root", data),
+            ("graph", graph),
+            ("dataset", dataset),
+            ("checkpoint", checkpoint),
+            ("asset_lock", asset_lock),
+            ("identities", root_identities + derived_identities),
+        ):
+            object.__setattr__(instance, field, value)
+        return instance
+
+    def revalidate(self) -> None:
+        """Fail closed unless every retained path still names its exact object."""
+        kinds = (
+            "directory",
+            "directory",
+            "directory",
+            "directory",
+            "regular_file",
+            "regular_file",
+        )
+        roles = (
+            "repository_root",
+            "data_root",
+            "graph",
+            "dataset",
+            "checkpoint",
+            "asset_lock",
+        )
+        for expected, role, kind in zip(self.identities, roles, kinds):
+            try:
+                actual = _snapshot_handover_path(expected.path, role, kind)
+            except AssetGateError as error:
+                raise AssetGateError(
+                    "HANDOVER_PATH_IDENTITY_CHANGED",
+                    f"{role}: {error}",
+                ) from error
+            if actual != expected:
+                raise AssetGateError(
+                    "HANDOVER_PATH_IDENTITY_CHANGED",
+                    f"{role}: device, inode, or mode changed",
+                )
+
+
+def _normalized_absolute_path(value: Path, role: str, prefix: str) -> Path:
+    try:
+        raw = os.fspath(value)
+    except TypeError as error:
+        raise AssetGateError(
+            f"{prefix}_PATH_INVALID", f"{role}: path-like value required"
+        ) from error
+    if not isinstance(raw, str):
+        raise AssetGateError(f"{prefix}_PATH_INVALID", f"{role}: text path required")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise AssetGateError(f"{prefix}_PATH_NOT_ABSOLUTE", f"{role}: {raw}")
+    if raw != os.path.normpath(raw) or raw != path.as_posix():
+        raise AssetGateError(f"{prefix}_PATH_NOT_NORMALIZED", f"{role}: {raw}")
+    return path
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first == second or first in second.parents or second in first.parents
+
+
+def _identity_triplet(value: os.stat_result) -> tuple[int, int, int]:
+    return value.st_dev, value.st_ino, value.st_mode
+
+
+def _lstat_without_symlink_components(path: Path, role: str) -> os.stat_result:
+    current = Path(path.anchor)
+    final = current.lstat()
+    for component in path.parts[1:]:
+        current /= component
+        final = current.lstat()
+        if stat.S_ISLNK(final.st_mode):
+            raise AssetGateError(
+                "HANDOVER_PATH_ALIAS",
+                f"{role}: symlink component is forbidden: {current}",
+            )
+    return final
+
+
+def _open_absolute_no_follow(path: Path, *, directory: bool) -> int:
+    directory_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path.anchor, directory_flags)
+    try:
+        components = path.parts[1:]
+        for index, component in enumerate(components):
+            final = index == len(components) - 1
+            flags = (
+                directory_flags
+                if not final or directory
+                else os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+            )
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _snapshot_handover_path(path: Path, role: str, kind: str) -> PathIdentity:
+    try:
+        before = _lstat_without_symlink_components(path, role)
+        expected_type = stat.S_ISDIR if kind == "directory" else stat.S_ISREG
+        if not expected_type(before.st_mode):
+            raise AssetGateError(
+                "HANDOVER_PATH_TYPE_MISMATCH",
+                f"{role}: expected {kind}: {path}",
+            )
+        descriptor = _open_absolute_no_follow(path, directory=kind == "directory")
+        try:
+            opened = os.fstat(descriptor)
+            after = os.stat(path, follow_symlinks=False)
+        finally:
+            os.close(descriptor)
+        if _identity_triplet(before) != _identity_triplet(opened) or _identity_triplet(
+            before
+        ) != _identity_triplet(after):
+            raise AssetGateError(
+                "HANDOVER_PATH_IDENTITY_CHANGED",
+                f"{role}: identity changed while validating: {path}",
+            )
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise AssetGateError(
+                "HANDOVER_PATH_ALIAS", f"{role}: cannot resolve strictly: {path}"
+            ) from error
+        if resolved != path:
+            raise AssetGateError(
+                "HANDOVER_PATH_ALIAS",
+                f"{role}: spelling does not equal strict resolution: {path}",
+            )
+        return PathIdentity(path, before.st_dev, before.st_ino, before.st_mode)
+    except AssetGateError:
+        raise
+    except FileNotFoundError as error:
+        raise AssetGateError("HANDOVER_PATH_UNAVAILABLE", f"{role}: {path}") from error
+    except OSError as error:
+        raise AssetGateError(
+            "HANDOVER_PATH_UNAVAILABLE", f"{role}: {path}: {error}"
+        ) from error
 
 
 @dataclass(frozen=True)
@@ -1084,6 +1299,122 @@ def verify_asset_inventory(root: Path, asset: AssetSpec) -> AssetManifest:
     return measured
 
 
+def prepare_handover_run_directory(path: Path, paths: HandoverPaths) -> PathIdentity:
+    """Open one isolated empty run directory without following path aliases."""
+    if not isinstance(paths, HandoverPaths):
+        raise AssetGateError(
+            "RUN_PATH_INVALID", "a validated HandoverPaths instance is required"
+        )
+    paths.revalidate()
+    run = _normalized_absolute_path(path, "run_directory", "RUN")
+    restricted = (
+        paths.repository_root,
+        paths.data_root,
+        paths.graph,
+        paths.dataset,
+        paths.checkpoint,
+        paths.asset_lock,
+    )
+    if any(_paths_overlap(run, retained) for retained in restricted):
+        raise AssetGateError(
+            "RUN_PATH_OVERLAP",
+            f"run_directory overlaps a retained handover path: {run}",
+        )
+
+    parent = run.parent
+    try:
+        parent_identity = _snapshot_handover_path(
+            parent, "run_directory parent", "directory"
+        )
+    except AssetGateError as error:
+        if error.reason == "HANDOVER_PATH_ALIAS":
+            reason = "RUN_PATH_ALIAS"
+        elif error.reason == "HANDOVER_PATH_UNAVAILABLE":
+            reason = "RUN_PARENT_UNAVAILABLE"
+        else:
+            reason = "RUN_PATH_INVALID"
+        raise AssetGateError(reason, str(error)) from error
+
+    parent_fd = -1
+    run_fd = -1
+    try:
+        parent_fd = _open_absolute_no_follow(parent, directory=True)
+        if _identity_triplet(os.fstat(parent_fd)) != (
+            parent_identity.device,
+            parent_identity.inode,
+            parent_identity.mode,
+        ):
+            raise AssetGateError(
+                "RUN_IDENTITY_CHANGED", "run_directory parent changed before use"
+            )
+        try:
+            initial = os.stat(run.name, dir_fd=parent_fd, follow_symlinks=False)
+            exists = True
+        except FileNotFoundError:
+            exists = False
+            try:
+                os.mkdir(run.name, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError as error:
+                raise AssetGateError(
+                    "RUN_IDENTITY_CHANGED",
+                    "run_directory appeared during atomic creation",
+                ) from error
+            initial = os.stat(run.name, dir_fd=parent_fd, follow_symlinks=False)
+
+        if stat.S_ISLNK(initial.st_mode):
+            raise AssetGateError("RUN_PATH_ALIAS", f"run_directory is a symlink: {run}")
+        if not stat.S_ISDIR(initial.st_mode):
+            raise AssetGateError(
+                "RUN_PATH_INVALID", f"run_directory is not a directory: {run}"
+            )
+        flags = (
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        )
+        run_fd = os.open(run.name, flags, dir_fd=parent_fd)
+        opened = os.fstat(run_fd)
+        if _identity_triplet(initial) != _identity_triplet(opened):
+            raise AssetGateError(
+                "RUN_IDENTITY_CHANGED", "run_directory changed while opening"
+            )
+        if not exists:
+            os.fchmod(run_fd, 0o700)
+            opened = os.fstat(run_fd)
+        if os.listdir(run_fd):
+            raise AssetGateError(
+                "RUN_DIRECTORY_NOT_EMPTY",
+                f"run_directory must be explicitly empty: {run}",
+            )
+        after_fd = os.fstat(run_fd)
+        after_path = os.stat(run.name, dir_fd=parent_fd, follow_symlinks=False)
+        if _identity_triplet(opened) != _identity_triplet(
+            after_fd
+        ) or _identity_triplet(opened) != _identity_triplet(after_path):
+            raise AssetGateError(
+                "RUN_IDENTITY_CHANGED", "run_directory changed while validating"
+            )
+        try:
+            parent_after = _snapshot_handover_path(
+                parent, "run_directory parent", "directory"
+            )
+        except AssetGateError as error:
+            raise AssetGateError("RUN_IDENTITY_CHANGED", str(error)) from error
+        if parent_after != parent_identity:
+            raise AssetGateError(
+                "RUN_IDENTITY_CHANGED", "run_directory parent identity changed"
+            )
+        paths.revalidate()
+        return PathIdentity(run, opened.st_dev, opened.st_ino, opened.st_mode)
+    except AssetGateError:
+        raise
+    except OSError as error:
+        raise AssetGateError("RUN_IDENTITY_CHANGED", str(error)) from error
+    finally:
+        if run_fd >= 0:
+            os.close(run_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
 def _validated_asset_roots(asset_roots: Mapping[str, Path]) -> dict[str, Path]:
     if not isinstance(asset_roots, Mapping) or set(asset_roots) != set(
         APPROVED_ASSET_ROOTS
@@ -1103,17 +1434,58 @@ def _validated_asset_roots(asset_roots: Mapping[str, Path]) -> dict[str, Path]:
 
 
 def measure_approved_asset_roots(
-    asset_roots: Mapping[str, Path],
+    asset_roots: HandoverPaths | Mapping[str, Path],
 ) -> dict[str, AssetManifest]:
     """Measure only the three explicitly approved roots, never searched roots."""
+    if isinstance(asset_roots, HandoverPaths):
+        asset_roots.revalidate()
+        roots = {
+            "graph": asset_roots.graph,
+            "dataset": asset_roots.dataset,
+            "checkpoint": asset_roots.checkpoint,
+        }
+        measured = {
+            role: canonical_asset_manifest(root) for role, root in roots.items()
+        }
+        asset_roots.revalidate()
+        return measured
+    # TODO(Task 4): remove this legacy Mapping branch after semantic migration.
     roots = _validated_asset_roots(asset_roots)
     return {role: canonical_asset_manifest(roots[role]) for role in roots}
 
 
 def verify_asset_lock(
-    asset_roots: Mapping[str, Path], source: Path | Mapping[str, Any]
+    asset_roots: HandoverPaths | Mapping[str, Path],
+    source: Path | Mapping[str, Any] | None = None,
 ) -> tuple[AssetManifest, ...]:
     """Verify pinned assets in place; missing assets never receive substitutes."""
+    if isinstance(asset_roots, HandoverPaths):
+        if source is not None:
+            raise AssetGateError(
+                "ASSET_ROOT_MISMATCH",
+                "HandoverPaths verification always uses its derived asset_lock",
+            )
+        asset_roots.revalidate()
+        roots = {
+            "graph": asset_roots.graph,
+            "dataset": asset_roots.dataset,
+            "checkpoint": asset_roots.checkpoint,
+        }
+        lock = load_asset_lock(asset_roots.asset_lock)
+        if tuple(asset.role for asset in lock.assets) != tuple(roots):
+            raise AssetGateError(
+                "ASSET_ROOT_MISMATCH", "asset lock does not use the exact role set"
+            )
+        results = tuple(
+            verify_asset_inventory(roots[asset.role], asset) for asset in lock.assets
+        )
+        asset_roots.revalidate()
+        return results
+    # TODO(Task 4): remove this legacy Mapping branch after semantic migration.
+    if source is None:
+        raise AssetGateError(
+            "ASSET_ROOT_MISMATCH", "legacy asset verification requires its lock"
+        )
     roots = _validated_asset_roots(asset_roots)
     lock = load_asset_lock(source)
     results = []

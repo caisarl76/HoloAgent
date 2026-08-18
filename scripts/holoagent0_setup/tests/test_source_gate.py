@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -14,12 +15,17 @@ from holoagent0_setup.source_gate import (
     APPROVED_ASSET_ROOTS,
     SOURCE_COMMIT,
     SOURCE_LOCK_SCHEMA,
+    AssetManifest,
     AssetSpec,
     AssetGateError,
+    HandoverPaths,
+    PathIdentity,
     SourceGateError,
     canonical_asset_manifest,
     load_asset_lock,
     load_source_lock,
+    measure_approved_asset_roots,
+    prepare_handover_run_directory,
     verify_asset_lock,
     verify_manifest_git_objects,
     verify_source_worktree,
@@ -39,6 +45,449 @@ EXPECTED_SOURCE_COMMIT = "ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8"
 EXPECTED_PATH_SET_SHA256 = (
     "968b39b7a16021b65e4d0adbcc33528007d42c7d4c52aee03f9c70c563ad50dc"
 )
+
+
+def _populate_handover_roots(repository_root, data_root):
+    graph = (
+        data_root
+        / "fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/graph_20260629211448"
+    )
+    dataset = data_root / "fsr_vln/rgbd_datasets/icra_ic4f"
+    checkpoint = data_root / "fsr_vln/checkpoints/open_clip_pytorch_model.bin"
+    asset_lock = (
+        repository_root / "scripts/holoagent0_setup/locks/icra_ic4f-assets-v1.json"
+    )
+    graph.mkdir(parents=True)
+    dataset.mkdir(parents=True)
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+    asset_lock.parent.mkdir(parents=True)
+    asset_lock.write_text("{}", encoding="utf-8")
+
+
+def _make_handover_layout(tmp_path):
+    repository_root = tmp_path / "repository"
+    data_root = tmp_path / "data"
+    _populate_handover_roots(repository_root, data_root)
+    return repository_root, data_root
+
+
+def _handover_paths(tmp_path):
+    return HandoverPaths.from_roots(*_make_handover_layout(tmp_path))
+
+
+def test_handover_paths_derives_the_exact_roles_and_retains_identity(tmp_path):
+    repository_root, data_root = _make_handover_layout(tmp_path)
+
+    paths = HandoverPaths.from_roots(repository_root, data_root)
+
+    assert paths.repository_root == repository_root
+    assert paths.data_root == data_root
+    assert paths.graph == (
+        data_root
+        / "fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/graph_20260629211448"
+    )
+    assert paths.dataset == data_root / "fsr_vln/rgbd_datasets/icra_ic4f"
+    assert paths.checkpoint == (
+        data_root / "fsr_vln/checkpoints/open_clip_pytorch_model.bin"
+    )
+    assert paths.asset_lock == (
+        repository_root / "scripts/holoagent0_setup/locks/icra_ic4f-assets-v1.json"
+    )
+    assert isinstance(paths.identities, tuple)
+    assert tuple(identity.path for identity in paths.identities) == (
+        paths.repository_root,
+        paths.data_root,
+        paths.graph,
+        paths.dataset,
+        paths.checkpoint,
+        paths.asset_lock,
+    )
+    assert all(isinstance(identity, PathIdentity) for identity in paths.identities)
+    assert all(identity.device > 0 for identity in paths.identities)
+    assert all(identity.inode > 0 for identity in paths.identities)
+    assert all(identity.mode > 0 for identity in paths.identities)
+    assert stat.S_ISDIR(paths.identities[0].mode)
+    assert stat.S_ISDIR(paths.identities[1].mode)
+    assert stat.S_ISDIR(paths.identities[2].mode)
+    assert stat.S_ISDIR(paths.identities[3].mode)
+    assert stat.S_ISREG(paths.identities[4].mode)
+    assert stat.S_ISREG(paths.identities[5].mode)
+    assert paths.revalidate() is None
+
+
+def test_handover_paths_cannot_be_constructed_with_caller_role_paths(tmp_path):
+    repository_root, data_root = _make_handover_layout(tmp_path)
+
+    with pytest.raises(TypeError, match="from_roots"):
+        HandoverPaths(
+            repository_root=repository_root,
+            data_root=data_root,
+            graph=tmp_path / "substituted",
+            dataset=tmp_path / "substituted",
+            checkpoint=tmp_path / "substituted",
+            asset_lock=tmp_path / "substituted",
+            identities=(),
+        )
+
+
+@pytest.mark.parametrize("role", ["repository", "data"])
+def test_handover_paths_rejects_relative_roots(tmp_path, role):
+    repository_root, data_root = _make_handover_layout(tmp_path)
+    roots = {
+        "repository": repository_root,
+        "data": data_root,
+    }
+    roots[role] = Path(roots[role].name)
+
+    with pytest.raises(AssetGateError) as caught:
+        HandoverPaths.from_roots(roots["repository"], roots["data"])
+
+    assert caught.value.reason == "HANDOVER_PATH_NOT_ABSOLUTE"
+
+
+@pytest.mark.parametrize("role", ["repository", "data"])
+def test_handover_paths_rejects_lexically_unnormalized_roots(tmp_path, role):
+    repository_root, data_root = _make_handover_layout(tmp_path)
+    roots = {
+        "repository": repository_root,
+        "data": data_root,
+    }
+    roots[role] = roots[role] / ".." / roots[role].name
+
+    with pytest.raises(AssetGateError) as caught:
+        HandoverPaths.from_roots(roots["repository"], roots["data"])
+
+    assert caught.value.reason == "HANDOVER_PATH_NOT_NORMALIZED"
+
+
+@pytest.mark.parametrize("kind", ["missing", "file"])
+@pytest.mark.parametrize("role", ["repository", "data"])
+def test_handover_paths_rejects_missing_or_nondirectory_roots(tmp_path, role, kind):
+    repository_root, data_root = _make_handover_layout(tmp_path)
+    invalid = tmp_path / f"invalid-{role}-{kind}"
+    if kind == "file":
+        invalid.write_bytes(b"not a directory")
+    roots = {"repository": repository_root, "data": data_root}
+    roots[role] = invalid
+
+    with pytest.raises(AssetGateError) as caught:
+        HandoverPaths.from_roots(roots["repository"], roots["data"])
+
+    assert caught.value.reason in {
+        "HANDOVER_PATH_UNAVAILABLE",
+        "HANDOVER_PATH_TYPE_MISMATCH",
+    }
+
+
+@pytest.mark.parametrize("relationship", ["equal", "repository_above", "data_above"])
+def test_handover_paths_rejects_root_overlap_in_both_directions(tmp_path, relationship):
+    if relationship == "equal":
+        repository_root = data_root = tmp_path / "shared"
+    elif relationship == "repository_above":
+        repository_root = tmp_path / "repository"
+        data_root = repository_root / "data"
+    else:
+        data_root = tmp_path / "data"
+        repository_root = data_root / "repository"
+    _populate_handover_roots(repository_root, data_root)
+
+    with pytest.raises(AssetGateError) as caught:
+        HandoverPaths.from_roots(repository_root, data_root)
+
+    assert caught.value.reason == "HANDOVER_PATH_OVERLAP"
+
+
+@pytest.mark.parametrize(
+    "alias", ["root_component", "root_final", "derived_component", "derived_final"]
+)
+def test_handover_paths_rejects_root_and_derived_symlink_aliases(tmp_path, alias):
+    if alias == "root_component":
+        real_parent = tmp_path / "real-parent"
+        repository_root = real_parent / "repository"
+        data_root = tmp_path / "data"
+        _populate_handover_roots(repository_root, data_root)
+        (tmp_path / "alias-parent").symlink_to(real_parent, target_is_directory=True)
+        repository_root = tmp_path / "alias-parent/repository"
+    else:
+        repository_root, data_root = _make_handover_layout(tmp_path)
+        if alias == "root_final":
+            real_repository = tmp_path / "real-repository"
+            repository_root.rename(real_repository)
+            repository_root.symlink_to(real_repository, target_is_directory=True)
+        elif alias == "derived_component":
+            component = data_root / "fsr_vln/scene_graphs_opensource"
+            real_component = tmp_path / "real-scene-graphs"
+            component.rename(real_component)
+            component.symlink_to(real_component, target_is_directory=True)
+        else:
+            graph = (
+                data_root
+                / "fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/graph_20260629211448"
+            )
+            real_graph = tmp_path / "real-graph"
+            graph.rename(real_graph)
+            graph.symlink_to(real_graph, target_is_directory=True)
+
+    with pytest.raises(AssetGateError) as caught:
+        HandoverPaths.from_roots(repository_root, data_root)
+
+    assert caught.value.reason == "HANDOVER_PATH_ALIAS"
+
+
+@pytest.mark.parametrize("role", ["graph", "dataset", "checkpoint", "asset_lock"])
+def test_handover_paths_rejects_missing_derived_roles(tmp_path, role):
+    paths = _handover_paths(tmp_path)
+    target = getattr(paths, role)
+    if target.is_dir():
+        target.rmdir()
+    else:
+        target.unlink()
+
+    with pytest.raises(AssetGateError) as caught:
+        HandoverPaths.from_roots(paths.repository_root, paths.data_root)
+
+    assert caught.value.reason == "HANDOVER_PATH_UNAVAILABLE"
+    assert role in str(caught.value)
+
+
+@pytest.mark.parametrize("role", ["checkpoint", "asset_lock"])
+def test_handover_paths_rejects_nonregular_file_roles(tmp_path, role):
+    paths = _handover_paths(tmp_path)
+    target = getattr(paths, role)
+    target.unlink()
+    target.mkdir()
+
+    with pytest.raises(AssetGateError) as caught:
+        HandoverPaths.from_roots(paths.repository_root, paths.data_root)
+
+    assert caught.value.reason == "HANDOVER_PATH_TYPE_MISMATCH"
+    assert role in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "role",
+    ["repository_root", "data_root", "graph", "dataset", "checkpoint", "asset_lock"],
+)
+@pytest.mark.parametrize("mutation", ["replacement", "mode"])
+def test_handover_paths_revalidate_rejects_role_identity_or_mode_drift(
+    tmp_path, role, mutation
+):
+    paths = _handover_paths(tmp_path)
+    target = getattr(paths, role)
+    if mutation == "mode":
+        target.chmod(stat.S_IMODE(target.stat().st_mode) ^ stat.S_IWUSR)
+    elif target.is_dir():
+        original = target.with_name(f"{target.name}-original")
+        target.rename(original)
+        target.mkdir()
+    else:
+        target.rename(target.with_name(f"{target.name}-original"))
+        target.write_bytes(b"replacement")
+
+    with pytest.raises(AssetGateError) as caught:
+        paths.revalidate()
+
+    assert caught.value.reason == "HANDOVER_PATH_IDENTITY_CHANGED"
+    assert role.replace("_root", "") in str(caught.value)
+
+
+def test_new_asset_measurement_uses_only_derived_exact_roles(tmp_path, monkeypatch):
+    paths = _handover_paths(tmp_path)
+    observed = []
+    sentinel = AssetManifest(0, 0, hashlib.sha256(b"").hexdigest(), ())
+
+    def measure(path):
+        observed.append(path)
+        return sentinel
+
+    monkeypatch.setattr(source_gate, "canonical_asset_manifest", measure)
+
+    measured = measure_approved_asset_roots(paths)
+
+    assert measured == {
+        "graph": sentinel,
+        "dataset": sentinel,
+        "checkpoint": sentinel,
+    }
+    assert observed == [paths.graph, paths.dataset, paths.checkpoint]
+
+
+def test_new_asset_verification_uses_the_derived_lock_and_role_set(
+    tmp_path, monkeypatch
+):
+    paths = _handover_paths(tmp_path)
+    loaded = []
+    verified = []
+    assets = tuple(
+        AssetSpec(role, "file", role, 1, 1, "0" * 64, ())
+        for role in ("graph", "dataset", "checkpoint")
+    )
+
+    def load(source):
+        loaded.append(source)
+        return SimpleNamespace(assets=assets)
+
+    def verify(root, asset):
+        verified.append((root, asset.role))
+        return asset.role
+
+    monkeypatch.setattr(source_gate, "load_asset_lock", load)
+    monkeypatch.setattr(source_gate, "verify_asset_inventory", verify)
+
+    assert verify_asset_lock(paths) == ("graph", "dataset", "checkpoint")
+    assert loaded == [paths.asset_lock]
+    assert verified == [
+        (paths.graph, "graph"),
+        (paths.dataset, "dataset"),
+        (paths.checkpoint, "checkpoint"),
+    ]
+
+
+def test_prepare_handover_run_directory_atomically_creates_owner_only_directory(
+    tmp_path,
+):
+    paths = _handover_paths(tmp_path)
+    run_parent = tmp_path / "runs"
+    run_parent.mkdir()
+    run = run_parent / "fixture"
+
+    identity = prepare_handover_run_directory(run, paths)
+
+    assert identity.path == run
+    assert (identity.device, identity.inode, identity.mode) == (
+        run.stat().st_dev,
+        run.stat().st_ino,
+        run.stat().st_mode,
+    )
+    assert stat.S_ISDIR(identity.mode)
+    assert stat.S_IMODE(identity.mode) == 0o700
+    assert tuple(run.iterdir()) == ()
+
+
+def test_prepare_handover_run_directory_accepts_empty_existing_real_directory(
+    tmp_path,
+):
+    paths = _handover_paths(tmp_path)
+    run = tmp_path / "empty-run"
+    run.mkdir(mode=0o750)
+
+    identity = prepare_handover_run_directory(run, paths)
+
+    assert identity.path == run
+    assert identity.inode == run.stat().st_ino
+    assert stat.S_IMODE(identity.mode) == 0o750
+
+
+def test_prepare_handover_run_directory_rejects_relative_path(tmp_path):
+    paths = _handover_paths(tmp_path)
+
+    with pytest.raises(AssetGateError) as caught:
+        prepare_handover_run_directory(Path("relative-run"), paths)
+
+    assert caught.value.reason == "RUN_PATH_NOT_ABSOLUTE"
+
+
+def test_prepare_handover_run_directory_rejects_unnormalized_path(tmp_path):
+    paths = _handover_paths(tmp_path)
+    run = tmp_path / "runs" / ".." / "run"
+
+    with pytest.raises(AssetGateError) as caught:
+        prepare_handover_run_directory(run, paths)
+
+    assert caught.value.reason == "RUN_PATH_NOT_NORMALIZED"
+
+
+@pytest.mark.parametrize("kind", ["nonempty", "file"])
+def test_prepare_handover_run_directory_rejects_nonempty_or_file_path(tmp_path, kind):
+    paths = _handover_paths(tmp_path)
+    run = tmp_path / f"{kind}-run"
+    if kind == "nonempty":
+        run.mkdir()
+        (run / "owned-by-user").write_bytes(b"preserve")
+    else:
+        run.write_bytes(b"preserve")
+
+    with pytest.raises(AssetGateError) as caught:
+        prepare_handover_run_directory(run, paths)
+
+    assert caught.value.reason in {"RUN_DIRECTORY_NOT_EMPTY", "RUN_PATH_INVALID"}
+    assert run.exists()
+    if kind == "nonempty":
+        assert (run / "owned-by-user").read_bytes() == b"preserve"
+    else:
+        assert run.read_bytes() == b"preserve"
+
+
+@pytest.mark.parametrize("alias", ["component", "final"])
+def test_prepare_handover_run_directory_rejects_symlink_components_and_final(
+    tmp_path, alias
+):
+    paths = _handover_paths(tmp_path)
+    real_parent = tmp_path / "real-runs"
+    real_parent.mkdir()
+    if alias == "component":
+        (tmp_path / "linked-runs").symlink_to(real_parent, target_is_directory=True)
+        run = tmp_path / "linked-runs/run"
+    else:
+        real_run = real_parent / "real-run"
+        real_run.mkdir()
+        run = tmp_path / "linked-run"
+        run.symlink_to(real_run, target_is_directory=True)
+
+    with pytest.raises(AssetGateError) as caught:
+        prepare_handover_run_directory(run, paths)
+
+    assert caught.value.reason == "RUN_PATH_ALIAS"
+
+
+@pytest.mark.parametrize(
+    "role",
+    ["repository_root", "data_root", "graph", "dataset", "checkpoint", "asset_lock"],
+)
+@pytest.mark.parametrize("relationship", ["equal", "inside", "above"])
+def test_prepare_handover_run_directory_rejects_role_overlap_in_both_directions(
+    tmp_path, role, relationship
+):
+    paths = _handover_paths(tmp_path)
+    restricted = getattr(paths, role)
+    if relationship == "equal":
+        run = restricted
+    elif relationship == "inside":
+        run = restricted / "run"
+    else:
+        run = restricted.parent
+
+    with pytest.raises(AssetGateError) as caught:
+        prepare_handover_run_directory(run, paths)
+
+    assert caught.value.reason == "RUN_PATH_OVERLAP"
+
+
+def test_prepare_handover_run_directory_rejects_identity_replacement_during_open(
+    tmp_path, monkeypatch
+):
+    paths = _handover_paths(tmp_path)
+    run = tmp_path / "run"
+    run.mkdir()
+    original_listdir = source_gate.os.listdir
+    replaced = False
+
+    def replace_after_open(path):
+        nonlocal replaced
+        result = original_listdir(path)
+        if not replaced:
+            replaced = True
+            run.rename(tmp_path / "original-run")
+            run.mkdir()
+        return result
+
+    monkeypatch.setattr(source_gate.os, "listdir", replace_after_open)
+
+    with pytest.raises(AssetGateError) as caught:
+        prepare_handover_run_directory(run, paths)
+
+    assert caught.value.reason == "RUN_IDENTITY_CHANGED"
 
 
 def _approved_paths() -> tuple[str, ...]:
@@ -289,9 +738,27 @@ def test_asset_lock_is_closed_and_pins_approved_roots_counts_and_digests():
         load_asset_lock(document)
 
 
-def test_generated_asset_lock_exactly_matches_the_three_approved_roots():
+def test_generated_asset_lock_exactly_matches_the_three_derived_roots(
+    tmp_path, monkeypatch
+):
     lock = load_asset_lock(ASSET_LOCK)
-    measured = source_gate.measure_approved_asset_roots(APPROVED_ASSET_ROOTS)
+    paths = _handover_paths(tmp_path)
+    by_path = {
+        getattr(paths, asset.role): AssetManifest(
+            file_count=asset.file_count,
+            byte_count=asset.byte_count,
+            sha256=asset.sha256,
+            files=asset.files,
+        )
+        for asset in lock.assets
+    }
+    monkeypatch.setattr(
+        source_gate,
+        "canonical_asset_manifest",
+        lambda path: by_path[path],
+    )
+
+    measured = source_gate.measure_approved_asset_roots(paths)
 
     assert [
         (
