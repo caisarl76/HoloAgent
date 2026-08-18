@@ -1379,6 +1379,7 @@ def prepare_handover_run_directory(path: Path, paths: HandoverPaths) -> PathIden
         if not exists:
             os.fchmod(run_fd, 0o700)
             opened = os.fstat(run_fd)
+        run_identity = PathIdentity(run, opened.st_dev, opened.st_ino, opened.st_mode)
         if os.listdir(run_fd):
             raise AssetGateError(
                 "RUN_DIRECTORY_NOT_EMPTY",
@@ -1403,7 +1404,29 @@ def prepare_handover_run_directory(path: Path, paths: HandoverPaths) -> PathIden
                 "RUN_IDENTITY_CHANGED", "run_directory parent identity changed"
             )
         paths.revalidate()
-        return PathIdentity(run, opened.st_dev, opened.st_ino, opened.st_mode)
+        try:
+            final_parent = _snapshot_handover_path(
+                parent, "run_directory parent", "directory"
+            )
+            final_fd = os.fstat(run_fd)
+            final_path = os.stat(run.name, dir_fd=parent_fd, follow_symlinks=False)
+        except (AssetGateError, OSError) as error:
+            raise AssetGateError("RUN_IDENTITY_CHANGED", str(error)) from error
+        expected = (
+            run_identity.device,
+            run_identity.inode,
+            run_identity.mode,
+        )
+        if (
+            final_parent != parent_identity
+            or _identity_triplet(final_fd) != expected
+            or _identity_triplet(final_path) != expected
+        ):
+            raise AssetGateError(
+                "RUN_IDENTITY_CHANGED",
+                "run_directory or its parent changed during final revalidation",
+            )
+        return run_identity
     except AssetGateError:
         raise
     except OSError as error:
