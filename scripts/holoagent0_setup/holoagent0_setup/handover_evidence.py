@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 from importlib import import_module, metadata
 import inspect
+import math
 import os
 from pathlib import Path
 import platform
@@ -20,11 +21,18 @@ from .atomic_io import (
     AtomicPublicationAmbiguity,
     atomic_write_json_no_replace,
     canonical_json_bytes,
+    read_json_secure,
 )
 from .contract import ContractError, ContractSet
 from .semantic_gate import (
+    CHECKPOINT_SHA256,
+    DATASET_ROOT_SHA256,
+    EXPECTED_SEMANTIC,
+    GRAPH_ROOT_SHA256,
     GraphCounts,
+    ROOM_NAME_MAPPING_SHA256,
     SemanticFixtureResult,
+    STRUCTURED_QUERY_SHA256,
     import_root_hmsg_runtime,
 )
 from .source_gate import (
@@ -665,6 +673,62 @@ class _RunDirectoryAuthority:
             self._descriptor = -1
 
 
+def _replay_published_document(
+    contract: ContractSet,
+    authority: _RunDirectoryAuthority,
+    schema_name: str,
+    filename: str,
+    expected_document: dict[str, object],
+    expected_descriptor: ArtifactDescriptor,
+) -> ArtifactDescriptor:
+    authority.revalidate()
+    value, replayed_descriptor = read_json_secure(
+        authority.path / filename,
+        expected_mode=0o600,
+        relative_to=authority.path,
+        directory_fd=authority.descriptor,
+    )
+    authority.revalidate()
+    if type(value) is not dict or value != expected_document:
+        raise AtomicIOError(f"replayed {filename} differs from expected document")
+    contract.require_valid_document(schema_name, value)
+    _require_descriptor_matches(replayed_descriptor, filename, expected_document)
+    if replayed_descriptor != expected_descriptor:
+        raise AtomicIOError(f"replayed {filename} differs from publication proof")
+    return replayed_descriptor
+
+
+def _require_reserved_names_absent(authority: _RunDirectoryAuthority) -> None:
+    authority.revalidate()
+    collisions: list[str] = []
+    for filename in (*EVIDENCE_ORDER, RESULT_FILE):
+        try:
+            os.stat(
+                filename,
+                dir_fd=authority.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise AtomicIOError(
+                f"reserved artifact name could not be inspected: {filename}"
+            ) from error
+        collisions.append(filename)
+    authority.revalidate()
+    if collisions:
+        raise EvidencePublicationError(
+            tuple(
+                PublicationFailure(
+                    filename,
+                    "reserved_name_collision",
+                    FileExistsError(f"reserved artifact name exists: {filename}"),
+                )
+                for filename in collisions
+            )
+        )
+
+
 def _semantic_failure(detail: str) -> EvidencePublicationError:
     return EvidencePublicationError(
         (
@@ -763,6 +827,126 @@ def _require_repository_binding(
         raise _semantic_failure(
             "environment PASS graph module origin disagrees with source root"
         )
+
+
+def _require_pass_stage_bindings(
+    source: Mapping[str, object],
+    asset: Mapping[str, object],
+    query: Mapping[str, object],
+    *,
+    accepted_implementation_commit: str | None,
+    authoritative_data_root: PathIdentity,
+) -> None:
+    if source.get("status") == "PASS" and accepted_implementation_commit != source.get(
+        "checkout_commit"
+    ):
+        raise _semantic_failure(
+            "accepted implementation commit disagrees with source checkout"
+        )
+
+    asset_rows: list[dict[str, object]] | None = None
+    if asset.get("status") == "PASS":
+        if asset.get("data_root") != path_identity_document(authoritative_data_root):
+            raise _semantic_failure(
+                "asset data root disagrees with authoritative data root"
+            )
+        observed_rows = asset.get("assets")
+        if type(observed_rows) is not list or len(observed_rows) != 3:
+            raise _semantic_failure("asset PASS requires exactly three asset rows")
+        if any(type(row) is not dict for row in observed_rows):
+            raise _semantic_failure("asset PASS rows must be exact objects")
+        asset_rows = observed_rows
+        if tuple(row.get("role") for row in asset_rows) != (
+            "graph",
+            "dataset",
+            "checkpoint",
+        ):
+            raise _semantic_failure(
+                "asset PASS roles must be graph, dataset, checkpoint in order"
+            )
+        expected_asset_digests = (
+            GRAPH_ROOT_SHA256,
+            DATASET_ROOT_SHA256,
+            CHECKPOINT_SHA256,
+        )
+        if tuple(row.get("sha256") for row in asset_rows) != expected_asset_digests:
+            raise _semantic_failure("asset PASS digests differ from pinned assets")
+
+    if query.get("status") != "PASS":
+        return
+    result = query.get("result")
+    if query.get("execution_count") != 1 or type(result) is not dict:
+        raise _semantic_failure(
+            "query PASS requires one execution and a semantic result"
+        )
+    if (
+        query.get("query_sha256") != STRUCTURED_QUERY_SHA256
+        or result.get("structured_query_sha256") != STRUCTURED_QUERY_SHA256
+    ):
+        raise _semantic_failure("query digest differs from the pinned structured query")
+
+    semantic_digests = (
+        result.get("graph_root_sha256"),
+        result.get("dataset_root_sha256"),
+        result.get("checkpoint_sha256"),
+        result.get("room_name_mapping_sha256"),
+    )
+    expected_semantic_digests = (
+        GRAPH_ROOT_SHA256,
+        DATASET_ROOT_SHA256,
+        CHECKPOINT_SHA256,
+        ROOM_NAME_MAPPING_SHA256,
+    )
+    if semantic_digests != expected_semantic_digests:
+        raise _semantic_failure("semantic result digests differ from pinned fixtures")
+    if (
+        asset_rows is not None
+        and tuple(row.get("sha256") for row in asset_rows) != semantic_digests[:3]
+    ):
+        raise _semantic_failure("semantic result digests disagree with asset evidence")
+
+    if result.get("graph_counts") != {
+        "floors": 1,
+        "rooms": 3,
+        "objects": 497,
+    }:
+        raise _semantic_failure("semantic graph counts differ from the pinned fixture")
+    expected = EXPECTED_SEMANTIC
+    observed_identity = (
+        result.get("graph_identity"),
+        result.get("floor_id"),
+        result.get("room"),
+        result.get("object"),
+        result.get("frame_id"),
+    )
+    expected_identity = (
+        expected.graph_identity,
+        expected.floor_id,
+        {"id": expected.room_id, "name": expected.room_name},
+        {"id": expected.object_id, "name": expected.object_name},
+        expected.frame_id,
+    )
+    if observed_identity != expected_identity:
+        raise _semantic_failure("semantic identities differ from the pinned fixture")
+
+    position = result.get("position")
+    if (
+        type(position) is not list
+        or len(position) != len(expected.position)
+        or any(type(value) not in {int, float} for value in position)
+        or any(
+            not math.isclose(
+                actual,
+                expected_value,
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            for actual, expected_value in zip(position, expected.position)
+        )
+    ):
+        raise _semantic_failure("semantic position differs from the pinned fixture")
+    if result.get("orientation") != list(expected.orientation):
+        raise _semantic_failure("semantic orientation differs from the pinned fixture")
 
 
 def _read_authoritative_file(
@@ -961,11 +1145,19 @@ def publish_handover_evidence(
         stage_documents[SOURCE_FILE],
         repository_root,
     )
+    _require_pass_stage_bindings(
+        stage_documents[SOURCE_FILE],
+        stage_documents[ASSET_FILE],
+        stage_documents[QUERY_FILE],
+        accepted_implementation_commit=accepted_implementation_commit,
+        authoritative_data_root=data_root,
+    )
 
     authority = _RunDirectoryAuthority.retain(
         Path(run_directory), run_directory_identity
     )
     try:
+        _require_reserved_names_absent(authority)
         descriptors: dict[str, ArtifactDescriptor] = {}
         failures: list[PublicationFailure] = []
         for filename in EVIDENCE_ORDER:
@@ -1019,6 +1211,34 @@ def publish_handover_evidence(
                 )
             raise EvidencePublicationError(tuple(failures))
 
+        replayed_descriptors: dict[str, ArtifactDescriptor] = {}
+        replay_failures: list[PublicationFailure] = []
+        for filename in EVIDENCE_ORDER:
+            try:
+                replayed_descriptors[filename] = _replay_published_document(
+                    contract,
+                    authority,
+                    _STAGE_SCHEMAS[filename],
+                    filename,
+                    stage_documents[filename],
+                    descriptors[filename],
+                )
+            except Exception as error:
+                replay_failures.append(
+                    PublicationFailure(filename, "stage_replay", error)
+                )
+        if replay_failures or tuple(replayed_descriptors) != EVIDENCE_ORDER:
+            if not replay_failures:
+                replay_failures.append(
+                    PublicationFailure(
+                        RESULT_FILE,
+                        "stage_replay",
+                        AtomicIOError("replayed stage descriptor set is incomplete"),
+                    )
+                )
+            raise EvidencePublicationError(tuple(replay_failures))
+        descriptors = replayed_descriptors
+
         evidence_files = [
             {
                 "name": filename,
@@ -1065,6 +1285,44 @@ def publish_handover_evidence(
                 expected_parent_identity=authority.parent_identity,
             )
             _require_descriptor_matches(terminal_descriptor, RESULT_FILE, terminal)
+            post_terminal_descriptors = {
+                filename: _replay_published_document(
+                    contract,
+                    authority,
+                    _STAGE_SCHEMAS[filename],
+                    filename,
+                    stage_documents[filename],
+                    descriptors[filename],
+                )
+                for filename in EVIDENCE_ORDER
+            }
+            replayed_terminal_descriptor = _replay_published_document(
+                contract,
+                authority,
+                "fsrvln-handover-result-v1",
+                RESULT_FILE,
+                terminal,
+                terminal_descriptor,
+            )
+            post_terminal_rows = [
+                {
+                    "name": filename,
+                    "sha256": post_terminal_descriptors[filename].sha256,
+                    "size": post_terminal_descriptors[filename].size,
+                }
+                for filename in EVIDENCE_ORDER
+            ]
+            post_terminal_bundle = hashlib.sha256(
+                canonical_json_bytes(post_terminal_rows)
+            ).hexdigest()
+            if (
+                terminal["evidence_files"] != post_terminal_rows
+                or terminal["bundle_sha256"] != post_terminal_bundle
+                or replayed_terminal_descriptor != terminal_descriptor
+            ):
+                raise AtomicIOError(
+                    "terminal content differs from replayed evidence bundle"
+                )
             authority.revalidate()
         except AtomicPublicationAmbiguity as error:
             quarantine_error: Exception | None = None

@@ -238,8 +238,10 @@ def _pass_documents(paths: HandoverPaths) -> dict[str, dict[str, object]]:
         SimpleNamespace(role=role) for role in ("graph", "dataset", "checkpoint")
     )
     manifests = tuple(
-        SimpleNamespace(file_count=index, byte_count=index * 10, sha256=f"{index:064x}")
-        for index in (1, 2, 3)
+        SimpleNamespace(file_count=index, byte_count=index * 10, sha256=digest)
+        for index, digest in enumerate(
+            (GRAPH_ROOT_SHA256, DATASET_ROOT_SHA256, CHECKPOINT_SHA256), start=1
+        )
     )
     asset = build_asset_document(
         paths,
@@ -747,7 +749,7 @@ def test_cuda_build_missing_diagnostics_publish_terminal_environment_failure(
         contract,
         run_directory,
         documents,
-        accepted_implementation_commit=None,
+        accepted_implementation_commit=GIT_SHA,
         repository_root=paths.identities[0],
         data_root=paths.identities[1],
         run_directory_identity=_identity(run_directory),
@@ -895,6 +897,310 @@ def test_publisher_rejects_source_repository_identity_path_alias(contract, tmp_p
     assert list(run_directory.iterdir()) == []
 
 
+def test_publisher_rejects_accepted_commit_mismatch_before_any_write(
+    contract, tmp_path
+):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+
+    with pytest.raises(RuntimeError):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            _pass_documents(paths),
+            accepted_implementation_commit="e" * 40,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert list(run_directory.iterdir()) == []
+
+
+def test_publisher_rejects_asset_data_root_mismatch_before_any_write(
+    contract, tmp_path
+):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    alternate_data = tmp_path / "alternate-data"
+    alternate_data.mkdir()
+    documents[ASSET_FILE]["data_root"] = path_identity_document(
+        _identity(alternate_data)
+    )
+
+    with pytest.raises(RuntimeError):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert list(run_directory.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "roles",
+    (
+        ("dataset", "graph", "checkpoint"),
+        ("graph", "graph", "checkpoint"),
+    ),
+)
+def test_publisher_rejects_asset_pass_roles_not_exactly_ordered_unique(
+    contract, tmp_path, roles
+):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    for row, role in zip(documents[ASSET_FILE]["assets"], roles):
+        row["role"] = role
+
+    with pytest.raises(RuntimeError):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert list(run_directory.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    (
+        "query_sha256",
+        "structured_query_sha256",
+        "graph_root_sha256",
+        "dataset_root_sha256",
+        "checkpoint_sha256",
+        "room_name_mapping_sha256",
+        "asset_graph_sha256",
+        "asset_dataset_sha256",
+        "asset_checkpoint_sha256",
+    ),
+)
+def test_publisher_rejects_each_pass_digest_mismatch(contract, tmp_path, mismatch):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    replacement = "f" * 64
+    if mismatch == "query_sha256":
+        documents[QUERY_FILE]["query_sha256"] = replacement
+    elif mismatch.startswith("asset_"):
+        role = mismatch.removeprefix("asset_").removesuffix("_sha256")
+        row = next(
+            row for row in documents[ASSET_FILE]["assets"] if row["role"] == role
+        )
+        row["sha256"] = replacement
+    else:
+        documents[QUERY_FILE]["result"][mismatch] = replacement
+
+    with pytest.raises(RuntimeError):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert list(run_directory.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    (
+        "counts",
+        "graph_identity",
+        "floor_id",
+        "room_id",
+        "room_name",
+        "object_id",
+        "object_name",
+        "frame_id",
+        "position",
+        "orientation",
+    ),
+)
+def test_publisher_rejects_each_pass_semantic_mismatch(contract, tmp_path, mismatch):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    result = documents[QUERY_FILE]["result"]
+    if mismatch == "counts":
+        result["graph_counts"]["objects"] = 496
+    elif mismatch == "room_id":
+        result["room"]["id"] = "other-room"
+    elif mismatch == "room_name":
+        result["room"]["name"] = "Office"
+    elif mismatch == "object_id":
+        result["object"]["id"] = "other-object"
+    elif mismatch == "object_name":
+        result["object"]["name"] = "table"
+    elif mismatch == "position":
+        result["position"][0] += 2e-6
+    elif mismatch == "orientation":
+        result["orientation"] = [0.0, 0.0, 1.0, 0.0]
+    else:
+        result[mismatch] = f"wrong-{mismatch}"
+
+    with pytest.raises(RuntimeError):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert list(run_directory.iterdir()) == []
+
+
+def test_publisher_rejects_pass_execution_count_before_any_write(
+    contract, monkeypatch, tmp_path
+):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    documents[QUERY_FILE]["execution_count"] = 2
+    attempts = []
+    real_write = evidence_module.atomic_write_json_no_replace
+
+    def recording_write(path, document, **kwargs):
+        attempts.append(path.name)
+        return real_write(path, document, **kwargs)
+
+    monkeypatch.setattr(
+        evidence_module, "atomic_write_json_no_replace", recording_write
+    )
+
+    with pytest.raises(RuntimeError):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert attempts == []
+    assert list(run_directory.iterdir()) == []
+
+
+def test_publisher_accepts_semantic_position_within_absolute_tolerance(
+    contract, tmp_path
+):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    documents[QUERY_FILE]["result"]["position"][0] += 5e-7
+
+    publish_handover_evidence(
+        contract,
+        run_directory,
+        documents,
+        accepted_implementation_commit=GIT_SHA,
+        repository_root=paths.identities[0],
+        data_root=paths.identities[1],
+        run_directory_identity=_identity(run_directory),
+        cpu_gpu_label="CPU",
+        started_at=STARTED,
+        finished_at=FINISHED,
+    )
+
+    terminal = json.loads((run_directory / RESULT_FILE).read_bytes())
+    assert terminal["status"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("filename", "kind"),
+    (
+        (ENVIRONMENT_FILE, "regular"),
+        (QUERY_FILE, "directory"),
+        (RESULT_FILE, "symlink"),
+    ),
+)
+def test_reserved_name_collision_rejects_before_first_write(
+    contract, monkeypatch, tmp_path, filename, kind
+):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    reserved = run_directory / filename
+    if kind == "regular":
+        reserved.write_bytes(b"reserved")
+    elif kind == "directory":
+        reserved.mkdir()
+    else:
+        reserved.symlink_to("missing-target")
+    paths = _fake_paths(tmp_path)
+    attempts = []
+    real_write = evidence_module.atomic_write_json_no_replace
+
+    def recording_write(path, document, **kwargs):
+        attempts.append(path.name)
+        return real_write(path, document, **kwargs)
+
+    monkeypatch.setattr(
+        evidence_module, "atomic_write_json_no_replace", recording_write
+    )
+
+    with pytest.raises(RuntimeError):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            _pass_documents(paths),
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert attempts == []
+    assert tuple(run_directory.iterdir()) == (reserved,)
+
+
 def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
     contract, monkeypatch, tmp_path
 ):
@@ -905,6 +1211,7 @@ def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
     run_identity = _identity(run_directory)
     calls = []
     authorities = []
+    replays = []
 
     class RecordingContract:
         def require_valid_document(self, schema_name, document):
@@ -923,6 +1230,19 @@ def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
     monkeypatch.setattr(
         evidence_module, "atomic_write_json_no_replace", recording_write
     )
+    real_read = evidence_module.read_json_secure
+
+    def recording_read(path, **kwargs):
+        replays.append(
+            (
+                path.name,
+                kwargs.get("directory_fd"),
+                kwargs.get("relative_to"),
+            )
+        )
+        return real_read(path, **kwargs)
+
+    monkeypatch.setattr(evidence_module, "read_json_secure", recording_read)
 
     terminal_descriptor = publish_handover_evidence(
         RecordingContract(),
@@ -937,7 +1257,7 @@ def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
         finished_at=FINISHED,
     )
 
-    assert calls == [
+    assert calls[:8] == [
         ("validate", "fsrvln-environment-v1"),
         ("write", ENVIRONMENT_FILE),
         ("validate", "fsrvln-source-verification-v1"),
@@ -946,8 +1266,21 @@ def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
         ("write", ASSET_FILE),
         ("validate", "fsrvln-query-result-v1"),
         ("write", QUERY_FILE),
+    ]
+    replay_validations = [
+        ("validate", "fsrvln-environment-v1"),
+        ("validate", "fsrvln-source-verification-v1"),
+        ("validate", "fsrvln-asset-verification-v1"),
+        ("validate", "fsrvln-query-result-v1"),
+    ]
+    assert calls[8:12] == replay_validations
+    assert calls[12:14] == [
         ("validate", "fsrvln-handover-result-v1"),
         ("write", RESULT_FILE),
+    ]
+    assert calls[14:] == [
+        *replay_validations,
+        ("validate", "fsrvln-handover-result-v1"),
     ]
     assert terminal_descriptor.relative_path == RESULT_FILE
     terminal_bytes = (run_directory / RESULT_FILE).read_bytes()
@@ -963,6 +1296,15 @@ def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
     assert all(
         identity_value == (run_identity.device, run_identity.inode)
         for _parent_fd, identity_value in authorities
+    )
+    assert [name for name, _directory_fd, _relative_to in replays] == [
+        *EVIDENCE_ORDER,
+        *EVIDENCE_ORDER,
+        RESULT_FILE,
+    ]
+    assert all(
+        directory_fd == retained_fd and relative_to == run_directory
+        for _name, directory_fd, relative_to in replays
     )
     with pytest.raises(OSError):
         os.fstat(retained_fd)
@@ -987,6 +1329,7 @@ def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
         filename: (run_directory / filename).read_bytes()
         for filename in (*EVIDENCE_ORDER, RESULT_FILE)
     }
+    calls_before_second_publication = list(calls)
     with pytest.raises(RuntimeError):
         publish_handover_evidence(
             contract,
@@ -1000,6 +1343,7 @@ def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
             started_at=STARTED,
             finished_at=FINISHED,
         )
+    assert calls == calls_before_second_publication
     assert before == {
         filename: (run_directory / filename).read_bytes()
         for filename in (*EVIDENCE_ORDER, RESULT_FILE)
@@ -1128,7 +1472,7 @@ def test_evidence_publisher_derives_fail_from_first_blocker_and_keeps_partial_ro
         contract,
         run_directory,
         documents,
-        accepted_implementation_commit=None,
+        accepted_implementation_commit=GIT_SHA,
         repository_root=paths.identities[0],
         data_root=paths.identities[1],
         run_directory_identity=_identity(run_directory),
@@ -1290,6 +1634,92 @@ def test_run_directory_replacement_fails_closed_and_later_attempts_keep_authorit
         os.fstat(retained_fd)
     assert not (run_directory / RESULT_FILE).exists()
     assert not (moved_directory / RESULT_FILE).exists()
+
+
+def test_stage_replacement_after_write_is_detected_before_terminal(
+    contract, monkeypatch, tmp_path
+):
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    real_write = evidence_module.atomic_write_json_no_replace
+
+    def replace_stage_after_last_write(path, document, **kwargs):
+        descriptor = real_write(path, document, **kwargs)
+        if path.name == QUERY_FILE:
+            target = run_directory / ENVIRONMENT_FILE
+            replacement = run_directory / ".replacement-environment"
+            replacement.write_bytes(target.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, target)
+        return descriptor
+
+    monkeypatch.setattr(
+        evidence_module,
+        "atomic_write_json_no_replace",
+        replace_stage_after_last_write,
+    )
+
+    with pytest.raises(RuntimeError):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert not (run_directory / RESULT_FILE).exists()
+
+
+def test_post_terminal_stage_tamper_removes_authoritative_terminal(
+    contract, monkeypatch, tmp_path
+):
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    real_write = evidence_module.atomic_write_json_no_replace
+
+    def replace_stage_after_terminal(path, document, **kwargs):
+        descriptor = real_write(path, document, **kwargs)
+        if path.name == RESULT_FILE:
+            target = run_directory / QUERY_FILE
+            replacement = run_directory / ".replacement-query"
+            replacement.write_bytes(target.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, target)
+        return descriptor
+
+    monkeypatch.setattr(
+        evidence_module,
+        "atomic_write_json_no_replace",
+        replace_stage_after_terminal,
+    )
+
+    with pytest.raises(RuntimeError):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert not (run_directory / RESULT_FILE).exists()
+    quarantines = tuple(run_directory.glob(f".{RESULT_FILE}.quarantine-*"))
+    assert len(quarantines) == 1
 
 
 def test_ambiguous_terminal_is_quarantined_and_never_returned_as_success(
