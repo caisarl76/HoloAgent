@@ -557,16 +557,22 @@ def load_real_hmsg_adapter(
     )
 
 
-def verify_cyclone_roles(
-    repository_root: Path, asset_source: Path | Mapping[str, Any]
-) -> CycloneConfigSet:
+def verify_cyclone_roles(paths: HandoverPaths) -> CycloneConfigSet:
     """Delegate Cyclone authority to the existing production policy loader."""
-    root = Path(repository_root).resolve(strict=True)
     try:
-        lock = load_asset_lock(asset_source)
+        if not isinstance(paths, HandoverPaths):
+            raise AssetGateError(
+                "ASSET_ROOT_MISMATCH",
+                "a validated HandoverPaths instance is required",
+            )
+        paths.revalidate()
+        lock = load_asset_lock(paths)
+        paths.revalidate()
         contract = load_pinned_cyclone_configs(
-            root / "scripts/holoagent0_setup/config", repository_root=root
+            paths.repository_root / "scripts/holoagent0_setup/config",
+            repository_root=paths.repository_root,
         )
+        paths.revalidate()
         locked_descriptors = tuple(
             (
                 config.role,

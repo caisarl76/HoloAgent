@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 import holoagent0_setup.semantic_fixture_node as fixture_module
+import holoagent0_setup.semantic_gate as semantic_gate_module
 from holoagent0_setup.semantic_gate import (
     CHECKPOINT_SHA256,
     CYCLONE_CONFIG_SET_SHA256,
@@ -78,6 +79,10 @@ def _portable_handover_paths(tmp_path: Path) -> HandoverPaths:
     )
     asset_lock.parent.mkdir(parents=True)
     asset_lock.write_bytes(ASSET_LOCK.read_bytes())
+    copied_config = repository_root / "scripts/holoagent0_setup/config"
+    copied_config.mkdir(parents=True)
+    for source in sorted((PACKAGE_ROOT / "config").glob("cyclonedds-offline-p*.xml")):
+        (copied_config / source.name).write_bytes(source.read_bytes())
     return HandoverPaths.from_roots(repository_root, data_root)
 
 
@@ -566,8 +571,25 @@ def test_real_adapter_rejects_verified_asset_mismatch(tmp_path, monkeypatch):
         load_real_hmsg_adapter(paths, tmp_path / "run")
 
 
-def test_four_role_cyclone_configs_are_exact_and_digest_bound():
-    contract = verify_cyclone_roles(REPOSITORY_ROOT, ASSET_LOCK)
+def test_cyclone_verification_public_api_accepts_only_handover_paths():
+    assert tuple(inspect.signature(verify_cyclone_roles).parameters) == ("paths",)
+
+
+def test_four_role_cyclone_configs_are_exact_and_identity_bound(tmp_path, monkeypatch):
+    paths = _portable_handover_paths(tmp_path)
+    original_load = semantic_gate_module.load_asset_lock
+    observed = []
+
+    def load_identity_bound(source):
+        observed.append(source)
+        assert source is paths
+        return original_load(source)
+
+    monkeypatch.setattr(semantic_gate_module, "load_asset_lock", load_identity_bound)
+
+    contract = verify_cyclone_roles(paths)
+
+    assert observed == [paths]
 
     assert [(role.role, role.participant_index) for role in contract.configs] == [
         ("fixture", 0),
@@ -616,12 +638,11 @@ def test_four_role_cyclone_configs_are_exact_and_digest_bound():
 
 
 def test_cyclone_config_content_mutation_is_rejected(tmp_path):
-    copied = tmp_path / "repository"
-    copied_config = copied / "scripts/holoagent0_setup/config"
-    copied_config.mkdir(parents=True)
-    for source in sorted((PACKAGE_ROOT / "config").glob("cyclonedds-offline-p*.xml")):
-        (copied_config / source.name).write_bytes(source.read_bytes())
-    target = copied_config / "cyclonedds-offline-p2.xml"
+    paths = _portable_handover_paths(tmp_path)
+    target = (
+        paths.repository_root
+        / "scripts/holoagent0_setup/config/cyclonedds-offline-p2.xml"
+    )
     target.write_text(
         target.read_text().replace(
             "<Transport>udp</Transport>", "<Transport>tcp</Transport>"
@@ -629,7 +650,28 @@ def test_cyclone_config_content_mutation_is_rejected(tmp_path):
     )
 
     with pytest.raises(SemanticGateError, match="CYCLONE_CONFIG_MISMATCH"):
-        verify_cyclone_roles(copied, ASSET_LOCK)
+        verify_cyclone_roles(paths)
+
+
+def test_cyclone_verification_rejects_handover_identity_drift(tmp_path, monkeypatch):
+    paths = _portable_handover_paths(tmp_path)
+    original_load = semantic_gate_module.load_pinned_cyclone_configs
+
+    def load_then_replace_lock(*args, **kwargs):
+        contract = original_load(*args, **kwargs)
+        content = paths.asset_lock.read_bytes()
+        paths.asset_lock.rename(tmp_path / "original-asset-lock.json")
+        paths.asset_lock.write_bytes(content)
+        return contract
+
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "load_pinned_cyclone_configs",
+        load_then_replace_lock,
+    )
+
+    with pytest.raises(SemanticGateError, match="CYCLONE_CONFIG_MISMATCH"):
+        verify_cyclone_roles(paths)
 
 
 def _valid_graph_snapshot(*, capture=False):
@@ -816,9 +858,9 @@ def test_fixture_main_is_bounded_and_shuts_ros_down_on_constructor_failure(
     )
     monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
 
-    def verify_cyclone(repository_root, asset_lock):
-        assert repository_root == paths.repository_root
-        assert asset_lock == paths.asset_lock
+    def verify_cyclone(bound_paths):
+        assert bound_paths.repository_root == paths.repository_root
+        assert bound_paths.asset_lock == paths.asset_lock
         return object()
 
     monkeypatch.setattr(fixture_module, "verify_cyclone_roles", verify_cyclone)

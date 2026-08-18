@@ -130,7 +130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments.repository_root,
         arguments.data_root,
     )
-    cyclone = verify_cyclone_roles(paths.repository_root, paths.asset_lock)
+    cyclone = verify_cyclone_roles(paths)
     validate_fixture_runtime_environment(cyclone, os.environ)
     adapter = load_real_hmsg_adapter(paths, arguments.run_directory)
     try:
