@@ -866,9 +866,11 @@ integrity, network policy, and evidence binding satisfied preserves exit 129,
 
 ### 2. HoloAgent-0 Readiness Runner
 
-A focused Python command under `scripts/holoagent0_setup/` coordinates checks
-and targets `outputs/holoagent0_setup/YYYYMMDDTHHMMSSZ/`. In
-`workstation_offline`, its external supervisor alone writes authoritative
+A focused Python command under `scripts/holoagent0_setup/` coordinates checks.
+The standalone workstation-offline entry point targets
+`outputs/holoagent0_setup/workstation-offline-<UTC>-<random>/`; parent modes
+may allocate child run IDs through their separately reviewed lineage protocol.
+In `workstation_offline`, its external supervisor alone writes authoritative
 `result.json`; the traced coordinator writes only the provisional ledger
 generations described above. In every other mode, the mode runner writes
 authoritative `result.json` after its finalizers. Neither component has a ROS
@@ -890,6 +892,112 @@ traffic required by `semantic.fixture_query`.
 OpenClaw provisioning is a separate explicit action. `workstation_mujoco`
 delegates only to the existing Stage 1-4 scripts after rechecking localhost DDS
 and the graph allowlist.
+
+#### Task 13 public offline composition checkpoint
+
+Task 13 exposes only the standalone `workstation_offline` command. Its public
+argument grammar contains exactly one required `--output-root` option. It has
+no public mode, run-ID, parent-run, lineage-nonce, runtime-factory, plugin,
+module, command, or tool-path override. Unknown, positional, repeated, or
+abbreviated options fail before an invocation exists. MuJoCo child lineage
+remains private to the later parent runner and is not accepted by this command.
+
+The standalone run ID has the closed form
+`workstation-offline-YYYYMMDDTHHMMSSZ-<32-lowercase-hex>`. The timestamp is UTC
+and the suffix is 128 bits from the operating-system CSPRNG. The independent
+ledger nonce is 256 random bits and is neither derived from nor exposed in the
+run ID. Injected clocks and randomness are private constructor dependencies for
+unit tests; neither can be selected through argv, environment, configuration,
+entry points, or import metadata in the public process.
+
+The CLI converts the output root to an absolute lexical path without resolving
+through a symlink. It walks every existing component with retained
+`O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW` descriptors and requires the final
+output root to be an effective-UID-owned directory with mode `0700`. When the
+final output-root component is absent, only that component may be created, with
+mode `0700`, beneath an already existing retained parent that is an
+effective-UID-owned directory and is not group- or other-writable. Recursive
+parent creation, a symlink at any component, ownership/type/mode drift, a
+non-directory, or a changed parent identity fails before supervisor launch.
+The invocation selects but does not pre-create its run directory.
+`BootstrapRuntime` remains the sole atomic `mkdir(mode=0700, parents=False,
+exist_ok=False)` authority. A collision or pre-existing run path fails without
+reuse, deletion, renaming, or suffix retry.
+
+`offline_cli.py` contains presentation and argument handling only.
+`offline_runtime.py` owns composition through a closed internal factory
+interface. Public `main()` constructs one tracked production factory directly;
+there is no registry lookup or mutable module-level factory selector. The
+factory derives the package/contract root from the installed tracked module,
+opens it without following a symlink, loads the exact reviewed `ContractSet`,
+collects the closed bootstrap facts and bootstrap report, creates the
+`BootstrapInvocation`, and composes the existing `EvidenceSupervisor`.
+Supervisor-only result publication, the fixed gate order, finalizer precedence,
+signal collection, safety latch, retained artifacts, and atomic no-replace
+write remain unchanged.
+
+Task 13 deliberately does not invent a trace/coordinator launcher or action
+child while the strace build and runtime fields remain
+`PENDING_REPRODUCIBLE_BUILD`. The production factory supplies closed callbacks
+that raise a harness error if a launcher, forwarder, or post-launch identity
+validator is unexpectedly reached before Task 14 replaces the pending runtime
+composition. The existing production supervisor must instead select its
+reviewed no-launch path. At the Task 13 checkpoint, the exact public outcome is:
+
+- no trace, normalizer, coordinator, namespace, ROS/DDS participant, OpenClaw,
+  AgentOS, chatbot, audio, or motion process is started;
+- the configured trace launcher is called zero times;
+- `offline.trace_integrity` is `FAIL` with `TRACE_BOOTSTRAP_FAILED`;
+- `offline.network_policy` is `SKIPPED` with `DEPENDENCY_NOT_AVAILABLE`;
+- `primary_blocking_gate` is `offline.trace_integrity`;
+- the label/status/exit tuple is `FAIL_HARNESS`, `FAIL`, and `40`; and
+- the supervisor publishes a schema-valid retained `result.json` and runs all
+  reachable mandatory finalizers.
+
+This checkpoint is not a workstation-readiness pass. Phase A still requires
+the Task 14 reviewed runtime and complete live composition before it may emit
+`PASS_HOLOAGENT0_OFFLINE`.
+
+After parsing succeeds, the CLI prints and flushes one bounded line
+`evidence_dir=<absolute-run-path>`. After authoritative execution, it reopens
+`result.json` relative to a retained run-root descriptor with `O_NOFOLLOW`,
+requires stable regular-file identity, the configured size bound, canonical
+UTF-8 JSON, the result schema, the expected run ID and mode, the exact 27-gate
+order, and the policy's label/status/exit/blocker mapping. Only then does it
+print `primary_blocking_gate=<gate-id>` or `primary_blocking_gate=NONE`. A
+missing, substituted, changing, oversized, noncanonical, or inconsistent
+publication prints `primary_blocking_gate=UNAVAILABLE`, returns `40`, and does
+not create, repair, replace, quarantine, or delete evidence. CLI text is
+diagnostic only and never becomes a second result authority.
+
+The internal `OfflineApplication(factory)` constructor is the sole test seam.
+Production `main()` never accepts a factory argument. A fake-toolchain test may
+instantiate the application directly, including from a dedicated tracked test
+helper subprocess, but the fake must use the real `EvidenceSupervisor` with
+dependency-injected bootstrap, trace, broker, and finalizer authorities. It
+must not write `result.json` itself. The passing fake proves all 27 gates in
+order, four passing finalizers, `FULL` trace state, zero network-policy
+violations, `PASS_HOLOAGENT0_OFFLINE`, and exit `0`. Public-wrapper tests prove
+that argv, environment, working directory, Python entry points, and import
+metadata cannot select that fake.
+
+`run_workstation_offline.sh` resolves its own tracked directory independently
+of the caller's working directory, overwrites `PYTHONPATH` with the one tracked
+package root, and executes `/usr/bin/python3.10 -P -B -m
+holoagent0_setup.offline_cli`. It fixes `LC_ALL=C`, `TZ=UTC`,
+`PYTHONNOUSERSITE=1`, `PYTHONSAFEPATH=1`, `PYTHONDONTWRITEBYTECODE=1`,
+`START_G1_PUBVEL=0`, `G1_DRY_RUN=1`, and `ALLOW_G1_MOTION=0`. It preserves
+provider credential variables only as inherited opaque environment state; it
+does not copy them into argv or diagnostics. The wrapper contains no install,
+download, network probe, gateway/service start, ROS command, simulator launch,
+Unitree SDK import, command publisher, cleanup, deletion, or fallback Python
+path.
+
+Task 14 owns the reviewed strace build/runtime digests, concrete
+tracer/normalizer/coordinator launcher, handoff and broker FD assembly,
+production `TracedCoordinator` and action-child composition, isolated
+loopback-namespace and semantic DDS execution, and live workstation acceptance.
+Those authorities cannot be supplied by a Task 13 CLI option or test factory.
 
 ### 3. OpenClaw Installation and Lifecycle Isolation
 
@@ -2242,6 +2350,12 @@ Implementation follows test-driven development.
 - Semantic 74-blob verification, canonical asset manifests, exact fixture
   identity/pose, and parser `SKIPPED` behavior.
 - Chatbot dependency failure and all four credential/audio classifications.
+- Task 13 standalone CLI grammar, run-ID and independent ledger-nonce
+  generation, no-follow output-root authority, single-component mode-`0700`
+  creation, collision refusal, fixed production-factory binding, bounded
+  diagnostic output, and canonical identity-stable result readback. Exercise
+  every wrong run-ID/mode/gate-order/blocker/label/status/exit tuple without
+  permitting the CLI to repair or replace supervisor evidence.
 - PC2 static command allowlist, neutral DDS classification, process-plane
   control signatures, independent process and aggregate-graph allowlist
   matching, inventory-only `TRIAGE_UNKNOWN`, exact camera/full-stream closure,
@@ -2250,6 +2364,14 @@ Implementation follows test-driven development.
 
 ### Integration tests
 
+- Run the Task 13 internal application with the real `EvidenceSupervisor` and
+  fake bootstrap/trace/broker/finalizer dependencies. Require exact 27-gate
+  order, four passing finalizers, `FULL` trace state, zero network violations,
+  supervisor-only publication, `PASS_HOLOAGENT0_OFFLINE`, and exit `0`. Run the
+  public wrapper separately from a neutral working directory under the pending
+  trace policy and require zero launcher calls, the exact
+  `offline.trace_integrity`/`offline.network_policy` failure tuple,
+  `FAIL_HARNESS`, exit `40`, and retained schema-valid evidence.
 - Run AgentOS offline with transport/process/ROS spies, an audit hook, syscall
   tracing, and graph snapshots; require zero transport, child-process, and ROS
   publication attempts and the expected artifacts.
@@ -2326,6 +2448,15 @@ the reviewed manifest; acceptance is zero failures, not "196 tests."
 
 ### Adversarial tests
 
+- Attempt to select the Task 13 fake factory through argv, environment,
+  working directory, Python entry points, import metadata, and path shadowing;
+  every public invocation must retain the tracked production factory. Reject
+  missing/repeated/abbreviated/unknown options, public lineage or run-ID
+  controls, unsafe or changing output-root components, symlink substitution,
+  pre-existing run paths, result-file identity swaps, oversized/noncanonical
+  results, and wrong authority mappings. Preserve every created failed run and
+  prove the wrapper contains no install, download, probe, ROS, gateway,
+  simulator, Unitree, cleanup, deletion, or fallback-Python command.
 - Reject oversized/malformed plans, unknown keys, unsupported skills/targets,
   duplicate IDs, missing dependencies, cycles, and plan execution without
   `--dry-run`.

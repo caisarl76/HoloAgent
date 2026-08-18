@@ -2659,7 +2659,7 @@
 100644 6ca9cea0f607a4427b392aba03339c1bd50d8b83	docs/superpowers/plans/2026-08-05-holoagent0-pc2-sensor-only.md
 100644 76159746c509411fa9ddde454881082ddd19ce16	docs/superpowers/plans/2026-08-05-holoagent0-workstation-offline.md
 100644 ecda0adf0291dcd288057065e3edf289d1768c1f	docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md
-100644 62bad4907be25b181ddfded18ac785a83751d7cb	docs/superpowers/specs/2026-07-29-holoagent0-workstation-pc2-setup-design.md
+100644 f701888dbeaade6c3d04ab416e568d8db2090f7b	docs/superpowers/specs/2026-07-29-holoagent0-workstation-pc2-setup-design.md
 100644 4edb82ebc13ab0603c2c2fc78d87b9172a338c21	docs/user_guide/Intruduction.md
 100644 ca62882add18b8a86da91cfec8fee8ee57dd49f5	docs/user_guide/README_agent.md
 100644 921b8a6592f7419e2462534e1ee298bf64b04d75	docs/user_guide/README_workflow.md
