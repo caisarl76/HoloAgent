@@ -726,19 +726,24 @@ def _environment_runtime_label(document: Mapping[str, object]) -> str | None:
     return expected_label
 
 
-def _require_pass_graph_origin(
-    environment: Mapping[str, object], source: Mapping[str, object]
+def _require_repository_binding(
+    environment: Mapping[str, object],
+    source: Mapping[str, object],
+    authoritative_repository_root: PathIdentity,
 ) -> None:
+    expected_identity = path_identity_document(authoritative_repository_root)
+    recorded_identity = source.get("repository_root")
+    if type(recorded_identity) is not dict or recorded_identity != expected_identity:
+        raise _semantic_failure(
+            "source repository identity disagrees with authoritative repository identity"
+        )
     if environment.get("status") != "PASS":
         return
-    repository_root = source.get("repository_root")
-    repository_path = (
-        repository_root.get("path") if isinstance(repository_root, dict) else None
-    )
+    repository_path = expected_identity["path"]
     graph_origin = environment.get("graph_module_origin")
-    if type(repository_path) is not str or type(graph_origin) is not str:
+    if type(graph_origin) is not str:
         raise _semantic_failure(
-            "environment PASS graph module origin requires a recorded source root"
+            "environment PASS graph module origin requires an authoritative source root"
         )
     root = Path(repository_path)
     origin = Path(graph_origin)
@@ -951,8 +956,10 @@ def publish_handover_evidence(
         raise _semantic_failure(
             "terminal CPU/GPU label disagrees with environment evidence"
         )
-    _require_pass_graph_origin(
-        stage_documents[ENVIRONMENT_FILE], stage_documents[SOURCE_FILE]
+    _require_repository_binding(
+        stage_documents[ENVIRONMENT_FILE],
+        stage_documents[SOURCE_FILE],
+        repository_root,
     )
 
     authority = _RunDirectoryAuthority.retain(

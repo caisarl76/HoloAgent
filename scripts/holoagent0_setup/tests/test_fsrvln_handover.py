@@ -803,6 +803,98 @@ def test_publisher_rejects_pass_environment_with_wrong_graph_origin(contract, tm
     assert list(run_directory.iterdir()) == []
 
 
+def test_publisher_rejects_coordinated_alternate_source_and_graph_root(
+    contract, tmp_path
+):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    alternate_root = tmp_path / "alternate-repository"
+    alternate_root.mkdir()
+    documents[SOURCE_FILE]["repository_root"] = path_identity_document(
+        _identity(alternate_root)
+    )
+    documents[ENVIRONMENT_FILE]["graph_module_origin"] = str(
+        alternate_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    )
+
+    with pytest.raises(RuntimeError, match="authoritative repository identity"):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert list(run_directory.iterdir()) == []
+
+
+@pytest.mark.parametrize("field", ("device", "inode", "mode"))
+def test_publisher_rejects_forged_source_repository_identity_field(
+    contract, tmp_path, field
+):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    documents[SOURCE_FILE]["repository_root"][field] += 1
+
+    with pytest.raises(RuntimeError, match="authoritative repository identity"):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert list(run_directory.iterdir()) == []
+
+
+def test_publisher_rejects_source_repository_identity_path_alias(contract, tmp_path):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    repository_alias = tmp_path / "repository-alias"
+    repository_alias.symlink_to(paths.repository_root, target_is_directory=True)
+    documents[SOURCE_FILE]["repository_root"] = {
+        **path_identity_document(paths.identities[0]),
+        "path": str(repository_alias),
+    }
+    documents[ENVIRONMENT_FILE]["graph_module_origin"] = str(
+        repository_alias / "fsr_vln/memory/hmsg/graph/graph.py"
+    )
+
+    with pytest.raises(RuntimeError, match="authoritative repository identity"):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert list(run_directory.iterdir()) == []
+
+
 def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
     contract, monkeypatch, tmp_path
 ):
