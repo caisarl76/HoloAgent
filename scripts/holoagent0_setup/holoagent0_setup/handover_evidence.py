@@ -703,15 +703,14 @@ def _environment_runtime_label(document: Mapping[str, object]) -> str | None:
     if status == "PASS" and any(row_status != "PASS" for row_status in row_statuses):
         raise _semantic_failure("environment PASS requires every import row to PASS")
 
-    torch_status = row_statuses[0]
     if accelerator is None:
-        if status == "PASS" or torch_status == "PASS":
+        if status == "PASS":
             raise _semantic_failure(
-                "a successful PyTorch import requires accelerator observations"
+                "environment PASS requires accelerator observations"
             )
         return None
-    if not isinstance(accelerator, dict) or torch_status != "PASS":
-        raise _semantic_failure("accelerator evidence disagrees with PyTorch import")
+    if not isinstance(accelerator, dict):
+        raise _semantic_failure("accelerator evidence must be an object or null")
     cuda_available = accelerator.get("cuda_available")
     cuda_build = accelerator.get("torch_cuda_build")
     label = accelerator.get("label")
@@ -722,9 +721,43 @@ def _environment_runtime_label(document: Mapping[str, object]) -> str | None:
         raise _semantic_failure("accelerator label disagrees with CUDA availability")
     if cuda_build is not None and (type(cuda_build) is not str or not cuda_build):
         raise _semantic_failure("PyTorch CUDA build must be nonempty text or null")
-    if cuda_available and cuda_build is None:
+    if status == "PASS" and cuda_available and cuda_build is None:
         raise _semantic_failure("CUDA availability requires a PyTorch CUDA build")
     return expected_label
+
+
+def _require_pass_graph_origin(
+    environment: Mapping[str, object], source: Mapping[str, object]
+) -> None:
+    if environment.get("status") != "PASS":
+        return
+    repository_root = source.get("repository_root")
+    repository_path = (
+        repository_root.get("path") if isinstance(repository_root, dict) else None
+    )
+    graph_origin = environment.get("graph_module_origin")
+    if type(repository_path) is not str or type(graph_origin) is not str:
+        raise _semantic_failure(
+            "environment PASS graph module origin requires a recorded source root"
+        )
+    root = Path(repository_path)
+    origin = Path(graph_origin)
+    if (
+        not root.is_absolute()
+        or str(root) != repository_path
+        or ".." in root.parts
+        or not origin.is_absolute()
+        or str(origin) != graph_origin
+        or ".." in origin.parts
+    ):
+        raise _semantic_failure(
+            "environment PASS graph module origin must be an exact absolute path"
+        )
+    expected = root / "fsr_vln/memory/hmsg/graph/graph.py"
+    if origin != expected or graph_origin != str(expected):
+        raise _semantic_failure(
+            "environment PASS graph module origin disagrees with source root"
+        )
 
 
 def _read_authoritative_file(
@@ -918,6 +951,9 @@ def publish_handover_evidence(
         raise _semantic_failure(
             "terminal CPU/GPU label disagrees with environment evidence"
         )
+    _require_pass_graph_origin(
+        stage_documents[ENVIRONMENT_FILE], stage_documents[SOURCE_FILE]
+    )
 
     authority = _RunDirectoryAuthority.retain(
         Path(run_directory), run_directory_identity

@@ -710,6 +710,99 @@ def test_publisher_rejects_terminal_cpu_gpu_disagreement_before_any_write(
     assert list(run_directory.iterdir()) == []
 
 
+def test_cuda_build_missing_diagnostics_publish_terminal_environment_failure(
+    contract, monkeypatch, tmp_path
+):
+    paths = _fake_paths(tmp_path)
+    _install_fake_runtime(monkeypatch, paths, cuda=False)
+    torch = _module("torch", "2.7.1", origin="/opt/runtime/torch.py")
+    torch.version = SimpleNamespace(cuda=None)
+    torch.cuda = SimpleNamespace(is_available=lambda: True)
+    fake_import = evidence_module.import_module
+    monkeypatch.setattr(
+        evidence_module,
+        "import_module",
+        lambda name: torch if name == "torch" else fake_import(name),
+    )
+    documents = _pass_documents(paths)
+    documents[ENVIRONMENT_FILE] = qualify_environment(paths)
+    documents[ASSET_FILE] = build_asset_document(
+        paths,
+        status="NOT_RUN",
+        reason="EARLIER_BLOCKING_STAGE",
+        started_at=STARTED,
+        finished_at=FINISHED,
+    )
+    documents[QUERY_FILE] = build_query_document(
+        status="NOT_RUN",
+        reason="EARLIER_BLOCKING_STAGE",
+        started_at=STARTED,
+        finished_at=FINISHED,
+        query_sha256=STRUCTURED_QUERY_SHA256,
+    )
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+
+    publish_handover_evidence(
+        contract,
+        run_directory,
+        documents,
+        accepted_implementation_commit=None,
+        repository_root=paths.identities[0],
+        data_root=paths.identities[1],
+        run_directory_identity=_identity(run_directory),
+        cpu_gpu_label="GPU",
+        started_at=STARTED,
+        finished_at=FINISHED,
+    )
+
+    assert {path.name for path in run_directory.iterdir()} == {
+        *EVIDENCE_ORDER,
+        RESULT_FILE,
+    }
+    published_environment = json.loads((run_directory / ENVIRONMENT_FILE).read_bytes())
+    terminal = json.loads((run_directory / RESULT_FILE).read_bytes())
+    assert published_environment == documents[ENVIRONMENT_FILE]
+    assert published_environment["accelerator"] == {
+        "label": "GPU",
+        "torch_cuda_build": None,
+        "cuda_available": True,
+    }
+    assert published_environment["imports"][0]["reason"] == (
+        "CUDA_BUILD_MISSING: torch reports CUDA available"
+    )
+    assert terminal["status"] == "FAIL"
+    assert terminal["reason"] == "CUDA_BUILD_MISSING: torch reports CUDA available"
+    assert terminal["first_blocking_reason"] == terminal["reason"]
+    assert terminal["cpu_gpu_label"] == "GPU"
+
+
+def test_publisher_rejects_pass_environment_with_wrong_graph_origin(contract, tmp_path):
+    run_directory = tmp_path / "run"
+    run_directory.mkdir(mode=0o700)
+    paths = _fake_paths(tmp_path)
+    documents = _pass_documents(paths)
+    documents[ENVIRONMENT_FILE]["graph_module_origin"] = str(
+        paths.repository_root / "fsr_vln/agentic/memory/hmsg/graph/graph.py"
+    )
+
+    with pytest.raises(RuntimeError, match="graph module origin"):
+        publish_handover_evidence(
+            contract,
+            run_directory,
+            documents,
+            accepted_implementation_commit=GIT_SHA,
+            repository_root=paths.identities[0],
+            data_root=paths.identities[1],
+            run_directory_identity=_identity(run_directory),
+            cpu_gpu_label="CPU",
+            started_at=STARTED,
+            finished_at=FINISHED,
+        )
+
+    assert list(run_directory.iterdir()) == []
+
+
 def test_evidence_publisher_writes_canonical_descriptors_and_terminal_last(
     contract, monkeypatch, tmp_path
 ):
