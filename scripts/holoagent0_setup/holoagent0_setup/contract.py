@@ -98,7 +98,7 @@ _TRACE_DECODED_ADDRESS_SYSCALLS = (
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _UTC_RFC3339_PATTERN = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
-    r"(?:\.[0-9]+)?Z$"
+    r"(?:\.([0-9]+))?Z$"
 )
 
 
@@ -1741,10 +1741,16 @@ def _is_number(value: object) -> bool:
 
 
 def _is_datetime(value: str) -> bool:
-    if _UTC_RFC3339_PATTERN.fullmatch(value) is None:
+    match = _UTC_RFC3339_PATTERN.fullmatch(value)
+    if match is None:
         return False
+    fractional_seconds = match.group(1)
+    normalized = value[:-1] + "+00:00"
+    if fractional_seconds is not None:
+        microseconds = fractional_seconds[:6].ljust(6, "0")
+        normalized = f"{value[:19]}.{microseconds}+00:00"
     try:
-        datetime.fromisoformat(value[:-1] + "+00:00")
+        datetime.fromisoformat(normalized)
     except ValueError:
         return False
     return True

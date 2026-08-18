@@ -848,6 +848,8 @@ def test_fsrvln_digest_definitions_have_explicit_exact_lengths(contract: Contrac
         "2026-08-18T00Z",
         "2026-08-18T00:00Z",
         "2026-08-18T00:00:00+00:00",
+        "2026-08-18T00:00:00.Z",
+        "2026-08-18T00:00:00.xZ",
         "2026-08-18T00:00:00Z\n",
         "2026-02-30T00:00:00Z",
         "2026-08-18T24:00:00Z",
@@ -863,7 +865,17 @@ def test_fsrvln_timestamps_require_strict_utc_rfc3339_seconds(
 
 
 @pytest.mark.parametrize(
-    "timestamp", ("2026-08-18T00:00:00Z", "2026-08-18T00:00:00.123456Z")
+    "timestamp",
+    (
+        "2026-08-18T00:00:00Z",
+        "2026-08-18T00:00:00.1Z",
+        "2026-08-18T00:00:00.12Z",
+        "2026-08-18T00:00:00.123Z",
+        "2026-08-18T00:00:00.1234Z",
+        "2026-08-18T00:00:00.12345Z",
+        "2026-08-18T00:00:00.123456Z",
+        "2026-08-18T00:00:00.1234567Z",
+    ),
 )
 def test_fsrvln_timestamps_accept_whole_or_fractional_utc_seconds(
     contract: ContractSet, timestamp: str
