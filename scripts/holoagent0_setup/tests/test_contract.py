@@ -1593,12 +1593,19 @@ def test_result_timestamps_cannot_be_reversed(contract: ContractSet, mode: str):
     assert not contract.validate_result(value).ok
 
 
+@pytest.mark.parametrize(
+    ("started_at", "ended_at"),
+    (
+        ("2026-08-05T00:00:00.2Z", "2026-08-05T00:00:00.1Z"),
+        ("2026-08-05T00:00:00.1234568Z", "2026-08-05T00:00:00.1234567Z"),
+    ),
+)
 def test_result_fractional_timestamps_cannot_bypass_reversed_order(
-    contract: ContractSet,
+    contract: ContractSet, started_at: str, ended_at: str
 ):
     value = make_pass_result("pc2_inventory")
-    value["started_at"] = "2026-08-05T00:00:00.2Z"
-    value["ended_at"] = "2026-08-05T00:00:00.1Z"
+    value["started_at"] = started_at
+    value["ended_at"] = ended_at
 
     decision = contract.validate_result(value)
 
@@ -1606,10 +1613,20 @@ def test_result_fractional_timestamps_cannot_bypass_reversed_order(
     assert "$.started_at/ended_at: result timestamps are reversed" in decision.errors
 
 
-def test_result_fractional_timestamps_preserve_valid_order(contract: ContractSet):
+@pytest.mark.parametrize(
+    ("started_at", "ended_at"),
+    (
+        ("2026-08-05T00:00:00.1Z", "2026-08-05T00:00:00.12Z"),
+        ("2026-08-05T00:00:00.12Z", "2026-08-05T00:00:00.1200Z"),
+        ("2026-08-05T00:00:00.1234567Z", "2026-08-05T00:00:00.1234568Z"),
+    ),
+)
+def test_result_fractional_timestamps_preserve_valid_order(
+    contract: ContractSet, started_at: str, ended_at: str
+):
     value = make_pass_result("pc2_inventory")
-    value["started_at"] = "2026-08-05T00:00:00.1Z"
-    value["ended_at"] = "2026-08-05T00:00:00.12Z"
+    value["started_at"] = started_at
+    value["ended_at"] = ended_at
 
     decision = contract.validate_result(value)
 
@@ -1633,6 +1650,18 @@ def test_result_fractional_timestamps_preserve_valid_order(contract: ContractSet
         ),
         (
             "2026-08-05T00:00:00.12Z",
+            "2026-08-05T00:00:00.1200Z",
+            "2026-08-05T00:00:00.1200000Z",
+            None,
+        ),
+        (
+            "2026-08-05T00:00:00.1234567Z",
+            "2026-08-05T00:00:00.1234568Z",
+            "2026-08-05T00:00:00.1234569Z",
+            None,
+        ),
+        (
+            "2026-08-05T00:00:00.12Z",
             "2026-08-05T00:00:00.1Z",
             "2026-08-05T00:00:00.1234Z",
             "$.pc2_evidence.monitor_samples: sample is outside action window",
@@ -1641,6 +1670,12 @@ def test_result_fractional_timestamps_preserve_valid_order(contract: ContractSet
             "2026-08-05T00:00:00.1Z",
             "2026-08-05T00:00:00.1234Z",
             "2026-08-05T00:00:00.12Z",
+            "$.pc2_evidence.monitor_samples: sample is outside action window",
+        ),
+        (
+            "2026-08-05T00:00:00.1234567Z",
+            "2026-08-05T00:00:00.1234569Z",
+            "2026-08-05T00:00:00.1234568Z",
             "$.pc2_evidence.monitor_samples: sample is outside action window",
         ),
         (

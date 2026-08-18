@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 import hashlib
 import json
 import math
@@ -1740,28 +1741,32 @@ def _is_number(value: object) -> bool:
     )
 
 
-def _parse_utc_rfc3339_datetime(value: object) -> datetime | None:
+def _parse_utc_rfc3339_datetime(
+    value: object,
+) -> tuple[datetime, Decimal] | None:
     if not isinstance(value, str):
         return None
     match = _UTC_RFC3339_PATTERN.fullmatch(value)
     if match is None:
         return None
     fractional_seconds = match.group(1)
-    normalized = value[:-1] + "+00:00"
-    if fractional_seconds is not None:
-        microseconds = fractional_seconds[:6].ljust(6, "0")
-        normalized = f"{value[:19]}.{microseconds}+00:00"
     try:
-        return datetime.fromisoformat(normalized)
+        whole_second = datetime.fromisoformat(value[:19] + "+00:00")
     except ValueError:
         return None
+    fraction = (
+        Decimal(f"0.{fractional_seconds}")
+        if fractional_seconds is not None
+        else Decimal(0)
+    )
+    return whole_second, fraction
 
 
 def _is_datetime(value: str) -> bool:
     return _parse_utc_rfc3339_datetime(value) is not None
 
 
-def _parse_datetime(value: object) -> datetime | None:
+def _parse_datetime(value: object) -> tuple[datetime, Decimal] | None:
     return _parse_utc_rfc3339_datetime(value)
 
 
