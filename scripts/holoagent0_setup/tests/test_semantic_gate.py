@@ -646,6 +646,61 @@ def test_root_hmsg_runtime_restores_cache_and_path_after_import_failure(
     assert tuple(sys.path) == before_path
 
 
+@pytest.mark.parametrize("replace_root", [False, True])
+def test_root_hmsg_runtime_restores_state_when_repository_root_drifts_at_boundary(
+    tmp_path, monkeypatch, replace_root
+):
+    paths = _portable_handover_paths(tmp_path)
+    repository_root = paths.repository_root
+    moved_root = tmp_path / "original-repository"
+    stale_memory = ModuleType("memory")
+    stale_perception = ModuleType("perception")
+    monkeypatch.setitem(sys.modules, "memory", stale_memory)
+    monkeypatch.setitem(sys.modules, "perception", stale_perception)
+    omega_module = ModuleType("omegaconf")
+    omega_module.OmegaConf = object()
+    monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
+    before_memory = _memory_module_snapshot()
+    before_perception = _perception_module_snapshot()
+    before_path = tuple(sys.path)
+    original_revalidate = HandoverPaths.revalidate
+    mutated = False
+
+    def revalidate_then_drift(self):
+        nonlocal mutated
+        original_revalidate(self)
+        if not mutated:
+            repository_root.rename(moved_root)
+            if replace_root:
+                replacement_graph = (
+                    repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+                )
+                replacement_graph.parent.mkdir(parents=True)
+                replacement_graph.write_text(
+                    "SOURCE = 'replacement'\n", encoding="utf-8"
+                )
+                (repository_root / "fsr_vln/perception").mkdir()
+            mutated = True
+
+    monkeypatch.setattr(HandoverPaths, "revalidate", revalidate_then_drift)
+
+    with pytest.raises(SemanticGateError) as caught:
+        import_root_hmsg_runtime(paths)
+
+    assert caught.value.reason == "SEMANTIC_ASSET_UNAVAILABLE"
+    assert _memory_module_snapshot() == before_memory
+    assert _perception_module_snapshot() == before_perception
+    assert all(
+        _memory_module_snapshot()[name] is module
+        for name, module in before_memory.items()
+    )
+    assert all(
+        _perception_module_snapshot()[name] is module
+        for name, module in before_perception.items()
+    )
+    assert tuple(sys.path) == before_path
+
+
 def test_root_hmsg_runtime_restores_the_entire_module_cache(tmp_path, monkeypatch):
     paths = _portable_handover_paths(tmp_path)
     fsr_root = paths.repository_root / "fsr_vln"

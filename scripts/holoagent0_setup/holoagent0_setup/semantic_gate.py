@@ -585,25 +585,32 @@ def import_root_hmsg_runtime(
             for namespace in namespace_roots
         )
     }
-    for name in tuple(original_repository_modules):
-        sys.modules.pop(name, None)
-    for namespace, namespace_root in namespace_roots.items():
-        namespace_module = ModuleType(namespace)
-        namespace_specification = importlib.machinery.ModuleSpec(
-            namespace, loader=None, is_package=True
-        )
-        namespace_specification.submodule_search_locations = [str(namespace_root)]
-        namespace_module.__spec__ = namespace_specification
-        namespace_module.__path__ = [str(namespace_root)]
-        namespace_module.__package__ = namespace
-        sys.modules[namespace] = namespace_module
-    fsr_resolved = fsr_root.resolve(strict=True)
-    sys.path[:] = [
-        entry
-        for entry in sys.path
-        if Path(entry or ".").resolve(strict=False) != fsr_resolved
-    ]
     try:
+        for name in tuple(original_repository_modules):
+            sys.modules.pop(name, None)
+        for namespace, namespace_root in namespace_roots.items():
+            namespace_module = ModuleType(namespace)
+            namespace_specification = importlib.machinery.ModuleSpec(
+                namespace, loader=None, is_package=True
+            )
+            namespace_specification.submodule_search_locations = [str(namespace_root)]
+            namespace_module.__spec__ = namespace_specification
+            namespace_module.__path__ = [str(namespace_root)]
+            namespace_module.__package__ = namespace
+            sys.modules[namespace] = namespace_module
+        paths.revalidate()
+        try:
+            fsr_resolved = fsr_root.resolve(strict=True)
+        except OSError as error:
+            raise AssetGateError(
+                "HANDOVER_PATH_IDENTITY_CHANGED",
+                f"repository-local HMSG source root: {error}",
+            ) from error
+        sys.path[:] = [
+            entry
+            for entry in sys.path
+            if Path(entry or ".").resolve(strict=False) != fsr_resolved
+        ]
         graph_module = importlib.import_module("memory.hmsg.graph.graph")
         OmegaConf = importlib.import_module("omegaconf").OmegaConf
         specification = getattr(graph_module, "__spec__", None)
@@ -627,6 +634,8 @@ def import_root_hmsg_runtime(
                 if name == namespace or name.startswith(f"{namespace}."):
                     _validate_root_namespace_module(name, module, namespace_root)
         return graph_module, OmegaConf, module_path
+    except AssetGateError as error:
+        raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
     except SemanticGateError:
         raise
     except Exception as error:
