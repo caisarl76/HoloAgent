@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import importlib
 import json
 import math
 from pathlib import Path
@@ -18,7 +19,9 @@ from .cyclone_policy import (
 )
 from .source_gate import (
     AssetGateError,
+    HandoverPaths,
     load_asset_lock,
+    prepare_handover_run_directory,
     verify_asset_lock,
 )
 
@@ -434,90 +437,124 @@ class RealHMSGRetrievalAdapter:
 
 
 def hmsg_query_configuration(
-    *, graph_path: Path, checkpoint_path: Path, run_directory: Path
+    paths: HandoverPaths, run_directory: Path
 ) -> dict[str, Any]:
     """Build the minimal real-Graph query configuration with owned outputs."""
+    if not isinstance(paths, HandoverPaths):
+        raise AssetGateError(
+            "ASSET_ROOT_MISMATCH", "a validated HandoverPaths instance is required"
+        )
     return {
         "main": {
             "use_gpt": False,
-            "graph_path": str(graph_path),
+            "graph_path": str(paths.graph),
             "save_path": str(run_directory),
         },
         "models": {
             "clip": {
                 "type": "ViT-L/14",
-                "checkpoint": str(checkpoint_path),
+                "checkpoint": str(paths.checkpoint),
             }
         },
     }
 
 
-def load_real_hmsg_adapter(
-    repository_root: Path,
-    asset_source: Path | Mapping[str, Any],
-    asset_roots: Mapping[str, Path],
-    run_directory: Path,
-) -> RealHMSGRetrievalAdapter:
-    """Verify assets, then lazily import and load the real HMSG graph."""
-    root = Path(repository_root).resolve(strict=True)
-    run_root = Path(run_directory)
+def import_root_hmsg_runtime(
+    paths: HandoverPaths,
+) -> tuple[Any, Any, Path]:
+    """Lazily import HMSG only from the retained root-level FSR-VLN tree."""
     try:
-        if not run_root.is_absolute():
-            raise ValueError("semantic run directory must be absolute")
-        run_root = run_root.resolve(strict=True)
-        if not run_root.is_dir():
-            raise ValueError("semantic run directory is not a directory")
-        for value in asset_roots.values():
-            asset_root = Path(value).resolve(strict=True)
-            if run_root == asset_root or (
-                asset_root.is_dir() and run_root.is_relative_to(asset_root)
-            ):
-                raise ValueError("semantic run directory overlaps an asset root")
-        lock = load_asset_lock(asset_source)
-        verify_asset_lock(asset_roots, asset_source)
-    except (AssetGateError, OSError, ValueError) as error:
+        if not isinstance(paths, HandoverPaths):
+            raise AssetGateError(
+                "ASSET_ROOT_MISMATCH",
+                "a validated HandoverPaths instance is required",
+            )
+        paths.revalidate()
+    except AssetGateError as error:
         raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
 
-    fsr_root = root / "fsr_vln"
+    fsr_root = paths.repository_root / "fsr_vln"
     fsr_path = str(fsr_root)
-    inserted_path = fsr_path not in sys.path
-    if inserted_path:
-        sys.path.insert(0, fsr_path)
+    expected_module_path = fsr_root / "memory/hmsg/graph/graph.py"
+    sys.path.insert(0, fsr_path)
     try:
-        from memory.hmsg.graph import graph as graph_module  # type: ignore[import-not-found]
-        from omegaconf import OmegaConf  # type: ignore[import-not-found]
-
-        module_path = Path(graph_module.__file__).resolve(strict=True)
-        expected_module_path = (fsr_root / "memory/hmsg/graph/graph.py").resolve(
-            strict=True
+        graph_module = importlib.import_module("memory.hmsg.graph.graph")
+        OmegaConf = importlib.import_module("omegaconf").OmegaConf
+        specification = getattr(graph_module, "__spec__", None)
+        raw_origin = getattr(specification, "origin", None) or getattr(
+            graph_module, "__file__", None
         )
-        if module_path != expected_module_path:
+        if not isinstance(raw_origin, str):
+            raise ValueError("HMSG module has no filesystem origin")
+        module_path = Path(raw_origin)
+        if not module_path.is_absolute():
+            raise ValueError(f"unexpected HMSG module origin: {raw_origin}")
+        module_path = module_path.resolve(strict=True)
+        expected_resolved = expected_module_path.resolve(strict=True)
+        if (
+            expected_resolved != expected_module_path
+            or module_path != expected_module_path
+        ):
             raise ValueError(f"unexpected HMSG module origin: {module_path}")
-        Graph = graph_module.Graph
-
-        graph_path = Path(asset_roots["graph"])
-        checkpoint_path = Path(asset_roots["checkpoint"])
-        configuration = OmegaConf.create(
-            hmsg_query_configuration(
-                graph_path=graph_path,
-                checkpoint_path=checkpoint_path,
-                run_directory=run_root,
-            )
-        )
-        graph = Graph(configuration)
-        graph.load_graph(str(graph_path))
-        graph.set_room_names(room_names=list(lock.room_name_mapping))
+        return graph_module, OmegaConf, module_path
+    except SemanticGateError:
+        raise
     except Exception as error:
         raise SemanticGateError(
             "SEMANTIC_DEPENDENCY_UNAVAILABLE", str(error)
         ) from error
     finally:
-        if inserted_path:
-            try:
-                sys.path.remove(fsr_path)
-            except ValueError:
-                pass
-    return RealHMSGRetrievalAdapter(graph, graph_identity=lock.graph_identity)
+        try:
+            sys.path.remove(fsr_path)
+        except ValueError:
+            pass
+
+
+def load_real_hmsg_adapter(
+    paths: HandoverPaths, run_directory: Path
+) -> RealHMSGRetrievalAdapter:
+    """Verify retained authority, then load the root-level real HMSG graph."""
+    try:
+        if not isinstance(paths, HandoverPaths):
+            raise AssetGateError(
+                "ASSET_ROOT_MISMATCH",
+                "a validated HandoverPaths instance is required",
+            )
+        paths.revalidate()
+        run_identity = prepare_handover_run_directory(run_directory, paths)
+        paths.revalidate()
+        verification = verify_asset_lock(paths)
+    except (AssetGateError, OSError, ValueError) as error:
+        raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
+
+    graph_module, OmegaConf, _module_origin = import_root_hmsg_runtime(paths)
+    try:
+        paths.revalidate()
+        confirmed_run_identity = prepare_handover_run_directory(
+            run_identity.path, paths
+        )
+        if confirmed_run_identity != run_identity:
+            raise AssetGateError(
+                "RUN_IDENTITY_CHANGED",
+                "run_directory changed after its initial validation",
+            )
+        configuration = OmegaConf.create(
+            hmsg_query_configuration(paths, confirmed_run_identity.path)
+        )
+        graph = graph_module.Graph(configuration)
+        paths.revalidate()
+        graph.load_graph(str(paths.graph))
+        paths.revalidate()
+        graph.set_room_names(room_names=list(verification.lock.room_name_mapping))
+    except AssetGateError as error:
+        raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
+    except Exception as error:
+        raise SemanticGateError(
+            "SEMANTIC_DEPENDENCY_UNAVAILABLE", str(error)
+        ) from error
+    return RealHMSGRetrievalAdapter(
+        graph, graph_identity=verification.lock.graph_identity
+    )
 
 
 def verify_cyclone_roles(

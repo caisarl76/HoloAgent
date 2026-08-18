@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,6 @@ import pytest
 import holoagent0_setup.source_gate as source_gate
 from holoagent0_setup.source_gate import (
     ASSET_LOCK_SCHEMA,
-    APPROVED_ASSET_ROOTS,
     SOURCE_COMMIT,
     SOURCE_LOCK_SCHEMA,
     AssetManifest,
@@ -337,7 +337,10 @@ def test_new_asset_verification_uses_the_derived_lock_and_role_set(
     monkeypatch.setattr(source_gate, "load_asset_lock", load)
     monkeypatch.setattr(source_gate, "_verify_handover_asset_inventory", verify)
 
-    assert verify_asset_lock(paths) == ("graph", "dataset", "checkpoint")
+    verification = verify_asset_lock(paths)
+
+    assert verification.lock.assets == assets
+    assert verification.manifests == ("graph", "dataset", "checkpoint")
     assert loaded == [paths]
     assert verified == [
         (paths.graph, "graph"),
@@ -1260,13 +1263,25 @@ def test_asset_inventory_rejects_file_replaced_by_internal_symlink(tmp_path):
         source_gate.verify_asset_inventory(root, spec)
 
 
-def test_asset_verification_requires_exact_explicit_approved_role_roots(tmp_path):
-    missing = dict(APPROVED_ASSET_ROOTS)
-    missing.pop("dataset")
-    with pytest.raises(AssetGateError, match="ASSET_ROOT_MISMATCH"):
-        verify_asset_lock(missing, ASSET_LOCK)
+def test_asset_measurement_and_verification_reject_legacy_root_arguments(tmp_path):
+    legacy_roots = {
+        "graph": tmp_path / "graph",
+        "dataset": tmp_path / "dataset",
+        "checkpoint": tmp_path / "checkpoint",
+    }
 
-    substituted = dict(APPROVED_ASSET_ROOTS)
-    substituted["dataset"] = tmp_path
-    with pytest.raises(AssetGateError, match="ASSET_ROOT_MISMATCH"):
-        verify_asset_lock(substituted, ASSET_LOCK)
+    with pytest.raises(AssetGateError, match="HandoverPaths"):
+        measure_approved_asset_roots(legacy_roots)
+    with pytest.raises(AssetGateError, match="HandoverPaths"):
+        verify_asset_lock(legacy_roots)
+    with pytest.raises(TypeError):
+        verify_asset_lock(legacy_roots, ASSET_LOCK)
+
+    assert tuple(inspect.signature(measure_approved_asset_roots).parameters) == (
+        "paths",
+    )
+    assert tuple(inspect.signature(verify_asset_lock).parameters) == ("paths",)
+    source = Path(source_gate.__file__).read_text(encoding="utf-8")
+    assert "APPROVED_ASSET_ROOTS" not in source
+    assert "_validated_asset_roots" not in source
+    assert "/home/jihun" not in source

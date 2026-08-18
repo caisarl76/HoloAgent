@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import importlib.machinery
+import inspect
 import json
 import math
 from pathlib import Path
@@ -31,6 +33,7 @@ from holoagent0_setup.semantic_gate import (
     TopicCardinality,
     evaluate_semantic_fixture,
     hmsg_query_configuration,
+    import_root_hmsg_runtime,
     load_real_hmsg_adapter,
     offline_natural_language_parser_gate,
     semantic_evidence_reason,
@@ -39,12 +42,58 @@ from holoagent0_setup.semantic_gate import (
     verify_cyclone_roles,
 )
 from holoagent0_setup.semantic_fixture_node import SemanticFixtureController
-from holoagent0_setup.source_gate import APPROVED_ASSET_ROOTS
+from holoagent0_setup.source_gate import (
+    AssetGateError,
+    HandoverPaths,
+    VerifiedAssetLock,
+    load_asset_lock,
+)
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = PACKAGE_ROOT.parents[1]
 ASSET_LOCK = PACKAGE_ROOT / "locks/icra_ic4f-assets-v1.json"
+
+
+def _portable_handover_paths(tmp_path: Path) -> HandoverPaths:
+    repository_root = tmp_path / "repository"
+    data_root = tmp_path / "data"
+    graph_module = repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    graph_module.parent.mkdir(parents=True)
+    graph_module.write_text("# portable test module\n", encoding="utf-8")
+    graph = (
+        data_root
+        / "fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/graph_20260629211448"
+    )
+    graph.mkdir(parents=True)
+    (graph / "graph.bin").write_bytes(b"graph")
+    dataset = data_root / "fsr_vln/rgbd_datasets/icra_ic4f"
+    dataset.mkdir(parents=True)
+    (dataset / "frame.bin").write_bytes(b"dataset")
+    checkpoint = data_root / "fsr_vln/checkpoints/open_clip_pytorch_model.bin"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+    asset_lock = (
+        repository_root / "scripts/holoagent0_setup/locks/icra_ic4f-assets-v1.json"
+    )
+    asset_lock.parent.mkdir(parents=True)
+    asset_lock.write_bytes(ASSET_LOCK.read_bytes())
+    return HandoverPaths.from_roots(repository_root, data_root)
+
+
+def _verified_lock(paths: HandoverPaths) -> VerifiedAssetLock:
+    return VerifiedAssetLock(lock=load_asset_lock(paths), manifests=())
+
+
+def _fake_graph_module(origin: Path, graph_type=object):
+    module = SimpleNamespace(
+        Graph=graph_type,
+        __file__=str(origin),
+        __spec__=importlib.machinery.ModuleSpec(
+            "memory.hmsg.graph.graph", loader=None, origin=str(origin)
+        ),
+    )
+    return module
 
 
 class FakeAdapter:
@@ -266,32 +315,255 @@ def test_real_adapter_calls_hmsg_room_object_retrieval_and_coordinate_transform(
     assert result.position == EXPECTED_SEMANTIC.position
 
 
-def test_real_hmsg_query_configuration_uses_owned_output_not_asset_roots(tmp_path):
-    graph = APPROVED_ASSET_ROOTS["graph"]
-    checkpoint = APPROVED_ASSET_ROOTS["checkpoint"]
-    configuration = hmsg_query_configuration(
-        graph_path=graph,
-        checkpoint_path=checkpoint,
-        run_directory=tmp_path,
-    )
+def test_real_hmsg_query_configuration_derives_assets_only_from_handover_paths(
+    tmp_path,
+):
+    paths = _portable_handover_paths(tmp_path)
+    run_directory = tmp_path / "run"
+    configuration = hmsg_query_configuration(paths, run_directory)
 
     assert configuration == {
         "main": {
             "use_gpt": False,
-            "graph_path": str(graph),
-            "save_path": str(tmp_path),
+            "graph_path": str(paths.graph),
+            "save_path": str(run_directory),
         },
-        "models": {"clip": {"type": "ViT-L/14", "checkpoint": str(checkpoint)}},
+        "models": {"clip": {"type": "ViT-L/14", "checkpoint": str(paths.checkpoint)}},
     }
 
 
-def test_real_adapter_fails_closed_when_assets_or_dependencies_are_unavailable(
-    tmp_path,
+def test_real_adapter_public_api_accepts_only_paths_and_run_directory():
+    assert tuple(inspect.signature(load_real_hmsg_adapter).parameters) == (
+        "paths",
+        "run_directory",
+    )
+
+
+def test_root_hmsg_runtime_import_uses_exact_root_origin_and_restores_sys_path(
+    tmp_path, monkeypatch
 ):
-    roots = dict(APPROVED_ASSET_ROOTS)
-    roots["graph"] = tmp_path / "unapproved-graph"
+    paths = _portable_handover_paths(tmp_path)
+    expected = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    graph_module = _fake_graph_module(expected)
+    omega_conf = object()
+    imports = []
+
+    def import_module(name):
+        imports.append((name, tuple(sys.path)))
+        assert sys.path[0] == str(paths.repository_root / "fsr_vln")
+        if name == "memory.hmsg.graph.graph":
+            return graph_module
+        if name == "omegaconf":
+            return SimpleNamespace(OmegaConf=omega_conf)
+        raise AssertionError(name)
+
+    monkeypatch.setattr(
+        "holoagent0_setup.semantic_gate.importlib.import_module", import_module
+    )
+    before = tuple(sys.path)
+
+    loaded_module, loaded_omega_conf, origin = import_root_hmsg_runtime(paths)
+
+    assert (loaded_module, loaded_omega_conf, origin) == (
+        graph_module,
+        omega_conf,
+        expected,
+    )
+    assert [name for name, _path in imports] == [
+        "memory.hmsg.graph.graph",
+        "omegaconf",
+    ]
+    assert tuple(sys.path) == before
+
+
+def test_root_hmsg_runtime_rejects_agentic_origin(tmp_path, monkeypatch):
+    paths = _portable_handover_paths(tmp_path)
+    wrong = paths.repository_root / "agentic_robot/fsr_vln/memory/hmsg/graph/graph.py"
+    wrong.parent.mkdir(parents=True)
+    wrong.write_text("# forbidden origin\n", encoding="utf-8")
+
+    def import_module(name):
+        if name == "memory.hmsg.graph.graph":
+            return _fake_graph_module(wrong)
+        return SimpleNamespace(OmegaConf=object())
+
+    monkeypatch.setattr(
+        "holoagent0_setup.semantic_gate.importlib.import_module", import_module
+    )
+
+    with pytest.raises(SemanticGateError, match="unexpected HMSG module origin"):
+        import_root_hmsg_runtime(paths)
+
+
+def test_root_hmsg_runtime_rejects_stale_cached_wrong_module(tmp_path, monkeypatch):
+    paths = _portable_handover_paths(tmp_path)
+    stale = tmp_path / "stale/memory/hmsg/graph/graph.py"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("# stale cached origin\n", encoding="utf-8")
+    monkeypatch.setitem(
+        sys.modules, "memory.hmsg.graph.graph", _fake_graph_module(stale)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "omegaconf",
+        SimpleNamespace(OmegaConf=object()),
+    )
+
+    with pytest.raises(SemanticGateError, match="unexpected HMSG module origin"):
+        import_root_hmsg_runtime(paths)
+
+
+def test_real_adapter_uses_verified_paths_configuration_and_room_mapping(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    run_directory = tmp_path / "run"
+    observed = {}
+
+    class FakeOmegaConf:
+        @staticmethod
+        def create(configuration):
+            observed["configuration"] = configuration
+            return configuration
+
+    class FakeGraph:
+        def __init__(self, configuration):
+            observed["constructed"] = configuration
+
+        def load_graph(self, graph_path):
+            observed["loaded"] = graph_path
+
+        def set_room_names(self, *, room_names):
+            observed["room_names"] = room_names
+
+    origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    monkeypatch.setattr(
+        "holoagent0_setup.semantic_gate.verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        "holoagent0_setup.semantic_gate.import_root_hmsg_runtime",
+        lambda bound: (_fake_graph_module(origin, FakeGraph), FakeOmegaConf, origin),
+    )
+
+    adapter = load_real_hmsg_adapter(paths, run_directory)
+
+    assert isinstance(adapter, RealHMSGRetrievalAdapter)
+    assert observed == {
+        "configuration": {
+            "main": {
+                "use_gpt": False,
+                "graph_path": str(paths.graph),
+                "save_path": str(run_directory),
+            },
+            "models": {
+                "clip": {
+                    "type": "ViT-L/14",
+                    "checkpoint": str(paths.checkpoint),
+                }
+            },
+        },
+        "constructed": observed["configuration"],
+        "loaded": str(paths.graph),
+        "room_names": ["Pantry", "Office", "Hallway"],
+    }
+
+
+def test_real_adapter_rejects_path_identity_drift_immediately_before_graph_load(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    run_directory = tmp_path / "run"
+    original_graph = tmp_path / "original-graph"
+
+    class FakeGraph:
+        def __init__(self, _configuration):
+            paths.graph.rename(original_graph)
+            paths.graph.mkdir()
+
+        def load_graph(self, _graph_path):
+            raise AssertionError("load_graph must not run after path drift")
+
+    origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    monkeypatch.setattr(
+        "holoagent0_setup.semantic_gate.verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        "holoagent0_setup.semantic_gate.import_root_hmsg_runtime",
+        lambda bound: (
+            _fake_graph_module(origin, FakeGraph),
+            SimpleNamespace(create=lambda value: value),
+            origin,
+        ),
+    )
+
     with pytest.raises(SemanticGateError, match="SEMANTIC_ASSET_UNAVAILABLE"):
-        load_real_hmsg_adapter(REPOSITORY_ROOT, ASSET_LOCK, roots, tmp_path)
+        load_real_hmsg_adapter(paths, run_directory)
+
+
+def test_real_adapter_rejects_run_overlap_before_asset_or_import_work(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    monkeypatch.setattr(
+        "holoagent0_setup.semantic_gate.verify_asset_lock",
+        lambda _bound: pytest.fail("asset verification must not run"),
+    )
+
+    with pytest.raises(SemanticGateError, match="RUN_PATH_OVERLAP"):
+        load_real_hmsg_adapter(paths, paths.graph)
+
+
+def test_real_adapter_rejects_run_identity_drift_after_runtime_import(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    run_directory = tmp_path / "run"
+
+    class FakeGraph:
+        def __init__(self, _configuration):
+            pass
+
+        def load_graph(self, _graph_path):
+            pass
+
+        def set_room_names(self, *, room_names):
+            pass
+
+    def import_after_run_replacement(_paths):
+        run_directory.rename(tmp_path / "original-run")
+        run_directory.mkdir()
+        origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+        return (
+            _fake_graph_module(origin, FakeGraph),
+            SimpleNamespace(create=lambda value: value),
+            origin,
+        )
+
+    monkeypatch.setattr(
+        "holoagent0_setup.semantic_gate.verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        "holoagent0_setup.semantic_gate.import_root_hmsg_runtime",
+        import_after_run_replacement,
+    )
+
+    with pytest.raises(SemanticGateError, match="SEMANTIC_ASSET_UNAVAILABLE"):
+        load_real_hmsg_adapter(paths, run_directory)
+
+
+def test_real_adapter_rejects_verified_asset_mismatch(tmp_path, monkeypatch):
+    paths = _portable_handover_paths(tmp_path)
+
+    def reject(_paths):
+        raise AssetGateError("ASSET_INVENTORY_MISMATCH", "graph")
+
+    monkeypatch.setattr("holoagent0_setup.semantic_gate.verify_asset_lock", reject)
+
+    with pytest.raises(SemanticGateError, match="SEMANTIC_ASSET_UNAVAILABLE"):
+        load_real_hmsg_adapter(paths, tmp_path / "run")
 
 
 def test_four_role_cyclone_configs_are_exact_and_digest_bound():
@@ -461,10 +733,54 @@ def test_fixture_node_module_is_import_safe_without_ros_dependencies():
     assert completed.returncode == 0, completed.stderr
 
 
+def test_fixture_cli_accepts_only_the_two_handover_roots_and_run_controls():
+    parameters = fixture_module._parse_arguments(
+        [
+            "--repository-root",
+            "/repository",
+            "--data-root",
+            "/data",
+            "--run-directory",
+            "/run",
+            "--timeout-seconds",
+            "2",
+        ]
+    )
+
+    assert vars(parameters) == {
+        "repository_root": Path("/repository"),
+        "data_root": Path("/data"),
+        "run_directory": Path("/run"),
+        "timeout_seconds": 2.0,
+    }
+    source = Path(fixture_module.__file__).read_text(encoding="utf-8")
+    assert source.count("HandoverPaths.from_roots(") == 1
+    for removed in (
+        "--asset-lock",
+        "--graph-root",
+        "--dataset-root",
+        "--checkpoint-path",
+    ):
+        with pytest.raises(SystemExit):
+            fixture_module._parse_arguments(
+                [
+                    "--repository-root",
+                    "/repository",
+                    "--data-root",
+                    "/data",
+                    "--run-directory",
+                    "/run",
+                    removed,
+                    "/legacy",
+                ]
+            )
+
+
 @pytest.mark.parametrize("build_fails", [False, True])
 def test_fixture_main_is_bounded_and_shuts_ros_down_on_constructor_failure(
     tmp_path, monkeypatch, build_fails
 ):
+    paths = _portable_handover_paths(tmp_path)
     events = []
 
     class FakeNode:
@@ -499,13 +815,24 @@ def test_fixture_main_is_bounded_and_shuts_ros_down_on_constructor_failure(
         init=init, ok=ok, spin_once=spin_once, shutdown=shutdown
     )
     monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
-    monkeypatch.setattr(fixture_module, "verify_cyclone_roles", lambda *_: object())
+
+    def verify_cyclone(repository_root, asset_lock):
+        assert repository_root == paths.repository_root
+        assert asset_lock == paths.asset_lock
+        return object()
+
+    monkeypatch.setattr(fixture_module, "verify_cyclone_roles", verify_cyclone)
     monkeypatch.setattr(
         fixture_module, "validate_fixture_runtime_environment", lambda *_: None
     )
-    monkeypatch.setattr(
-        fixture_module, "load_real_hmsg_adapter", lambda *_: FakeAdapter()
-    )
+
+    def load_adapter(bound_paths, run_directory):
+        assert bound_paths.repository_root == paths.repository_root
+        assert bound_paths.data_root == paths.data_root
+        assert run_directory == tmp_path / "run"
+        return FakeAdapter()
+
+    monkeypatch.setattr(fixture_module, "load_real_hmsg_adapter", load_adapter)
 
     def build(_adapter):
         if build_fails:
@@ -515,17 +842,11 @@ def test_fixture_main_is_bounded_and_shuts_ros_down_on_constructor_failure(
     monkeypatch.setattr(fixture_module, "build_ros_node", build)
     arguments = [
         "--repository-root",
-        str(REPOSITORY_ROOT),
-        "--asset-lock",
-        str(ASSET_LOCK),
-        "--graph-root",
-        str(APPROVED_ASSET_ROOTS["graph"]),
-        "--dataset-root",
-        str(APPROVED_ASSET_ROOTS["dataset"]),
-        "--checkpoint-path",
-        str(APPROVED_ASSET_ROOTS["checkpoint"]),
+        str(paths.repository_root),
+        "--data-root",
+        str(paths.data_root),
         "--run-directory",
-        str(tmp_path),
+        str(tmp_path / "run"),
         "--timeout-seconds",
         "1",
     ]
@@ -540,6 +861,7 @@ def test_fixture_main_is_bounded_and_shuts_ros_down_on_constructor_failure(
 
 
 def test_fixture_main_shutdown_runs_even_when_node_destroy_fails(tmp_path, monkeypatch):
+    paths = _portable_handover_paths(tmp_path)
     events = []
 
     class FakeNode:
@@ -571,17 +893,11 @@ def test_fixture_main_shutdown_runs_even_when_node_destroy_fails(tmp_path, monke
         fixture_module.main(
             [
                 "--repository-root",
-                str(REPOSITORY_ROOT),
-                "--asset-lock",
-                str(ASSET_LOCK),
-                "--graph-root",
-                str(APPROVED_ASSET_ROOTS["graph"]),
-                "--dataset-root",
-                str(APPROVED_ASSET_ROOTS["dataset"]),
-                "--checkpoint-path",
-                str(APPROVED_ASSET_ROOTS["checkpoint"]),
+                str(paths.repository_root),
+                "--data-root",
+                str(paths.data_root),
                 "--run-directory",
-                str(tmp_path),
+                str(tmp_path / "run"),
             ]
         )
     assert events == ["destroy", "shutdown"]

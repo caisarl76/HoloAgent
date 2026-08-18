@@ -32,19 +32,6 @@ READ_CHUNK_BYTES = 1024 * 1024
 ASSET_LOCK_READ_LIMIT_BYTES = 4 * 1024 * 1024
 GIT_TIMEOUT_SECONDS = 15
 GIT_OUTPUT_LIMIT_BYTES = 1024 * 1024
-# TODO(Task 4): remove this temporary host-bound compatibility constant together
-# with the Mapping branches in measure_approved_asset_roots/verify_asset_lock.
-# New callers must construct HandoverPaths from the two deployment roots.
-APPROVED_ASSET_ROOTS = {
-    "graph": Path(
-        "/home/jihun/work/HoloAgent/fsr_vln/scene_graphs_opensource/horizon/"
-        "icra_ic4f/graph_20260629211448"
-    ),
-    "dataset": Path("/mnt/data/jihun/HoloAgent/fsr_vln/rgbd_datasets/icra_ic4f"),
-    "checkpoint": Path(
-        "/mnt/data/jihun/HoloAgent/fsr_vln/checkpoints/open_clip_pytorch_model.bin"
-    ),
-}
 APPROVED_ASSETS = (
     (
         "graph",
@@ -413,6 +400,14 @@ class AssetManifest:
     byte_count: int
     sha256: str
     files: tuple[AssetFileSpec, ...]
+
+
+@dataclass(frozen=True)
+class VerifiedAssetLock:
+    """One identity-bound lock parse and its verified asset manifests."""
+
+    lock: AssetLock
+    manifests: tuple[AssetManifest, ...]
 
 
 def _closed(document: Mapping[str, Any], keys: set[str], subject: str) -> None:
@@ -1580,77 +1575,47 @@ def prepare_handover_run_directory(path: Path, paths: HandoverPaths) -> PathIden
             os.close(parent_fd)
 
 
-def _validated_asset_roots(asset_roots: Mapping[str, Path]) -> dict[str, Path]:
-    if not isinstance(asset_roots, Mapping) or set(asset_roots) != set(
-        APPROVED_ASSET_ROOTS
-    ):
-        raise AssetGateError(
-            "ASSET_ROOT_MISMATCH", "asset roots must use the exact approved role set"
-        )
-    validated = {}
-    for role, approved in APPROVED_ASSET_ROOTS.items():
-        candidate = Path(asset_roots[role])
-        if not candidate.is_absolute() or candidate != approved:
-            raise AssetGateError(
-                "ASSET_ROOT_MISMATCH", f"{role} does not use its approved root"
-            )
-        validated[role] = candidate
-    return validated
-
-
 def measure_approved_asset_roots(
-    asset_roots: HandoverPaths | Mapping[str, Path],
+    paths: HandoverPaths,
 ) -> dict[str, AssetManifest]:
     """Measure only the three explicitly approved roots, never searched roots."""
-    if isinstance(asset_roots, HandoverPaths):
-        asset_roots.revalidate()
-        measured = {
-            role: _canonical_handover_asset_manifest(asset_roots, role)
-            for role in ("graph", "dataset", "checkpoint")
-        }
-        asset_roots.revalidate()
-        return measured
-    # TODO(Task 4): remove this legacy Mapping branch after semantic migration.
-    roots = _validated_asset_roots(asset_roots)
-    return {role: canonical_asset_manifest(roots[role]) for role in roots}
+    if not isinstance(paths, HandoverPaths):
+        raise AssetGateError(
+            "ASSET_ROOT_MISMATCH", "a validated HandoverPaths instance is required"
+        )
+    paths.revalidate()
+    measured = {
+        role: _canonical_handover_asset_manifest(paths, role)
+        for role in ("graph", "dataset", "checkpoint")
+    }
+    paths.revalidate()
+    return measured
 
 
 def verify_asset_lock(
-    asset_roots: HandoverPaths | Mapping[str, Path],
-    source: Path | Mapping[str, Any] | None = None,
-) -> tuple[AssetManifest, ...]:
+    paths: HandoverPaths,
+) -> VerifiedAssetLock:
     """Verify pinned assets in place; missing assets never receive substitutes."""
-    if isinstance(asset_roots, HandoverPaths):
-        if source is not None:
-            raise AssetGateError(
-                "ASSET_ROOT_MISMATCH",
-                "HandoverPaths verification always uses its derived asset_lock",
-            )
-        asset_roots.revalidate()
-        roots = {
-            "graph": asset_roots.graph,
-            "dataset": asset_roots.dataset,
-            "checkpoint": asset_roots.checkpoint,
-        }
-        lock = load_asset_lock(asset_roots)
-        if tuple(asset.role for asset in lock.assets) != tuple(roots):
-            raise AssetGateError(
-                "ASSET_ROOT_MISMATCH", "asset lock does not use the exact role set"
-            )
-        results = tuple(
-            _verify_handover_asset_inventory(asset_roots, asset)
-            for asset in lock.assets
-        )
-        asset_roots.revalidate()
-        return results
-    # TODO(Task 4): remove this legacy Mapping branch after semantic migration.
-    if source is None:
+    if not isinstance(paths, HandoverPaths):
         raise AssetGateError(
-            "ASSET_ROOT_MISMATCH", "legacy asset verification requires its lock"
+            "ASSET_ROOT_MISMATCH", "a validated HandoverPaths instance is required"
         )
-    roots = _validated_asset_roots(asset_roots)
-    lock = load_asset_lock(source)
-    results = []
-    for asset in lock.assets:
-        results.append(verify_asset_inventory(roots[asset.role], asset))
-    return tuple(results)
+    paths.revalidate()
+    roots = {
+        "graph": paths.graph,
+        "dataset": paths.dataset,
+        "checkpoint": paths.checkpoint,
+    }
+    lock = load_asset_lock(paths)
+    if tuple(asset.role for asset in lock.assets) != tuple(roots):
+        raise AssetGateError(
+            "ASSET_ROOT_MISMATCH", "asset lock does not use the exact role set"
+        )
+    # The lock parse above is descriptor-bound. Revalidate immediately before
+    # opening the retained asset identities for their descriptor-bound traversal.
+    paths.revalidate()
+    manifests = tuple(
+        _verify_handover_asset_inventory(paths, asset) for asset in lock.assets
+    )
+    paths.revalidate()
+    return VerifiedAssetLock(lock=lock, manifests=manifests)

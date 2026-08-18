@@ -19,6 +19,7 @@ from .semantic_gate import (
     validate_fixture_runtime_environment,
     verify_cyclone_roles,
 )
+from .source_gate import HandoverPaths
 
 
 QUERY_TOPIC = "/holoagent0/semantic_fixture_query"
@@ -108,10 +109,7 @@ def build_ros_node(adapter: HMSGRetrievalAdapter):
 def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository-root", type=Path, required=True)
-    parser.add_argument("--asset-lock", type=Path, required=True)
-    parser.add_argument("--graph-root", type=Path, required=True)
-    parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--checkpoint-path", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--run-directory", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     return parser.parse_args(argv)
@@ -128,18 +126,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SemanticGateError(
             "SEMANTIC_CARDINALITY_MISMATCH", "timeout must be in (0, 60] seconds"
         )
-    cyclone = verify_cyclone_roles(arguments.repository_root, arguments.asset_lock)
-    validate_fixture_runtime_environment(cyclone, os.environ)
-    adapter = load_real_hmsg_adapter(
+    paths = HandoverPaths.from_roots(
         arguments.repository_root,
-        arguments.asset_lock,
-        {
-            "graph": arguments.graph_root,
-            "dataset": arguments.dataset_root,
-            "checkpoint": arguments.checkpoint_path,
-        },
-        arguments.run_directory,
+        arguments.data_root,
     )
+    cyclone = verify_cyclone_roles(paths.repository_root, paths.asset_lock)
+    validate_fixture_runtime_environment(cyclone, os.environ)
+    adapter = load_real_hmsg_adapter(paths, arguments.run_directory)
     try:
         import rclpy
     except ImportError as error:
