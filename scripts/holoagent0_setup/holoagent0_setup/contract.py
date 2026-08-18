@@ -184,6 +184,15 @@ class ContractSet:
             errors,
         )
 
+    def require_valid_document(
+        self, schema_name: str, value: Mapping[str, object]
+    ) -> None:
+        """Require one tracked document or raise an inspectable contract error."""
+
+        decision = self.validate_document(schema_name, value)
+        if not decision.ok:
+            raise ContractError(decision)
+
     def trace_tool_rows(self) -> tuple[dict[str, object], ...]:
         """Return defensive copies of the single reviewed trace-tool row."""
 
