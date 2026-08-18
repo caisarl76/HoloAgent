@@ -297,11 +297,12 @@ def test_new_asset_measurement_uses_only_derived_exact_roles(tmp_path, monkeypat
     observed = []
     sentinel = AssetManifest(0, 0, hashlib.sha256(b"").hexdigest(), ())
 
-    def measure(path):
-        observed.append(path)
+    def measure(bound_paths, role):
+        assert bound_paths is paths
+        observed.append(getattr(bound_paths, role))
         return sentinel
 
-    monkeypatch.setattr(source_gate, "canonical_asset_manifest", measure)
+    monkeypatch.setattr(source_gate, "_canonical_handover_asset_manifest", measure)
 
     measured = measure_approved_asset_roots(paths)
 
@@ -328,20 +329,164 @@ def test_new_asset_verification_uses_the_derived_lock_and_role_set(
         loaded.append(source)
         return SimpleNamespace(assets=assets)
 
-    def verify(root, asset):
-        verified.append((root, asset.role))
+    def verify(bound_paths, asset):
+        assert bound_paths is paths
+        verified.append((getattr(bound_paths, asset.role), asset.role))
         return asset.role
 
     monkeypatch.setattr(source_gate, "load_asset_lock", load)
-    monkeypatch.setattr(source_gate, "verify_asset_inventory", verify)
+    monkeypatch.setattr(source_gate, "_verify_handover_asset_inventory", verify)
 
     assert verify_asset_lock(paths) == ("graph", "dataset", "checkpoint")
-    assert loaded == [paths.asset_lock]
+    assert loaded == [paths]
     assert verified == [
         (paths.graph, "graph"),
         (paths.dataset, "dataset"),
         (paths.checkpoint, "checkpoint"),
     ]
+
+
+def test_handover_verification_rejects_asset_lock_aba_substitution(
+    tmp_path, monkeypatch
+):
+    repository_root, data_root = _make_handover_layout(tmp_path)
+    asset_lock = (
+        repository_root / "scripts/holoagent0_setup/locks/icra_ic4f-assets-v1.json"
+    )
+    asset_lock.write_bytes(ASSET_LOCK.read_bytes())
+    paths = HandoverPaths.from_roots(repository_root, data_root)
+    substitute = tmp_path / "substitute-asset-lock.json"
+    substitute.write_bytes(ASSET_LOCK.read_bytes())
+    original = tmp_path / "original-asset-lock.json"
+    original_load = source_gate.load_asset_lock
+    original_open = source_gate._open_absolute_no_follow
+    armed = False
+    consumed = False
+
+    def swap_lock():
+        asset_lock.rename(original)
+        substitute.rename(asset_lock)
+
+    def restore_lock():
+        asset_lock.rename(substitute)
+        original.rename(asset_lock)
+
+    def load_during_substitution(source):
+        nonlocal consumed
+        if armed and not isinstance(source, HandoverPaths):
+            consumed = True
+            swap_lock()
+            try:
+                return original_load(source)
+            finally:
+                restore_lock()
+        return original_load(source)
+
+    def open_during_substitution(path, *, directory):
+        nonlocal consumed
+        if armed and not consumed and path == asset_lock:
+            consumed = True
+            swap_lock()
+            try:
+                return original_open(path, directory=directory)
+            finally:
+                restore_lock()
+        return original_open(path, directory=directory)
+
+    original_revalidate = source_gate.HandoverPaths.revalidate
+
+    def arm_after_initial_revalidation(self):
+        nonlocal armed
+        original_revalidate(self)
+        armed = True
+
+    monkeypatch.setattr(source_gate, "load_asset_lock", load_during_substitution)
+    monkeypatch.setattr(
+        source_gate, "_open_absolute_no_follow", open_during_substitution
+    )
+    monkeypatch.setattr(
+        source_gate.HandoverPaths,
+        "revalidate",
+        arm_after_initial_revalidation,
+    )
+    with pytest.raises(AssetGateError) as caught:
+        verify_asset_lock(paths)
+
+    assert consumed is True
+    assert caught.value.reason == "ASSET_IDENTITY_CHANGED"
+    assert asset_lock.stat().st_ino == paths.identities[-1].inode
+
+
+def test_handover_measurement_rejects_asset_root_aba_substitution(
+    tmp_path, monkeypatch
+):
+    paths = _handover_paths(tmp_path)
+    substitute = tmp_path / "substitute-graph"
+    substitute.mkdir()
+    (substitute / "substitute.bin").write_bytes(b"substitute")
+    original = tmp_path / "original-graph"
+    original_manifest = source_gate.canonical_asset_manifest
+    original_open = source_gate._open_absolute_no_follow
+    original_revalidate = source_gate.HandoverPaths.revalidate
+    armed = False
+    consumed = False
+
+    def arm_after_initial_revalidation(self):
+        nonlocal armed
+        original_revalidate(self)
+        armed = True
+
+    def swap_graph():
+        paths.graph.rename(original)
+        substitute.rename(paths.graph)
+
+    def restore_graph():
+        paths.graph.rename(substitute)
+        original.rename(paths.graph)
+
+    def open_during_substitution(path, *, directory):
+        nonlocal consumed
+        if armed and not consumed and path == paths.graph:
+            consumed = True
+            swap_graph()
+            try:
+                return original_open(path, directory=directory)
+            finally:
+                restore_graph()
+        return original_open(path, directory=directory)
+
+    def measure_during_substitution(root):
+        nonlocal consumed
+        if armed and not consumed and root == paths.graph:
+            consumed = True
+            swap_graph()
+            try:
+                return original_manifest(root)
+            finally:
+                restore_graph()
+        return original_manifest(root)
+
+    monkeypatch.setattr(
+        source_gate.HandoverPaths,
+        "revalidate",
+        arm_after_initial_revalidation,
+    )
+    monkeypatch.setattr(
+        source_gate, "_open_absolute_no_follow", open_during_substitution
+    )
+    monkeypatch.setattr(
+        source_gate, "canonical_asset_manifest", measure_during_substitution
+    )
+
+    with pytest.raises(AssetGateError) as caught:
+        measure_approved_asset_roots(paths)
+
+    assert consumed is True
+    assert caught.value.reason == "ASSET_IDENTITY_CHANGED"
+    graph_identity = next(
+        identity for identity in paths.identities if identity.path == paths.graph
+    )
+    assert paths.graph.stat().st_ino == graph_identity.inode
 
 
 def test_prepare_handover_run_directory_atomically_creates_owner_only_directory(
@@ -813,8 +958,8 @@ def test_generated_asset_lock_exactly_matches_the_three_derived_roots(
     }
     monkeypatch.setattr(
         source_gate,
-        "canonical_asset_manifest",
-        lambda path: by_path[path],
+        "_canonical_handover_asset_manifest",
+        lambda bound_paths, role: by_path[getattr(bound_paths, role)],
     )
 
     measured = source_gate.measure_approved_asset_roots(paths)

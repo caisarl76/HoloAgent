@@ -29,6 +29,7 @@ APPROVED_PATH_SET_SHA256 = (
 CANONICAL_ASSET_ALGORITHM = "sha256-content-lines-v1"
 REVIEWED_GIT = Path("/usr/bin/git")
 READ_CHUNK_BYTES = 1024 * 1024
+ASSET_LOCK_READ_LIMIT_BYTES = 4 * 1024 * 1024
 GIT_TIMEOUT_SECONDS = 15
 GIT_OUTPUT_LIMIT_BYTES = 1024 * 1024
 # TODO(Task 4): remove this temporary host-bound compatibility constant together
@@ -195,6 +196,34 @@ class HandoverPaths:
                     "HANDOVER_PATH_IDENTITY_CHANGED",
                     f"{role}: device, inode, or mode changed",
                 )
+
+
+_HANDOVER_IDENTITY_ROLES = (
+    "repository_root",
+    "data_root",
+    "graph",
+    "dataset",
+    "checkpoint",
+    "asset_lock",
+)
+
+
+def _retained_path_identity(paths: HandoverPaths, role: str) -> PathIdentity:
+    """Return one identity only from the closed, internally derived role set."""
+    if not isinstance(paths, HandoverPaths) or role not in _HANDOVER_IDENTITY_ROLES:
+        raise AssetGateError(
+            "ASSET_ROOT_MISMATCH", f"unknown retained handover role: {role}"
+        )
+    expected_paths = tuple(getattr(paths, name) for name in _HANDOVER_IDENTITY_ROLES)
+    if (
+        len(paths.identities) != len(_HANDOVER_IDENTITY_ROLES)
+        or tuple(identity.path for identity in paths.identities) != expected_paths
+    ):
+        raise AssetGateError(
+            "HANDOVER_PATH_IDENTITY_CHANGED",
+            "retained path identities no longer match the closed role set",
+        )
+    return paths.identities[_HANDOVER_IDENTITY_ROLES.index(role)]
 
 
 def _normalized_absolute_path(value: Path, role: str, prefix: str) -> Path:
@@ -417,6 +446,60 @@ def _read_document(source: Path | Mapping[str, Any], error_type: type[RuntimeErr
     if not isinstance(document, dict):
         raise error_type("LOCK_INVALID", "lock root must be an object")
     return document
+
+
+def _read_retained_asset_lock(paths: HandoverPaths) -> dict[str, Any]:
+    expected = _retained_path_identity(paths, "asset_lock")
+    descriptor = -1
+    try:
+        descriptor = _open_absolute_no_follow(expected.path, directory=False)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or _identity_triplet(before) != (
+            expected.device,
+            expected.inode,
+            expected.mode,
+        ):
+            raise AssetGateError(
+                "ASSET_IDENTITY_CHANGED",
+                "opened asset_lock does not match its retained identity",
+            )
+        if before.st_size > ASSET_LOCK_READ_LIMIT_BYTES:
+            raise AssetGateError(
+                "LOCK_INVALID", "asset lock exceeds the bounded read limit"
+            )
+        content = bytearray()
+        while True:
+            remaining = ASSET_LOCK_READ_LIMIT_BYTES + 1 - len(content)
+            if remaining <= 0:
+                raise AssetGateError(
+                    "LOCK_INVALID", "asset lock exceeds the bounded read limit"
+                )
+            chunk = os.read(descriptor, min(READ_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            content.extend(chunk)
+        after = os.fstat(descriptor)
+        if _identity(before) != _identity(after) or len(content) != before.st_size:
+            raise AssetGateError(
+                "ASSET_IDENTITY_CHANGED", "asset_lock changed while being read"
+            )
+        try:
+            document = json.loads(
+                bytes(content).decode("utf-8"),
+                object_pairs_hook=_unique_json_object,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise AssetGateError("LOCK_INVALID", str(error)) from error
+        if not isinstance(document, dict):
+            raise AssetGateError("LOCK_INVALID", "lock root must be an object")
+        return document
+    except AssetGateError:
+        raise
+    except OSError as error:
+        raise AssetGateError("ASSET_IDENTITY_CHANGED", str(error)) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _safe_relative_path(value: Any, subject: str) -> str:
@@ -679,16 +762,6 @@ def _stream_regular_fd(fd: int, subject: str) -> tuple[int, str, int]:
     return observed, digest.hexdigest(), before.st_mode
 
 
-def _stream_regular_file(path: Path) -> tuple[int, str, int]:
-    """Return size, SHA-256 and mode from one identity-stable no-follow FD."""
-    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
-    try:
-        return _stream_regular_fd(fd, str(path))
-    finally:
-        os.close(fd)
-
-
 def _open_parent_beneath(root: Path, relative_path: str) -> tuple[int, str]:
     """Open an entry's parent without following any intermediate symlink."""
     parts = PurePosixPath(relative_path).parts
@@ -850,9 +923,11 @@ def verify_source_worktree(
     )
 
 
-def load_asset_lock(source: Path | Mapping[str, Any]) -> AssetLock:
+def load_asset_lock(source: HandoverPaths | Path | Mapping[str, Any]) -> AssetLock:
     """Load the closed semantic asset and Cyclone role lock."""
     try:
+        if isinstance(source, HandoverPaths):
+            source = _read_retained_asset_lock(source)
         document = _read_document(source, AssetGateError)
         _closed(
             document,
@@ -1227,54 +1302,31 @@ def _scan_asset_directory(
     return entries
 
 
-def canonical_asset_manifest(root: Path) -> AssetManifest:
-    """Build an exact, byte-sorted inventory with no-follow streaming reads."""
-    root = Path(root)
-    try:
-        root_before = root.lstat()
-        if stat.S_ISLNK(root_before.st_mode):
-            raise AssetGateError("ASSET_INVALID", f"asset root is a symlink: {root}")
-        if stat.S_ISDIR(root_before.st_mode):
-            flags = (
-                os.O_RDONLY
-                | os.O_CLOEXEC
-                | os.O_DIRECTORY
-                | getattr(os, "O_NOFOLLOW", 0)
+def _canonical_asset_manifest_from_fd(root: Path, root_fd: int) -> AssetManifest:
+    root_before = os.fstat(root_fd)
+    if stat.S_ISDIR(root_before.st_mode):
+        files = tuple(
+            sorted(
+                _scan_asset_directory(root_fd, PurePosixPath()),
+                key=lambda entry: os.fsencode(entry.relative_path),
             )
-            root_fd = os.open(root, flags)
-            try:
-                if _identity(root_before) != _identity(os.fstat(root_fd)):
-                    raise OSError("asset root identity changed before traversal")
-                files = tuple(
-                    sorted(
-                        _scan_asset_directory(root_fd, PurePosixPath()),
-                        key=lambda entry: os.fsencode(entry.relative_path),
-                    )
-                )
-            finally:
-                os.close(root_fd)
-        elif stat.S_ISREG(root_before.st_mode):
-            byte_size, digest, opened_mode = _stream_regular_file(root)
-            files = (
-                AssetFileSpec(
-                    relative_path=root.name,
-                    kind="regular_file",
-                    mode=_mode_string(opened_mode),
-                    byte_size=byte_size,
-                    sha256=digest,
-                    symlink_target=None,
-                ),
-            )
-        else:
-            raise AssetGateError("ASSET_INVALID", f"unsupported asset root: {root}")
-        if _identity(root_before) != _identity(root.lstat()):
-            raise OSError("asset root identity changed while hashing")
-    except FileNotFoundError as error:
-        raise AssetGateError("ASSET_UNAVAILABLE", str(root)) from error
-    except AssetGateError:
-        raise
-    except OSError as error:
-        raise AssetGateError("ASSET_IDENTITY_CHANGED", str(error)) from error
+        )
+    elif stat.S_ISREG(root_before.st_mode):
+        byte_size, digest, opened_mode = _stream_regular_fd(root_fd, str(root))
+        files = (
+            AssetFileSpec(
+                relative_path=root.name,
+                kind="regular_file",
+                mode=_mode_string(opened_mode),
+                byte_size=byte_size,
+                sha256=digest,
+                symlink_target=None,
+            ),
+        )
+    else:
+        raise AssetGateError("ASSET_INVALID", f"unsupported asset root: {root}")
+    if _identity(root_before) != _identity(os.fstat(root_fd)):
+        raise OSError("asset root identity changed while hashing")
     root_digest = _canonical_asset_digest(files)
     if stat.S_ISREG(root_before.st_mode):
         root_digest = files[0].sha256
@@ -1286,9 +1338,94 @@ def canonical_asset_manifest(root: Path) -> AssetManifest:
     )
 
 
+def canonical_asset_manifest(root: Path) -> AssetManifest:
+    """Build an exact, byte-sorted inventory with no-follow streaming reads."""
+    root = Path(root)
+    root_fd = -1
+    try:
+        root_before = root.lstat()
+        if stat.S_ISLNK(root_before.st_mode):
+            raise AssetGateError("ASSET_INVALID", f"asset root is a symlink: {root}")
+        if not (stat.S_ISDIR(root_before.st_mode) or stat.S_ISREG(root_before.st_mode)):
+            raise AssetGateError("ASSET_INVALID", f"unsupported asset root: {root}")
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        if stat.S_ISDIR(root_before.st_mode):
+            flags |= os.O_DIRECTORY
+        root_fd = os.open(root, flags)
+        if _identity(root_before) != _identity(os.fstat(root_fd)):
+            raise OSError("asset root identity changed before traversal")
+        manifest = _canonical_asset_manifest_from_fd(root, root_fd)
+        if _identity(root_before) != _identity(root.lstat()):
+            raise OSError("asset root identity changed while hashing")
+        return manifest
+    except FileNotFoundError as error:
+        raise AssetGateError("ASSET_UNAVAILABLE", str(root)) from error
+    except AssetGateError:
+        raise
+    except OSError as error:
+        raise AssetGateError("ASSET_IDENTITY_CHANGED", str(error)) from error
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _canonical_handover_asset_manifest(
+    paths: HandoverPaths, role: str
+) -> AssetManifest:
+    if role not in {"graph", "dataset", "checkpoint"}:
+        raise AssetGateError("ASSET_ROOT_MISMATCH", f"unexpected asset role: {role}")
+    expected = _retained_path_identity(paths, role)
+    directory = role != "checkpoint"
+    root_fd = -1
+    try:
+        root_fd = _open_absolute_no_follow(expected.path, directory=directory)
+        opened = os.fstat(root_fd)
+        expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+        if not expected_type(opened.st_mode) or _identity_triplet(opened) != (
+            expected.device,
+            expected.inode,
+            expected.mode,
+        ):
+            raise AssetGateError(
+                "ASSET_IDENTITY_CHANGED",
+                f"opened {role} does not match its retained identity",
+            )
+        manifest = _canonical_asset_manifest_from_fd(expected.path, root_fd)
+        if _identity_triplet(os.fstat(root_fd)) != (
+            expected.device,
+            expected.inode,
+            expected.mode,
+        ):
+            raise AssetGateError(
+                "ASSET_IDENTITY_CHANGED", f"{role} changed during measurement"
+            )
+        return manifest
+    except AssetGateError:
+        raise
+    except OSError as error:
+        raise AssetGateError("ASSET_IDENTITY_CHANGED", f"{role}: {error}") from error
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
 def verify_asset_inventory(root: Path, asset: AssetSpec) -> AssetManifest:
     """Compare the complete on-disk inventory with one immutable lock entry."""
     measured = canonical_asset_manifest(root)
+    if (
+        measured.file_count != asset.file_count
+        or measured.byte_count != asset.byte_count
+        or measured.sha256 != asset.sha256
+        or measured.files != asset.files
+    ):
+        raise AssetGateError("ASSET_INVENTORY_MISMATCH", asset.role)
+    return measured
+
+
+def _verify_handover_asset_inventory(
+    paths: HandoverPaths, asset: AssetSpec
+) -> AssetManifest:
+    measured = _canonical_handover_asset_manifest(paths, asset.role)
     if (
         measured.file_count != asset.file_count
         or measured.byte_count != asset.byte_count
@@ -1467,13 +1604,9 @@ def measure_approved_asset_roots(
     """Measure only the three explicitly approved roots, never searched roots."""
     if isinstance(asset_roots, HandoverPaths):
         asset_roots.revalidate()
-        roots = {
-            "graph": asset_roots.graph,
-            "dataset": asset_roots.dataset,
-            "checkpoint": asset_roots.checkpoint,
-        }
         measured = {
-            role: canonical_asset_manifest(root) for role, root in roots.items()
+            role: _canonical_handover_asset_manifest(asset_roots, role)
+            for role in ("graph", "dataset", "checkpoint")
         }
         asset_roots.revalidate()
         return measured
@@ -1499,13 +1632,14 @@ def verify_asset_lock(
             "dataset": asset_roots.dataset,
             "checkpoint": asset_roots.checkpoint,
         }
-        lock = load_asset_lock(asset_roots.asset_lock)
+        lock = load_asset_lock(asset_roots)
         if tuple(asset.role for asset in lock.assets) != tuple(roots):
             raise AssetGateError(
                 "ASSET_ROOT_MISMATCH", "asset lock does not use the exact role set"
             )
         results = tuple(
-            verify_asset_inventory(roots[asset.role], asset) for asset in lock.assets
+            _verify_handover_asset_inventory(asset_roots, asset)
+            for asset in lock.assets
         )
         asset_roots.revalidate()
         return results
