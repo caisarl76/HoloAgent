@@ -2,13 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the approved `workstation_offline` profile: deterministic AgentOS input, pinned OpenClaw and semantic assets, a fail-closed traced coordinator, and schema-valid evidence with no external or unapproved network activity.
+**Goal:** Build the approved `workstation_offline` core and a fail-closed public
+Task 13 checkpoint: deterministic offline gates, pinned assets, supervisor-only
+evidence, and a production CLI that cannot launch while the reviewed live trace
+runtime remains unavailable.
 
 **Architecture:** A small Python package under `scripts/holoagent0_setup/` owns closed schemas, policies, immutable ledgers, result classification, trace normalization, and the supervisor/coordinator split. Native launch helpers establish the inherited-FD, signal, seccomp, ptrace, and namespace boundaries before Python functional gates run. The supervisor alone publishes `result.json`; the traced coordinator can only submit hash-chained ledger generations over reviewed anonymous pipes.
 
 **Tech Stack:** Python 3.10, pytest, JSON Schema Draft 2020-12, Bash, C17/Linux syscalls, strace 6.6, Linux user/network namespaces, seccomp, ROS 2 Humble, CycloneDDS, OpenClaw 2026.7.1-2, SHA-256/SHA-512.
 
-**Dependency:** Begin from approved design commit `2363983`. This plan produces the shared result/policy package consumed by the MuJoCo and PC2 plans.
+**Dependency:** Begin from the approved design lineage through `6557b1f` and the
+one-shot run-root/wrapper hardening committed with this plan amendment. This
+plan produces the shared result/policy package later consumed by separately
+approved live-runtime, MuJoCo, and PC2 plans.
 
 ---
 
@@ -29,7 +35,9 @@ Create these focused units:
 - `scripts/holoagent0_setup/holoagent0_setup/supervisor.py`: bootstrap, tracer ownership, signal collection, finalizers, and authoritative exit.
 - `scripts/holoagent0_setup/holoagent0_setup/coordinator.py`: host observers, isolated action child, gate execution, and provisional ledger sealing.
 - `scripts/holoagent0_setup/holoagent0_setup/agentos_gate.py`, `openclaw_gate.py`, `semantic_gate.py`, `chatbot_gate.py`, `skills_gate.py`: functional gate adapters.
+- `scripts/holoagent0_setup/holoagent0_setup/offline_runtime.py`: fixed pending-runtime production composition and the closed internal factory protocol.
 - `scripts/holoagent0_setup/holoagent0_setup/offline_cli.py`: the public `workstation_offline` command.
+- `scripts/holoagent0_setup/run_workstation_offline.sh`: neutral-working-directory public wrapper with fixed Python and motion-deny environment.
 - `scripts/holoagent0_setup/native/tracee_launcher.c`: final FD layout, process group/session setup, prctl markers, and coordinator exec.
 - `scripts/holoagent0_setup/native/finalizer_only.c`: sanitized trace root for bootstrap finalization.
 - `scripts/holoagent0_setup/native/seccomp_policy.c`: deny the exact io_uring, `pidfd_getfd`, ptrace, and untraced-clone bypasses while leaving message syscalls traceable.
@@ -1426,103 +1434,718 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /usr/bin/python3.10 -
 Expected: all tests pass with only declared skips; `git diff --check` is clean
 and `git status --short` is empty.
 
-### Task 13: Offline CLI and full gate integration
+### Task 13A: Standalone invocation and one-shot run-root authority
 
 **Files:**
-- Create: `scripts/holoagent0_setup/holoagent0_setup/offline_cli.py`
 - Modify: `scripts/holoagent0_setup/holoagent0_setup/invocation.py`
-- Create: `scripts/holoagent0_setup/run_workstation_offline.sh`
-- Test: `scripts/holoagent0_setup/tests/test_offline_cli.py`
-- Test: `scripts/holoagent0_setup/tests/test_offline_integration.py`
+- Modify: `scripts/holoagent0_setup/holoagent0_setup/supervisor.py`
+- Create: `scripts/holoagent0_setup/tests/test_offline_cli.py`
+- Modify: `scripts/holoagent0_setup/tests/test_supervisor.py`
+- Modify: `scripts/holoagent0_setup/manifests/git-tracked-files-v1.txt`
 
-- [ ] **Step 1: Write an end-to-end fake-toolchain test**
+- [ ] **Step 1: Write failing invocation and directory-authority tests**
+
+In `test_offline_cli.py`, construct deterministic private sources and require
+the exact public grammar and generated identities:
+
+```python
+def test_public_parse_generates_closed_standalone_invocation(tmp_path):
+    output_root = _owned_output_root(tmp_path)
+    invocation = _parse_offline_invocation(
+        ["--output-root", str(output_root)],
+        sources=_InvocationSources(
+            now_utc=lambda: datetime(2026, 8, 18, 1, 2, 3, tzinfo=timezone.utc),
+            token_bytes=lambda size: bytes(range(size)),
+            cwd=lambda: tmp_path,
+            effective_uid=os.geteuid,
+        ),
+    )
+    assert invocation.mode == "workstation_offline"
+    assert invocation.run_id == (
+        "workstation-offline-20260818T010203Z-000102030405060708090a0b0c0d0e0f"
+    )
+    assert invocation.invocation_role == "standalone"
+    assert invocation.parent_run_id is None
+    assert invocation.lineage_nonce is None
+    assert invocation.run_root_authority.expected_run_root == (
+        output_root / invocation.run_id
+    )
+```
+
+Parametrize missing, repeated, abbreviated, unknown, positional, `--run-id`,
+`--mode`, `--parent-run-id`, `--lineage-nonce`, and `--factory` inputs. Add
+symlink-at-every-component, wrong owner/type/mode, group/other-writable parent,
+recursive missing parent, changed device/inode, collision, replay, and cleanup
+tests. In `test_supervisor.py`, require production bootstrap to call the exact
+one-shot authority and prohibit the pathname fallback:
+
+```python
+def test_production_bootstrap_creates_run_root_through_retained_authority(
+    tmp_path, reviewed_trace_contract, complete_bootstrap_inputs
+):
+    output_root = _owned_output_root(tmp_path)
+    authority = RunRootAuthority.open(output_root, "run-authority")
+    invocation = BootstrapInvocation(
+        run_root=output_root / "run-authority",
+        run_id="run-authority",
+        run_nonce="a" * 64,
+        facts=BootstrapFacts.clean(),
+        bootstrap_report=complete_bootstrap_inputs,
+        run_root_authority=authority,
+    )
+    state = BootstrapRuntime(
+        reviewed_trace_contract,
+        require_run_root_authority=True,
+    ).run(invocation)
+    assert state.run_root == output_root / "run-authority"
+    assert stat.S_IMODE(state.run_root.stat().st_mode) == 0o700
+    assert authority.consumed is True
+```
+
+- [ ] **Step 2: Run the focused tests and verify RED**
+
+Run:
+
+```bash
+PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /usr/bin/python3.10 -m pytest -q -p no:cacheprovider \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_supervisor.py \
+  -k 'offline_invocation or run_root_authority or production_bootstrap_creates_run_root'
+```
+
+Expected: collection fails because `_InvocationSources`,
+`_parse_offline_invocation`, and `RunRootAuthority` do not exist and
+`BootstrapInvocation` has no `run_root_authority` field.
+
+- [ ] **Step 3: Implement the minimal invocation and bootstrap authority**
+
+In `invocation.py`, retain the existing value fields, add an optional authority
+for legacy scenario construction, and expose only the closed public parser:
+
+```python
+class InvocationError(ValueError):
+    """The public invocation or retained path authority is invalid."""
+
+
+class _ClosedArgumentParser(argparse.ArgumentParser):
+    def error(self, _message: str) -> NoReturn:
+        raise InvocationError("invalid offline invocation")
+
+
+@dataclass(frozen=True)
+class _InvocationSources:
+    now_utc: Callable[[], datetime]
+    token_bytes: Callable[[int], bytes]
+    cwd: Callable[[], Path]
+    effective_uid: Callable[[], int]
+
+
+class RunRootAuthority:
+    def __init__(
+        self,
+        *,
+        output_root: Path,
+        output_root_fd: int,
+        output_root_identity: tuple[int, int],
+        run_basename: str,
+    ) -> None:
+        self._output_root = output_root
+        self._output_root_fd = output_root_fd
+        self._output_root_identity = output_root_identity
+        self._run_basename = run_basename
+        self._consumed = False
+
+    @classmethod
+    def open(cls, output_root: Path, run_basename: str) -> "RunRootAuthority":
+        absolute, descriptor, identity = _open_or_create_output_root(output_root)
+        return cls(
+            output_root=absolute,
+            output_root_fd=descriptor,
+            output_root_identity=identity,
+            run_basename=run_basename,
+        )
+
+    def create(self, expected_run_root: Path) -> None:
+        if self._consumed or expected_run_root != self.expected_run_root:
+            raise InvocationError("run-root authority is invalid or consumed")
+        before = os.fstat(self._output_root_fd)
+        if (before.st_dev, before.st_ino) != self._output_root_identity:
+            raise InvocationError("output-root identity changed")
+        try:
+            os.mkdir(self._run_basename, 0o700, dir_fd=self._output_root_fd)
+            child_fd = os.open(
+                self._run_basename,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=self._output_root_fd,
+            )
+            try:
+                child = os.fstat(child_fd)
+                bound = os.stat(
+                    self._run_basename,
+                    dir_fd=self._output_root_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    (child.st_dev, child.st_ino) != (bound.st_dev, bound.st_ino)
+                    or child.st_uid != os.geteuid()
+                    or not stat.S_ISDIR(child.st_mode)
+                    or stat.S_IMODE(child.st_mode) != 0o700
+                ):
+                    raise InvocationError("created run root is not authoritative")
+            finally:
+                os.close(child_fd)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if not self._consumed:
+            os.close(self._output_root_fd)
+            self._consumed = True
+
+    @property
+    def expected_run_root(self) -> Path:
+        return self._output_root / self._run_basename
+
+    @property
+    def consumed(self) -> bool:
+        return self._consumed
+
+
+@dataclass(frozen=True)
+class OfflineInvocation:
+    mode: Literal["workstation_offline"]
+    output_root: Path
+    run_id: str
+    invocation_role: Literal["standalone", "child"]
+    parent_run_id: str | None
+    lineage_nonce: str | None
+    run_root_authority: RunRootAuthority | None = None
+
+    @classmethod
+    def parse(cls, argv: Sequence[str] | None = None) -> "OfflineInvocation":
+        return _parse_offline_invocation(argv, sources=_SYSTEM_INVOCATION_SOURCES)
+```
+
+`_parse_offline_invocation` uses `_ClosedArgumentParser(allow_abbrev=False)`,
+an explicit one-occurrence scan for `--output-root`, exactly 16 random bytes
+for the run-ID suffix, and `RunRootAuthority.open`. Help may retain argparse's
+normal zero-exit behavior, but every invalid form is converted to the fixed
+`InvocationError` rather than escaping as exit `2`. The authority validates
+the generated basename against the closed run-ID grammar, walks absolute
+components with retained `dir_fd` plus `O_NOFOLLOW`, permits creation of only
+the final output-root component, records the parent device/inode, and owns that
+FD until `create` or `close`. `create` revalidates the parent, calls
+`os.mkdir(run_basename, 0o700, dir_fd=output_root_fd)`, opens and verifies the
+new directory, compares it with the expected absolute binding, then consumes
+the authority. Every exception closes all owned descriptors.
+
+In `supervisor.py`, add
+`run_root_authority: RunRootAuthority | None = None` to `BootstrapInvocation`
+and `require_run_root_authority: bool = False` to `BootstrapRuntime`. Its
+production classmethod sets the flag to `True`. `run()` calls the exact
+authority once before ledger creation; only non-production scenario runtimes
+retain the existing `Path.mkdir` branch. Update all direct production-runtime
+tests to construct a real authority rather than weakening the production flag.
+
+- [ ] **Step 4: Run focused and regression tests and verify GREEN**
+
+Run:
+
+```bash
+PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /usr/bin/python3.10 -m pytest -q -p no:cacheprovider \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_supervisor.py \
+  scripts/holoagent0_setup/tests/test_evidence.py \
+  scripts/holoagent0_setup/tests/test_ledger.py
+ruff check --no-cache \
+  scripts/holoagent0_setup/holoagent0_setup/invocation.py \
+  scripts/holoagent0_setup/holoagent0_setup/supervisor.py \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_supervisor.py
+ruff format --check --no-cache \
+  scripts/holoagent0_setup/holoagent0_setup/invocation.py \
+  scripts/holoagent0_setup/holoagent0_setup/supervisor.py \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_supervisor.py
+```
+
+Expected: all selected tests pass; Ruff reports no error and no reformatting.
+
+- [ ] **Step 5: Refresh tracked authority and commit Task 13A**
+
+Stage the intended files, regenerate each changed Git blob row in
+`git-tracked-files-v1.txt`, recompute its SHA-256 in `supervisor.py`, and run the
+closed authority selection before committing:
+
+```bash
+git add scripts/holoagent0_setup/holoagent0_setup/invocation.py \
+  scripts/holoagent0_setup/holoagent0_setup/supervisor.py \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_supervisor.py \
+  scripts/holoagent0_setup/manifests/git-tracked-files-v1.txt
+PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /usr/bin/python3.10 -m pytest -q -p no:cacheprovider \
+  scripts/holoagent0_setup/tests/test_supervisor.py -k 'production_tracked'
+git diff --cached --check
+git commit -m "feat: add offline invocation authority"
+```
+
+Expected: the authority tests pass, the staged diff is clean, and the commit
+contains no Task 13B/13C file.
+
+### Task 13B: Pending production factory and strict CLI
+
+**Files:**
+- Create: `scripts/holoagent0_setup/holoagent0_setup/offline_runtime.py`
+- Create: `scripts/holoagent0_setup/holoagent0_setup/offline_cli.py`
+- Modify: `scripts/holoagent0_setup/tests/test_offline_cli.py`
+- Create: `scripts/holoagent0_setup/tests/test_offline_integration.py`
+- Modify: `scripts/holoagent0_setup/manifests/git-tracked-files-v1.txt`
+- Modify: `scripts/holoagent0_setup/holoagent0_setup/supervisor.py`
+
+- [ ] **Step 1: Write failing pending-runtime, readback, and factory-isolation tests**
+
+Require a fixed production factory, the current exact pending-runtime outcome,
+and validated diagnostic output:
+
+```python
+def test_public_pending_runtime_is_authoritative_and_never_launches(
+    pending_offline_application, parsed_invocation
+):
+    completed = pending_offline_application.run(parsed_invocation)
+    result = _secure_result(parsed_invocation.result_path)
+    assert completed == 40
+    assert pending_offline_application.factory.launcher_calls == 0
+    assert result["label"] == "FAIL_HARNESS"
+    assert result["status"] == "FAIL"
+    assert result["process_exit_code"] == 40
+    assert result["primary_blocking_gate"] == "offline.trace_integrity"
+    assert _gate(result, "offline.trace_integrity") == {
+        "id": "offline.trace_integrity",
+        "role": "finalizer",
+        "status": "FAIL",
+        "reason": "TRACE_BOOTSTRAP_FAILED",
+    }
+    assert _gate(result, "offline.network_policy")["status"] == "SKIPPED"
+    assert _gate(result, "offline.network_policy")["reason"] == (
+        "DEPENDENCY_NOT_AVAILABLE"
+    )
+```
+
+Add tests for the two exact output lines, `NONE`, and `UNAVAILABLE`; missing,
+symlinked, changing, oversized, noncanonical, wrong-run, wrong-mode,
+wrong-gate-order, and wrong-label/status/exit/blocker results; fake selectors in
+argv/environment/entry-point metadata; working-directory/path shadowing; and
+unexpected launcher/forwarder/identity-validator calls. Every invalid readback
+returns `40`, leaves artifacts untouched, and performs no second publication.
+
+- [ ] **Step 2: Run the focused tests and verify RED**
+
+Run:
+
+```bash
+PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /usr/bin/python3.10 -m pytest -q -p no:cacheprovider \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_offline_integration.py
+```
+
+Expected: collection fails because `offline_runtime`, `offline_cli`,
+`OfflineApplication`, and `PendingProductionFactory` do not exist.
+
+- [ ] **Step 3: Implement the fixed factory, application, and secure readback**
+
+In `offline_runtime.py`, define the only composition boundary:
+
+```python
+class OfflineRuntimeError(RuntimeError):
+    """The fixed offline composition could not be constructed safely."""
+
+
+@dataclass(frozen=True)
+class OfflineExecution:
+    supervisor: EvidenceSupervisor
+    bootstrap_invocation: BootstrapInvocation
+    contract: ContractSet
+
+
+class OfflineRuntimeFactory(Protocol):
+    def build(self, invocation: OfflineInvocation) -> OfflineExecution:
+        raise NotImplementedError
+
+
+class PendingProductionFactory:
+    def __init__(self, package_root: Path) -> None:
+        self._package_root = _retain_tracked_package_root(package_root)
+        self.launcher_calls = 0
+
+    def _unexpected_launch(self, specification: object) -> object:
+        self.launcher_calls += 1
+        raise SupervisorError("pending trace runtime was unexpectedly reached")
+
+    @staticmethod
+    def _unexpected_forward(_pgid: int, _signal_name: str) -> object:
+        raise SupervisorError("pending coordinator forward was unexpectedly reached")
+
+    @staticmethod
+    def _unexpected_identity(_identity: ProcessIdentity) -> bool:
+        raise SupervisorError("pending coordinator identity was unexpectedly reached")
+
+    def build(self, invocation: OfflineInvocation) -> OfflineExecution:
+        contract = ContractSet(self._package_root)
+        facts, report = _collect_pending_bootstrap_inputs(contract)
+        bootstrap = BootstrapInvocation(
+            run_root=invocation.result_path.parent,
+            run_id=invocation.run_id,
+            run_nonce=secrets.token_hex(32),
+            facts=facts,
+            bootstrap_report=report,
+            run_root_authority=invocation.run_root_authority,
+        )
+        supervisor = EvidenceSupervisor.production(
+            contract,
+            trace_launcher=self._unexpected_launch,
+            signal_forwarder=self._unexpected_forward,
+            signal_identity_validator=self._unexpected_identity,
+            secret_sentinels={"h0-sentinel-" + secrets.token_hex(32)},
+        )
+        return OfflineExecution(supervisor, bootstrap, contract)
+```
+
+`_retain_tracked_package_root` walks the absolute path from `/` through
+`O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW` descriptors, requires every component
+to remain identity-stable, and returns the canonical package path only when the
+final descriptor is an effective-UID-owned directory. It closes every
+descriptor on success and failure. `_collect_pending_bootstrap_inputs` loads
+the one trace-tool row, enumerates at most 64 numeric `/proc/self/fd` entries in
+ascending order, excludes only its own enumeration descriptor, records exact
+`fd`/redacted `target`/`cloexec` rows, classifies sockets through
+`SO_DOMAIN`/`SO_TYPE`/`SO_PROTOCOL`, and returns `BootstrapFacts` plus this
+closed report:
+
+```python
+{
+    "schema_version": "holoagent0.bootstrap-report.v1",
+    "toolchain": {"expected": expected_toolchain, "observed": observed_toolchain},
+    "initial_fd_manifest": descriptor_rows,
+    "final_fd_manifest": descriptor_rows,
+    "sanitation_actions": [],
+    "rebinding_actions": [],
+    "live_fixture_passed": False,
+}
+```
+
+The collector accepts only stdin `/dev/null` or a reviewed non-socket
+pipe/regular file and stdout/stderr reviewed non-socket pipes/regular files;
+every other inherited descriptor makes `inherited_fd_safe=False` without
+silently closing it. `PendingProductionFactory` accepts only that retained
+package root derived from `offline_runtime.py.__file__`. It loads the tracked
+`ContractSet`, generates a separate 32-byte ledger nonce, and passes facts with
+`source_ok`, `runtime_ok`, `trace_capability_ok`, and `exitkill_verified`
+initially true while `inherited_fd_safe` and `sanitation_ok` reflect the exact
+descriptor observation. The existing
+`_ProductionBootstrapAdapter` intersects those facts with the pending trace
+policy and selects `NOT_STARTED`. Its trace launcher, signal forwarder, and
+post-launch identity validator increment private counters and raise
+`SupervisorError` if reached. The secret-sentinel set contains one independent
+32-byte random value held only in memory.
+
+In `offline_cli.py`, make the internal test seam explicit while keeping public
+construction fixed:
+
+```python
+class OfflineApplication:
+    def __init__(
+        self,
+        factory: OfflineRuntimeFactory,
+        *,
+        stdout: TextIO,
+    ) -> None:
+        self._factory = factory
+        self.stdout = stdout
+
+    def run(self, invocation: OfflineInvocation) -> int:
+        print(f"evidence_dir={invocation.result_path.parent}", file=self.stdout, flush=True)
+        try:
+            execution = self._factory.build(invocation)
+            exit_code = execution.supervisor.execute_authoritative(
+                execution.bootstrap_invocation
+            )
+            primary = _validated_primary_blocker(execution, invocation, exit_code)
+        except (
+            OfflineRuntimeError,
+            SupervisorError,
+            AtomicIOError,
+            CanonicalJSONError,
+            ContractLoadError,
+            ContractError,
+        ):
+            print(
+                "primary_blocking_gate=UNAVAILABLE",
+                file=self.stdout,
+                flush=True,
+            )
+            return 40
+        print(f"primary_blocking_gate={primary}", file=self.stdout, flush=True)
+        return exit_code if primary != "UNAVAILABLE" else 40
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        invocation = OfflineInvocation.parse(argv)
+        package_root = _tracked_package_root()
+        return OfflineApplication(
+            PendingProductionFactory(package_root),
+            stdout=sys.stdout,
+        ).run(invocation)
+    except (InvocationError, OfflineRuntimeError):
+        print("offline invocation rejected", file=sys.stderr, flush=True)
+        return 40
+```
+
+`_validated_primary_blocker` calls `read_json_secure` relative to the retained
+run root, requires exact mode, canonical bytes, stable identity, result size,
+`ContractSet.require_valid_result`, expected run ID/mode, exact
+`OFFLINE_GATE_ORDER`, and matching process exit. It returns the fixed gate ID,
+`NONE`, or `UNAVAILABLE`; it never writes. `OfflineApplication.run` catches
+only the six listed post-invocation exception classes, prints the mandatory
+`UNAVAILABLE` line, and returns `40`; public `main` catches only
+`InvocationError` and pre-execution `OfflineRuntimeError`, emits the fixed
+credential-free diagnostic to stderr, and returns `40`. Each helper wraps its
+own raw `OSError` or decode failure into one of those closed classes. Do not
+catch `KeyboardInterrupt`, `SystemExit`, or `BaseException`.
+
+- [ ] **Step 4: Run focused, production-pending, and quality checks**
+
+Run:
+
+```bash
+PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /usr/bin/python3.10 -m pytest -q -p no:cacheprovider \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_offline_integration.py \
+  scripts/holoagent0_setup/tests/test_supervisor.py \
+  -k 'offline or production_factory_current_pending_policy'
+ruff check --no-cache \
+  scripts/holoagent0_setup/holoagent0_setup/offline_runtime.py \
+  scripts/holoagent0_setup/holoagent0_setup/offline_cli.py \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_offline_integration.py
+ruff format --check --no-cache \
+  scripts/holoagent0_setup/holoagent0_setup/offline_runtime.py \
+  scripts/holoagent0_setup/holoagent0_setup/offline_cli.py \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_offline_integration.py
+```
+
+Expected: all selected tests pass, the launcher counters remain zero, and Ruff
+reports no error or reformatting.
+
+- [ ] **Step 5: Refresh tracked authority and commit Task 13B**
+
+Add both new tests to `test-manifest-v1.txt`, refresh the tracked Git blob rows
+and manifest SHA-256, run the manifest-authority selection, then commit:
+
+```bash
+git add scripts/holoagent0_setup/holoagent0_setup/offline_runtime.py \
+  scripts/holoagent0_setup/holoagent0_setup/offline_cli.py \
+  scripts/holoagent0_setup/holoagent0_setup/supervisor.py \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_offline_integration.py \
+  scripts/holoagent0_setup/test-manifest-v1.txt \
+  scripts/holoagent0_setup/manifests/git-tracked-files-v1.txt
+PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /usr/bin/python3.10 -m pytest -q -p no:cacheprovider \
+  scripts/holoagent0_setup/tests/test_supervisor.py -k 'production_tracked'
+git diff --cached --check
+git commit -m "feat: add pending offline readiness CLI"
+```
+
+Expected: the authority tests pass and the commit contains no shell wrapper or
+live launcher/action-child implementation.
+
+### Task 13C: Full fake-pipeline proof and public shell wrapper
+
+**Files:**
+- Create: `scripts/holoagent0_setup/run_workstation_offline.sh`
+- Create: `scripts/holoagent0_setup/tests/offline_fake_runtime.py`
+- Modify: `scripts/holoagent0_setup/tests/test_offline_integration.py`
+- Modify: `scripts/holoagent0_setup/tests/test_offline_cli.py`
+- Modify: `scripts/holoagent0_setup/test-manifest-v1.txt`
+- Modify: `scripts/holoagent0_setup/manifests/git-tracked-files-v1.txt`
+- Modify: `scripts/holoagent0_setup/holoagent0_setup/supervisor.py`
+
+- [ ] **Step 1: Write failing fake-authority and wrapper tests**
+
+Build a tracked fake factory from the real `EvidenceSupervisor` with injected
+bootstrap, trace, broker, finalizer, and result-publisher dependencies. Only
+the supervisor invokes the publisher. Require the complete passing tuple:
 
 ```python
 def test_offline_pass_has_exact_order_and_authority(fake_offline_environment):
-    completed = fake_offline_environment.run()
-    result = json.loads(completed.result_path.read_text())
+    completed = fake_offline_environment.run_application()
+    result = completed.validated_result
     assert completed.returncode == 0
     assert result["label"] == "PASS_HOLOAGENT0_OFFLINE"
-    assert [g["id"] for g in result["gates"]] == list(OFFLINE_GATE_ORDER)
+    assert result["status"] == "PASS"
+    assert result["process_exit_code"] == 0
+    assert result["primary_blocking_gate"] is None
+    assert [gate["id"] for gate in result["gates"]] == list(OFFLINE_GATE_ORDER)
+    assert all(gate["status"] == "PASS" for gate in result["gates"][-4:])
     assert result["offline_evidence"]["trace"]["state"] == "FULL"
     assert result["offline_evidence"]["network_policy"]["violations"] == 0
+    assert completed.publisher_calls == 1
 ```
 
-- [ ] **Step 2: Run integration tests and verify CLI absence**
+Run the real wrapper from a neutral directory against an owned output root and
+require the Task 13B pending tuple, fixed stdout lines, exit `40`, and retained
+result. Repeat with hostile `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`,
+entry-point metadata, current directory, and factory-shaped environment keys;
+the result must remain production-pending. Inspect the executed process tree
+and wrapper text to reject any install, download, probe, ROS, gateway,
+simulator, Unitree, cleanup, deletion, alternate Python, or shell-evaluated
+user command.
 
-Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_offline_cli.py scripts/holoagent0_setup/tests/test_offline_integration.py`
+- [ ] **Step 2: Run integration tests and verify RED**
 
-Expected: FAIL because the public runner does not exist.
-
-- [ ] **Step 3: Implement strict CLI wiring**
-
-```python
-def main(argv: Sequence[str] | None = None) -> int:
-    invocation = OfflineInvocation.parse(argv)
-    supervisor = EvidenceSupervisor.from_invocation(invocation)
-    return supervisor.execute_authoritative()
-```
-
-The shell wrapper sets `LC_ALL=C`, `TZ=UTC`, `START_G1_PUBVEL=0`, `G1_DRY_RUN=1`, `ALLOW_G1_MOTION=0`, reviewed paths only, no ROS participant, and no download command. Require a new run directory, exact pins, read-only host observation, loopback namespace, fixed gate order, all four finalizers, and supervisor-only result publication. Print the evidence directory and first precedence-winning gate; never delete failed runs.
-
-- [ ] **Step 4: Run the complete tracked offline manifest**
-
-Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q $(sed '/^#/d;/^$/d' scripts/holoagent0_setup/test-manifest-v1.txt)`
-
-Expected: at least one test collected and zero failures.
-
-- [ ] **Step 5: Commit the offline runner**
+Run:
 
 ```bash
-git add scripts/holoagent0_setup/holoagent0_setup/offline_cli.py scripts/holoagent0_setup/run_workstation_offline.sh scripts/holoagent0_setup/tests scripts/holoagent0_setup/test-manifest-v1.txt
-git commit -m "feat: add workstation offline readiness runner"
+PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /usr/bin/python3.10 -m pytest -q -p no:cacheprovider \
+  scripts/holoagent0_setup/tests/test_offline_integration.py \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  -k 'fake_pipeline or shell_wrapper or neutral_working_directory or hostile_python'
 ```
 
-### Task 14: Runtime acceptance, evidence inspection, and documentation
+Expected: the fake helper and public shell wrapper are missing.
 
-**Files:**
-- Modify: `scripts/holoagent0_setup/README.md`
-- Create: `docs/holoagent0/workstation-offline-runbook.md`
-- Test: `scripts/holoagent0_setup/tests/test_runbook_commands.py`
+- [ ] **Step 3: Implement the tracked fake and fixed wrapper**
 
-- [ ] **Step 1: Add command-validation tests for the runbook**
+`offline_fake_runtime.py` constructs `EvidenceSupervisor` with exact fake
+stages. Its finalizer returns an `AuthoritativeEvaluation` containing a
+schema-valid full offline PASS result and terminal proof; its fake publisher
+uses `atomic_write_json_no_replace` exactly once. No fake writes before the
+supervisor calls `publish`, and the helper is imported only by tests.
 
-```python
-def test_runbook_uses_no_unpinned_or_motion_command(runbook):
-    assert "run_ctl.sh" not in runbook
-    assert "g1_pubvel_node" not in runbook
-    assert "openclaw gateway start" not in runbook
-    assert "run_workstation_offline.sh" in runbook
-```
-
-- [ ] **Step 2: Run the runbook test and verify it fails before documentation exists**
-
-Run: `PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q scripts/holoagent0_setup/tests/test_runbook_commands.py`
-
-Expected: FAIL because the runbook is absent.
-
-- [ ] **Step 3: Document provisioning, execution, and inspection commands**
-
-Include exact commands for pinned strace provisioning, OpenClaw provisioning, offline execution, JSON Schema validation, trace/journal digest recomputation, gate/label inspection, qualification interpretation, and safe cleanup. State explicitly that the run does not commission physical motion.
+Create `run_workstation_offline.sh` as mode `100755`:
 
 ```bash
-bash scripts/holoagent0_setup/run_workstation_offline.sh --output-root outputs/holoagent0_setup
-jq '{label,status,process_exit,primary_blocking_gate,qualifications}' outputs/holoagent0_setup/*/result.json
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -P -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export LC_ALL=C
+export TZ=UTC
+export PYTHONPATH="${script_dir}"
+export PYTHONNOUSERSITE=1
+export PYTHONSAFEPATH=1
+export PYTHONDONTWRITEBYTECODE=1
+export START_G1_PUBVEL=0
+export G1_DRY_RUN=1
+export ALLOW_G1_MOTION=0
+unset PYTHONHOME PYTHONSTARTUP PYTHONINSPECT PYTHONWARNINGS PYTHONBREAKPOINT \
+  PYTHONUSERBASE PYTHONPLATLIBDIR PYTHONCASEOK PYTHONEXECUTABLE
+
+exec /usr/bin/python3.10 -P -B -m holoagent0_setup.offline_cli "$@"
 ```
 
-- [ ] **Step 4: Run static, unit, native, and manifest verification**
+The wrapper uses only Bash builtins plus the fixed `/usr/bin/dirname`; it does
+not source another file, search `PATH`, preserve a caller
+`PYTHONPATH`, preserve a caller-controlled Python home/startup/user-base/runtime
+layout, evaluate user text, create/delete an evidence path, or run any other
+command after `exec`. Provider credential variables remain inherited but are
+never copied to argv or diagnostics. The hostile-environment test enumerates
+every unset variable above and proves that none can select the fake factory or
+shadow the tracked package.
 
-Run: `make -C scripts/holoagent0_setup/native clean all && PYTHONPATH=scripts/holoagent0_setup python3 -m pytest -q $(sed '/^#/d;/^$/d' scripts/holoagent0_setup/test-manifest-v1.txt) && git diff --check`
+- [ ] **Step 4: Run focused, full-manifest, and static verification**
 
-Expected: native build succeeds, at least one test is collected, zero tests fail, and `git diff --check` prints nothing.
-
-- [ ] **Step 5: Commit the runbook**
+Run from the repository root:
 
 ```bash
-git add scripts/holoagent0_setup/README.md docs/holoagent0/workstation-offline-runbook.md scripts/holoagent0_setup/tests/test_runbook_commands.py
-git commit -m "docs: add workstation offline readiness runbook"
+PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /usr/bin/python3.10 -m pytest -q -p no:cacheprovider \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_offline_integration.py
+sed '/^#/d;/^$/d' scripts/holoagent0_setup/test-manifest-v1.txt | \
+  xargs env PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 \
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /usr/bin/python3.10 -m pytest -q -p no:cacheprovider
+bash -n scripts/holoagent0_setup/run_workstation_offline.sh
+ruff check --no-cache scripts/holoagent0_setup/holoagent0_setup/offline_runtime.py \
+  scripts/holoagent0_setup/holoagent0_setup/offline_cli.py \
+  scripts/holoagent0_setup/holoagent0_setup/invocation.py \
+  scripts/holoagent0_setup/tests/offline_fake_runtime.py \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_offline_integration.py
+ruff format --check --no-cache scripts/holoagent0_setup/holoagent0_setup/offline_runtime.py \
+  scripts/holoagent0_setup/holoagent0_setup/offline_cli.py \
+  scripts/holoagent0_setup/holoagent0_setup/invocation.py \
+  scripts/holoagent0_setup/tests/offline_fake_runtime.py \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_offline_integration.py
 ```
+
+Expected: the focused and complete tracked selections collect tests and have
+zero failures; shell syntax, Ruff, and formatting pass. Declared skips are
+reported but not converted to failures. No live network, ROS/DDS, OpenClaw,
+audio, simulator, PC2, sensor, Unitree, or robot action is started.
+
+- [ ] **Step 5: Refresh authority, commit Task 13C, and stop at its review gate**
+
+Refresh every new/changed tracked Git blob row and the manifest SHA-256, then
+run final authority and cleanliness checks before committing:
+
+```bash
+git add scripts/holoagent0_setup/run_workstation_offline.sh \
+  scripts/holoagent0_setup/tests/offline_fake_runtime.py \
+  scripts/holoagent0_setup/tests/test_offline_cli.py \
+  scripts/holoagent0_setup/tests/test_offline_integration.py \
+  scripts/holoagent0_setup/test-manifest-v1.txt \
+  scripts/holoagent0_setup/manifests/git-tracked-files-v1.txt \
+  scripts/holoagent0_setup/holoagent0_setup/supervisor.py
+PYTHONPATH=scripts/holoagent0_setup PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /usr/bin/python3.10 -m pytest -q -p no:cacheprovider \
+  scripts/holoagent0_setup/tests/test_supervisor.py -k 'production_tracked'
+git diff --cached --check
+git commit -m "feat: integrate workstation offline runner"
+git status --short
+```
+
+Expected: authority checks pass, the diff is clean, the final status is empty,
+and Task 14 remains unimplemented pending a separate live-runtime review.
+
+## Post-Task 13 live-runtime handoff
+
+Task 13C is the terminal implementation and review boundary of this plan. The
+old documentation-only Task 14 was removed because it could not implement the
+live authorities assigned to it by the approved design and therefore could
+never satisfy the completion gate below.
+
+Live readiness is a separate subsystem and requires a separate reviewed design
+amendment and implementation plan after Task 13C. That work must first review
+and commit literal reproducible-build and installed-runtime pins for strace
+6.6, then implement the concrete tracer/normalizer/coordinator launcher,
+production `TracedCoordinator` and action-child factory, broker and handoff FD
+assembly, isolated semantic DDS loopback execution, and finally the inspection
+runbook. Candidate measurements may be produced only by the already reviewed
+provisioner under separate network/Docker authorization; they do not amend the
+policy or authorize installation automatically.
+
+Until that separate checkpoint is approved, the public wrapper must retain the
+exact Task 13B pending outcome (`FAIL_HARNESS`, exit `40`, zero launcher calls).
+No Task 13 worker may provision strace, promote a policy row to `REVIEWED`,
+start the live coordinator/action child, create a ROS/DDS participant, launch
+OpenClaw, access audio, run MuJoCo, contact PC2, inspect sensors, import the
+Unitree SDK, or command robot hardware.
 
 ## Plan 1 completion gate
 
-Do not start the MuJoCo plan until one fresh `workstation_offline` run has a schema-valid pass or approved credential/audio qualification, gates 1–27 in exact order, all four finalizers satisfied, trace/evidence bundle digests independently recomputed, and no unapproved network operation. Preserve the run directory and its commit/config/asset/policy digests for `offline.reference`.
+Do not start the MuJoCo plan until the separate live-runtime plan is approved
+and one fresh `workstation_offline` run has a schema-valid pass or approved
+credential/audio qualification, gates 1–27 in exact order, all four finalizers
+satisfied, trace/evidence bundle digests independently recomputed, and no
+unapproved network operation. Preserve the run directory and its
+commit/config/asset/policy digests for `offline.reference`.

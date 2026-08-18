@@ -920,9 +920,18 @@ effective-UID-owned directory and is not group- or other-writable. Recursive
 parent creation, a symlink at any component, ownership/type/mode drift, a
 non-directory, or a changed parent identity fails before supervisor launch.
 The invocation selects but does not pre-create its run directory.
-`BootstrapRuntime` remains the sole atomic `mkdir(mode=0700, parents=False,
-exist_ok=False)` authority. A collision or pre-existing run path fails without
-reuse, deletion, renaming, or suffix retry.
+It carries one non-serializable, one-shot `RunRootAuthority` that owns the
+retained output-root descriptor, its stable device/inode identity, the exact
+run basename, and the expected absolute run path. Production
+`BootstrapInvocation` requires that authority; scenario-only supervisor tests
+may use the existing pathname constructor. `BootstrapRuntime` remains the sole
+creation authority: in production it calls the authority exactly once, uses
+`mkdir(run_basename, mode=0700, dir_fd=output_root_fd)`, opens the new directory
+with `O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW`, proves its owner/mode and identity
+against the expected absolute path, and consumes/closes the authority on every
+outcome. It never falls back to `Path.mkdir`. A collision, replayed authority,
+changed output-root identity, or pre-existing run path fails without reuse,
+deletion, renaming, or suffix retry.
 
 `offline_cli.py` contains presentation and argument handling only.
 `offline_runtime.py` owns composition through a closed internal factory
@@ -982,16 +991,19 @@ that argv, environment, working directory, Python entry points, and import
 metadata cannot select that fake.
 
 `run_workstation_offline.sh` resolves its own tracked directory independently
-of the caller's working directory, overwrites `PYTHONPATH` with the one tracked
-package root, and executes `/usr/bin/python3.10 -P -B -m
+of the caller's working directory using Bash builtins and fixed
+`/usr/bin/dirname`, never a `PATH` search; it overwrites `PYTHONPATH` with the
+one tracked package root and executes `/usr/bin/python3.10 -P -B -m
 holoagent0_setup.offline_cli`. It fixes `LC_ALL=C`, `TZ=UTC`,
 `PYTHONNOUSERSITE=1`, `PYTHONSAFEPATH=1`, `PYTHONDONTWRITEBYTECODE=1`,
 `START_G1_PUBVEL=0`, `G1_DRY_RUN=1`, and `ALLOW_G1_MOTION=0`. It preserves
-provider credential variables only as inherited opaque environment state; it
-does not copy them into argv or diagnostics. The wrapper contains no install,
-download, network probe, gateway/service start, ROS command, simulator launch,
-Unitree SDK import, command publisher, cleanup, deletion, or fallback Python
-path.
+provider credential variables only as inherited opaque environment state, but
+unsets `PYTHONHOME`, `PYTHONSTARTUP`, `PYTHONINSPECT`, `PYTHONWARNINGS`,
+`PYTHONBREAKPOINT`, `PYTHONUSERBASE`, `PYTHONPLATLIBDIR`, `PYTHONCASEOK`, and
+`PYTHONEXECUTABLE`; it does not copy any of them into argv or diagnostics. The
+wrapper contains no install, download, network probe, gateway/service start,
+ROS command, simulator launch, Unitree SDK import, command publisher, cleanup,
+deletion, or fallback Python path.
 
 Task 14 owns the reviewed strace build/runtime digests, concrete
 tracer/normalizer/coordinator launcher, handoff and broker FD assembly,
