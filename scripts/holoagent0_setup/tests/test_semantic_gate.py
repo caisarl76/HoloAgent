@@ -148,6 +148,136 @@ def _install_transient_forbidden_probe(tmp_path, monkeypatch):
     return trigger
 
 
+def test_runtime_import_audit_canonicalizes_cached_relative_import(
+    tmp_path, monkeypatch
+):
+    environment = tmp_path / "relative-forbidden-import"
+    package = environment / "rclpy"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "transient_relative.py").write_text("PROBED = True\n", encoding="utf-8")
+    monkeypatch.delitem(sys.modules, "rclpy", raising=False)
+    monkeypatch.delitem(sys.modules, "rclpy.transient_relative", raising=False)
+    monkeypatch.syspath_prepend(str(environment))
+    cached = importlib.import_module("rclpy.transient_relative")
+    audit = semantic_gate_module.RuntimeImportAudit()
+
+    with audit:
+        assert importlib.import_module(".transient_relative", package="rclpy") is cached
+
+    with pytest.raises(
+        SemanticGateError,
+        match="FORBIDDEN_RUNTIME_MODULE: rclpy.transient_relative",
+    ):
+        audit.require_allowed()
+
+
+def test_runtime_import_audit_rejects_reentry_before_and_after_close():
+    audit = semantic_gate_module.RuntimeImportAudit()
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+    audit.__enter__()
+    try:
+        try:
+            with pytest.raises(
+                SemanticGateError,
+                match="RUNTIME_IMPORT_AUDIT_INVALID: audit re-entry",
+            ):
+                audit.__enter__()
+        finally:
+            audit.close()
+
+        with pytest.raises(
+            SemanticGateError, match="RUNTIME_IMPORT_AUDIT_INVALID: audit re-entry"
+        ):
+            audit.__enter__()
+    finally:
+        semantic_gate_module.builtins.__import__ = original_builtin_import
+        importlib.import_module = original_import_module
+
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+
+
+def test_runtime_import_audit_rejects_out_of_order_close_then_recovers_lifo():
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+    outer = semantic_gate_module.RuntimeImportAudit()
+    inner = semantic_gate_module.RuntimeImportAudit()
+    outer.__enter__()
+    inner.__enter__()
+    try:
+        with pytest.raises(
+            SemanticGateError,
+            match="RUNTIME_IMPORT_AUDIT_INVALID: out-of-order close",
+        ):
+            outer.close()
+
+        assert semantic_gate_module.builtins.__import__ is not original_builtin_import
+        assert importlib.import_module is not original_import_module
+        inner.close()
+        outer.close()
+    finally:
+        semantic_gate_module.builtins.__import__ = original_builtin_import
+        importlib.import_module = original_import_module
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+
+
+def test_runtime_import_audit_force_unwinds_out_of_order_close_during_primary_error():
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+    outer = semantic_gate_module.RuntimeImportAudit()
+    inner = semantic_gate_module.RuntimeImportAudit()
+    outer.__enter__()
+    inner.__enter__()
+
+    with pytest.raises(AssertionError, match="primary programmer failure"):
+        try:
+            raise AssertionError("primary programmer failure")
+        finally:
+            outer.close()
+
+    inner.close()
+    assert semantic_gate_module.RuntimeImportAudit._active_stack == []
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+
+
+def test_runtime_import_audit_detects_hook_tamper_and_restores_originals():
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+    audit = semantic_gate_module.RuntimeImportAudit()
+    audit.__enter__()
+    importlib.import_module = lambda *_args, **_kwargs: None
+
+    with pytest.raises(
+        SemanticGateError,
+        match="RUNTIME_IMPORT_AUDIT_INVALID: import hooks were replaced",
+    ):
+        audit.close()
+
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+
+
+def test_runtime_import_audit_hook_tamper_does_not_mask_active_programmer_error():
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+    audit = semantic_gate_module.RuntimeImportAudit()
+    audit.__enter__()
+    importlib.import_module = lambda *_args, **_kwargs: None
+
+    with pytest.raises(AssertionError, match="primary programmer failure"):
+        try:
+            raise AssertionError("primary programmer failure")
+        finally:
+            audit.close()
+
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+
+
 def _memory_module_snapshot():
     return {
         name: module
@@ -1055,6 +1185,198 @@ def test_real_adapter_closes_run_authority_when_llm_guard_detects_tampering():
         adapter.close()
 
     assert closed == [True]
+
+
+@pytest.mark.parametrize(
+    "primary_error",
+    (
+        AssertionError("query programmer failure"),
+        SemanticGateError("QUERY_FIRST_BLOCKER", "query anticipated failure"),
+    ),
+)
+@pytest.mark.parametrize("exit_style", ("finally", "context_manager"))
+def test_real_adapter_cleanup_failures_do_not_mask_active_query_error(
+    primary_error, exit_style, tmp_path, monkeypatch
+):
+    trigger = _install_transient_forbidden_probe(tmp_path, monkeypatch)
+
+    def seam(*_args, **_kwargs):
+        raise AssertionError("original LLM seam must not run")
+
+    llm_utils = SimpleNamespace(
+        **{name: seam for name in semantic_gate_module._LLM_UTILS_SEAMS}
+    )
+    graph_module = SimpleNamespace(
+        **{name: seam for name in semantic_gate_module._GRAPH_LLM_SEAMS}
+    )
+    setattr(
+        graph_module,
+        semantic_gate_module._LLM_UTILS_MODULE_ATTRIBUTE,
+        llm_utils,
+    )
+    guard = semantic_gate_module._guard_external_llm_seams(graph_module)
+    read_descriptor, write_descriptor = os.pipe()
+    authority_closes = []
+
+    class FailingAuthority:
+        def revalidate(self):
+            os.fstat(read_descriptor)
+
+        def close(self):
+            authority_closes.append(True)
+            os.close(read_descriptor)
+            raise OSError("authority cleanup failure")
+
+    def query_room(*_args, **_kwargs):
+        trigger()
+        graph_module.create_llm_client = seam
+        raise primary_error
+
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+    audit = semantic_gate_module.RuntimeImportAudit()
+    audit.__enter__()
+    adapter = RealHMSGRetrievalAdapter(
+        SimpleNamespace(query_hmsg_room=query_room),
+        graph_identity=EXPECTED_SEMANTIC.graph_identity,
+        run_authority=FailingAuthority(),
+        llm_guard=guard,
+        import_audit=audit,
+    )
+
+    try:
+        with pytest.raises(type(primary_error)) as caught:
+            if exit_style == "context_manager":
+                with adapter:
+                    adapter.retrieve_structured(EXPECTED_SEMANTIC.query)
+            else:
+                try:
+                    adapter.retrieve_structured(EXPECTED_SEMANTIC.query)
+                finally:
+                    adapter.close()
+    finally:
+        os.close(write_descriptor)
+        audit.close()
+
+    assert caught.value is primary_error
+    assert authority_closes == [True]
+    with pytest.raises(OSError):
+        os.fstat(read_descriptor)
+    assert graph_module.create_llm_client is seam
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+
+
+def test_real_adapter_first_cleanup_error_wins_while_all_cleanup_is_attempted():
+    def seam(*_args, **_kwargs):
+        raise AssertionError("original LLM seam must not run")
+
+    llm_utils = SimpleNamespace(
+        **{name: seam for name in semantic_gate_module._LLM_UTILS_SEAMS}
+    )
+    graph_module = SimpleNamespace(
+        **{name: seam for name in semantic_gate_module._GRAPH_LLM_SEAMS}
+    )
+    setattr(
+        graph_module,
+        semantic_gate_module._LLM_UTILS_MODULE_ATTRIBUTE,
+        llm_utils,
+    )
+    guard = semantic_gate_module._guard_external_llm_seams(graph_module)
+    graph_module.create_llm_client = seam
+    authority_closes = []
+
+    def close_authority():
+        authority_closes.append(True)
+        raise OSError("later authority cleanup failure")
+
+    adapter = RealHMSGRetrievalAdapter(
+        SimpleNamespace(),
+        graph_identity=EXPECTED_SEMANTIC.graph_identity,
+        run_authority=SimpleNamespace(close=close_authority),
+        llm_guard=guard,
+    )
+
+    with pytest.raises(
+        SemanticGateError,
+        match="SEMANTIC_EXTERNAL_LLM_ATTEMPT: guarded seam binding changed: "
+        "create_llm_client",
+    ):
+        adapter.close()
+
+    assert authority_closes == [True]
+    assert graph_module.create_llm_client is seam
+
+
+def test_real_loader_cleanup_failures_do_not_mask_constructor_programmer_error(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    run_descriptors = []
+
+    def seam(*_args, **_kwargs):
+        raise AssertionError("original LLM seam must not run")
+
+    graph_module = None
+
+    class FakeGraph:
+        def __init__(self, configuration):
+            run_descriptors.append(int(Path(configuration["main"]["save_path"]).name))
+            graph_module.create_llm_client = seam
+            raise AssertionError("constructor programmer failure")
+
+    origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    graph_module = _fake_graph_module(origin, FakeGraph)
+    llm_utils = SimpleNamespace(
+        **{name: seam for name in semantic_gate_module._LLM_UTILS_SEAMS}
+    )
+    for name in semantic_gate_module._GRAPH_LLM_SEAMS:
+        setattr(graph_module, name, seam)
+    setattr(
+        graph_module,
+        semantic_gate_module._LLM_UTILS_MODULE_ATTRIBUTE,
+        llm_utils,
+    )
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "import_root_hmsg_runtime",
+        lambda _bound: (
+            graph_module,
+            SimpleNamespace(create=lambda value: value),
+            origin,
+        ),
+    )
+    authority_closes = []
+    original_close = semantic_gate_module.HandoverRunDirectoryAuthority.close
+
+    def close_then_fail(authority):
+        authority_closes.append(True)
+        original_close(authority)
+        raise OSError("loader authority cleanup failure")
+
+    monkeypatch.setattr(
+        semantic_gate_module.HandoverRunDirectoryAuthority,
+        "close",
+        close_then_fail,
+    )
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+
+    with pytest.raises(AssertionError, match="constructor programmer failure"):
+        load_real_hmsg_adapter(paths, tmp_path / "run")
+
+    assert authority_closes == [True]
+    assert graph_module.create_llm_client is seam
+    for descriptor in run_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
 
 
 def test_real_adapter_uses_verified_paths_configuration_and_room_mapping(

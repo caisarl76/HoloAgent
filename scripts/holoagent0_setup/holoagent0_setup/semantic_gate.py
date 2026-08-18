@@ -7,12 +7,13 @@ from dataclasses import dataclass
 import hashlib
 import importlib
 import importlib.machinery
+import importlib.util
 import json
 import math
 from pathlib import Path
 import sys
 from types import ModuleType
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, ClassVar, Mapping, Protocol
 
 from .cyclone_policy import (
     CONFIG_SET_SHA256,
@@ -81,12 +82,62 @@ class SemanticGateError(RuntimeError):
 class RuntimeImportAudit:
     """Record every requested import even when the module cache is restored."""
 
+    _active_stack: ClassVar[list["RuntimeImportAudit"]] = []
+
     def __init__(self) -> None:
         self._requested: set[str] = set()
         self._original_builtin_import = None
         self._original_import_module = None
+        self._audited_builtin_import = None
+        self._audited_import_module = None
+        self._entered = False
+        self._active = False
+
+    @staticmethod
+    def _invalid(detail: str) -> SemanticGateError:
+        return SemanticGateError("RUNTIME_IMPORT_AUDIT_INVALID", detail)
+
+    def _hooks_intact(self) -> bool:
+        return (
+            builtins.__import__ is self._audited_builtin_import
+            and importlib.import_module is self._audited_import_module
+        )
+
+    def _record(
+        self,
+        name: object,
+        *,
+        package: object = None,
+        globals_document: object = None,
+        level: object = 0,
+    ) -> None:
+        if not isinstance(name, str):
+            return
+        canonical = name
+        relative_name: str | None = None
+        relative_package = package if isinstance(package, str) else None
+        if isinstance(level, int) and level > 0:
+            relative_name = f"{'.' * level}{name}"
+            if isinstance(globals_document, dict):
+                candidate = globals_document.get("__package__") or globals_document.get(
+                    "__name__"
+                )
+                if isinstance(candidate, str):
+                    relative_package = candidate
+        elif name.startswith("."):
+            relative_name = name
+        if relative_name is not None and relative_package:
+            try:
+                canonical = importlib.util.resolve_name(relative_name, relative_package)
+            except (ImportError, TypeError, ValueError):
+                canonical = name
+        self._requested.add(canonical)
 
     def __enter__(self) -> "RuntimeImportAudit":
+        if self._entered:
+            raise self._invalid("audit re-entry is forbidden")
+        if self._active_stack and not self._active_stack[-1]._hooks_intact():
+            raise self._invalid("active parent import hooks were replaced")
         original_builtin_import = builtins.__import__
         original_import_module = importlib.import_module
         self._original_builtin_import = original_builtin_import
@@ -95,33 +146,57 @@ class RuntimeImportAudit:
         def audited_builtin_import(
             name, globals=None, locals=None, fromlist=(), level=0
         ):
-            if isinstance(name, str):
-                self._requested.add(name)
+            self._record(name, globals_document=globals, level=level)
             return original_builtin_import(name, globals, locals, fromlist, level)
 
         def audited_import_module(name, package=None):
-            if isinstance(name, str):
-                self._requested.add(name)
+            self._record(name, package=package)
             if package is None:
                 return original_import_module(name)
             return original_import_module(name, package)
 
+        self._audited_builtin_import = audited_builtin_import
+        self._audited_import_module = audited_import_module
         builtins.__import__ = audited_builtin_import
         importlib.import_module = audited_import_module
+        self._entered = True
+        self._active = True
+        self._active_stack.append(self)
         return self
 
     def __exit__(self, *_exc_info: object) -> None:
         self.close()
 
+    def _restore_top_owner(self) -> bool:
+        hooks_replaced = not self._hooks_intact()
+        builtins.__import__ = self._original_builtin_import
+        importlib.import_module = self._original_import_module
+        self._active_stack.pop()
+        self._active = False
+        return hooks_replaced
+
     def close(self) -> None:
-        if self._original_builtin_import is not None:
-            builtins.__import__ = self._original_builtin_import
-            self._original_builtin_import = None
-        if self._original_import_module is not None:
-            importlib.import_module = self._original_import_module
-            self._original_import_module = None
+        if not self._active:
+            return
+        if not self._active_stack or self._active_stack[-1] is not self:
+            if sys.exc_info()[0] is None:
+                raise self._invalid("out-of-order close is forbidden")
+            while self._active_stack:
+                owner = self._active_stack[-1]
+                owner._restore_top_owner()
+                if owner is self:
+                    break
+            return
+        hooks_replaced = self._restore_top_owner()
+        if hooks_replaced and sys.exc_info()[0] is None:
+            raise self._invalid("import hooks were replaced")
 
     def require_allowed(self) -> None:
+        if self._active:
+            if not self._active_stack or self._active_stack[-1] is not self:
+                raise self._invalid("audit is not the active LIFO owner")
+            if not self._hooks_intact():
+                raise self._invalid("import hooks were replaced")
         forbidden = sorted(
             name
             for name in self._requested
@@ -135,6 +210,22 @@ class RuntimeImportAudit:
 
 
 _ImportBoundaryAudit = RuntimeImportAudit
+
+
+def _run_cleanup_actions(
+    actions: tuple[Callable[[], None], ...], *, primary_active: bool
+) -> None:
+    first_error: BaseException | None = None
+    first_traceback = None
+    for action in actions:
+        try:
+            action()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+                first_traceback = error.__traceback__
+    if first_error is not None and not primary_active:
+        raise first_error.with_traceback(first_traceback)
 
 
 class _ExternalLLMGuard:
@@ -569,24 +660,16 @@ class RealHMSGRetrievalAdapter:
         self._run_authority = None
         audit = self._import_audit
         self._import_audit = None
-        try:
-            try:
-                if guard is not None:
-                    guard.close()
-            finally:
-                if authority is not None:
-                    authority.close()
-        except BaseException:
-            if audit is not None:
-                audit.close()
-            raise
-        else:
-            if audit is not None:
-                try:
-                    if not active_exception:
-                        audit.require_allowed()
-                finally:
-                    audit.close()
+        actions: list[Callable[[], None]] = []
+        if guard is not None:
+            actions.append(guard.close)
+        if authority is not None:
+            actions.append(authority.close)
+        if audit is not None:
+            if not active_exception:
+                actions.append(audit.require_allowed)
+            actions.append(audit.close)
+        _run_cleanup_actions(tuple(actions), primary_active=active_exception)
 
     def __enter__(self) -> "RealHMSGRetrievalAdapter":
         self._revalidate_run_authority()
@@ -923,15 +1006,15 @@ def load_real_hmsg_adapter(
     run_authority: HandoverRunDirectoryAuthority | None = None
 
     def close_loading_resources() -> None:
-        try:
-            if llm_guard is not None:
-                llm_guard.close()
-        finally:
-            try:
-                if run_authority is not None:
-                    run_authority.close()
-            finally:
-                import_audit.close()
+        actions: list[Callable[[], None]] = []
+        if llm_guard is not None:
+            actions.append(llm_guard.close)
+        if run_authority is not None:
+            actions.append(run_authority.close)
+        actions.append(import_audit.close)
+        _run_cleanup_actions(
+            tuple(actions), primary_active=sys.exc_info()[0] is not None
+        )
 
     try:
         graph_module, OmegaConf, _module_origin = import_root_hmsg_runtime(paths)

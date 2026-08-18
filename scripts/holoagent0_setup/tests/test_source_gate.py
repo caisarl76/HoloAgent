@@ -828,6 +828,33 @@ def test_source_lock_is_exact_sorted_approved_73_path_set():
     assert readme.git_oid == "291eea5e1969497760c5c48c62a4a04623a09eb6"
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ("schema", "digest", "count", "entry", "override"),
+)
+def test_source_lock_object_is_revalidated_through_full_closed_contract(mutation):
+    lock = load_source_lock(SOURCE_LOCK)
+    if mutation == "schema":
+        invalid = replace(lock, schema_version="unreviewed-source-lock")
+    elif mutation == "digest":
+        invalid = replace(lock, path_set_sha256="0" * 64)
+    elif mutation == "count":
+        invalid = replace(lock, entries=lock.entries[:-1])
+    elif mutation == "entry":
+        invalid = replace(
+            lock,
+            entries=(replace(lock.entries[0], mode="100600"), *lock.entries[1:]),
+        )
+    else:
+        invalid = replace(
+            lock,
+            reviewed_overrides=(replace(lock.reviewed_overrides[0], git_oid="0" * 40),),
+        )
+
+    with pytest.raises(SourceGateError, match="SOURCE_LOCK_INVALID"):
+        load_source_lock(invalid)
+
+
 def test_source_lock_matches_pinned_git_tree_without_restoring_anything():
     before = os.stat(REPOSITORY_ROOT).st_mtime_ns
     result = verify_manifest_git_objects(REPOSITORY_ROOT, SOURCE_LOCK)
@@ -1262,6 +1289,7 @@ def test_git_runner_uses_absolute_binary_minimal_environment_timeout_and_output_
     assert observed["argv"] == ["/usr/bin/git", "version"]
     assert observed["cwd"] == tmp_path
     assert observed["env"] == {
+        "GIT_NO_LAZY_FETCH": "1",
         "LC_ALL": "C",
         "LANG": "C",
         "PATH": "/usr/bin:/bin",
@@ -1284,6 +1312,29 @@ def test_git_runner_caps_failure_output_before_reporting_subprocess_error(
 
     with pytest.raises(SourceGateError, match="output exceeded"):
         source_gate._run_git(tmp_path, ["version"])
+
+
+def test_git_runner_missing_promised_object_fails_with_lazy_fetch_disabled(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def missing_object(argv, **kwargs):
+        calls.append((argv, kwargs))
+        assert kwargs["env"]["GIT_NO_LAZY_FETCH"] == "1"
+        return SimpleNamespace(
+            returncode=128,
+            stdout="",
+            stderr="fatal: missing promised blob object",
+        )
+
+    monkeypatch.setattr(source_gate.subprocess, "run", missing_object)
+
+    with pytest.raises(SourceGateError, match="missing promised blob object"):
+        source_gate._run_git(tmp_path, ["cat-file", "-e", f"{'0' * 40}^{{blob}}"])
+
+    assert len(calls) == 1
+    assert calls[0][0][0] == "/usr/bin/git"
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra", "changed"])

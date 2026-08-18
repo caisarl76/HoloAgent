@@ -532,10 +532,33 @@ def _hex_digest(value: Any, length: int, subject: str) -> str:
 
 def load_source_lock(source: SourceLock | Path | Mapping[str, Any]) -> SourceLock:
     """Load and fully validate the closed 73-path source lock."""
-    if isinstance(source, SourceLock):
-        return source
     try:
-        document = _read_document(source, SourceGateError)
+        if isinstance(source, SourceLock):
+            document = {
+                "schema_version": source.schema_version,
+                "commit": source.commit,
+                "path_set_sha256": source.path_set_sha256,
+                "entries": [
+                    {
+                        "path": entry.path,
+                        "mode": entry.mode,
+                        "kind": entry.kind,
+                        "git_oid": entry.git_oid,
+                    }
+                    for entry in source.entries
+                ],
+                "reviewed_overrides": [
+                    {
+                        "path": override.path,
+                        "commit": override.commit,
+                        "mode": override.mode,
+                        "git_oid": override.git_oid,
+                    }
+                    for override in source.reviewed_overrides
+                ],
+            }
+        else:
+            document = _read_document(source, SourceGateError)
         _closed(
             document,
             {
@@ -634,7 +657,7 @@ def load_source_lock(source: SourceLock | Path | Mapping[str, Any]) -> SourceLoc
         )
     except SourceGateError:
         raise
-    except (KeyError, TypeError, ValueError) as error:
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
         raise SourceGateError("SOURCE_LOCK_INVALID", str(error)) from error
 
 
@@ -649,7 +672,12 @@ def _run_git(repository_root: Path, arguments: list[str]) -> str:
             capture_output=True,
             text=True,
             timeout=GIT_TIMEOUT_SECONDS,
-            env={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"},
+            env={
+                "GIT_NO_LAZY_FETCH": "1",
+                "LC_ALL": "C",
+                "LANG": "C",
+                "PATH": "/usr/bin:/bin",
+            },
         )
     except subprocess.TimeoutExpired as error:
         raise SourceGateError("SOURCE_GIT_UNAVAILABLE", "git timed out") from error

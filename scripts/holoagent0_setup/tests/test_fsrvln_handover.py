@@ -2767,4 +2767,5 @@ def test_checkout_identity_resolves_exact_head_and_proves_locked_commit_ancestor
             ["merge-base", "--is-ancestor", lock.commit, GIT_SHA],
         ),
     ]
-    assert source_gate_module.load_source_lock(lock) is lock
+    assert source_gate_module.load_source_lock(lock) == lock
+    assert source_gate_module.load_source_lock(lock) is not lock
