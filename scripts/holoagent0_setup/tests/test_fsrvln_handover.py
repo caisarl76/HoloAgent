@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.machinery
 import json
 import os
 from dataclasses import replace
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +19,7 @@ from holoagent0_setup.atomic_io import (
 )
 from holoagent0_setup.contract import ContractError, ContractSet
 import holoagent0_setup.handover_evidence as evidence_module
+import holoagent0_setup.source_gate as source_gate_module
 from holoagent0_setup.handover_evidence import (
     ASSET_FILE,
     ENVIRONMENT_FILE,
@@ -44,8 +48,10 @@ from holoagent0_setup.semantic_gate import (
     SemanticFixtureResult,
 )
 from holoagent0_setup.source_gate import (
+    AssetGateError,
     HandoverPaths,
     PathIdentity,
+    SourceGateError,
     SourceVerification,
     VerifiedAssetLock,
 )
@@ -1993,3 +1999,547 @@ def test_late_terminal_collision_is_removed_from_retained_directory(
     assert {
         path.name for path in run_directory.iterdir() if not path.name.startswith(".")
     } == set(EVIDENCE_ORDER)
+
+
+def test_cli_requires_exact_three_paths_and_rejects_abbreviations(tmp_path):
+    cli = importlib.import_module("holoagent0_setup.fsrvln_handover")
+    repository = tmp_path / "repository"
+    data = tmp_path / "data"
+    run_directory = tmp_path / "run"
+
+    parsed = cli._parse_arguments(
+        [
+            "--repository-root",
+            str(repository),
+            "--data-root",
+            str(data),
+            "--run-directory",
+            str(run_directory),
+        ]
+    )
+
+    assert vars(parsed) == {
+        "repository_root": repository,
+        "data_root": data,
+        "run_directory": run_directory,
+    }
+    with pytest.raises(SystemExit) as abbreviated:
+        cli._parse_arguments(
+            [
+                "--repository",
+                str(repository),
+                "--data-root",
+                str(data),
+                "--run-directory",
+                str(run_directory),
+            ]
+        )
+    assert abbreviated.value.code == 2
+
+    for invalid in (
+        [],
+        [
+            "--repository-root",
+            str(repository),
+            "--data-root",
+            str(data),
+        ],
+        [
+            "--repository-root",
+            str(repository),
+            "--data-root",
+            str(data),
+            "--run-directory",
+            str(run_directory),
+            "--unexpected",
+        ],
+    ):
+        with pytest.raises(SystemExit) as misuse:
+            cli._parse_arguments(invalid)
+        assert misuse.value.code == 2
+
+
+class _CliAdapter:
+    def __init__(self):
+        self.closed = False
+
+    def graph_counts(self):
+        return GraphCounts(1, 3, 497)
+
+    def close(self):
+        self.closed = True
+
+
+def _install_cli_fakes(monkeypatch, tmp_path, contract, *, failure=None):
+    cli = importlib.import_module("holoagent0_setup.fsrvln_handover")
+    paths = _fake_paths(tmp_path)
+    run_directory = tmp_path / "run"
+    calls = []
+    captured = {}
+    adapter = _CliAdapter()
+    source_lock = SimpleNamespace(commit="c" * 40)
+    source_verification = _pass_source_verification()
+    asset_verification = _pass_asset_verification()
+    environment = _pass_documents(paths)[ENVIRONMENT_FILE]
+
+    def fail_or(name, value):
+        calls.append(name)
+        if failure == name:
+            if name in {"checkout_identity", "source_git_objects", "source_worktree"}:
+                raise SourceGateError(f"{name.upper()}_FAILED", "injected")
+            if name == "asset_inventory":
+                raise AssetGateError("ASSET_INVENTORY_FAILED", "injected")
+            if name in {"graph_load", "query_once"}:
+                from holoagent0_setup.semantic_gate import SemanticGateError
+
+                raise SemanticGateError(f"{name.upper()}_FAILED", "injected")
+            if name == "environment":
+                raise OSError("injected environment failure")
+        return value
+
+    def from_roots(repository_root, data_root):
+        assert repository_root == paths.repository_root
+        assert data_root == paths.data_root
+        return fail_or("paths", paths)
+
+    def prepare(actual_run_directory, actual_paths):
+        assert actual_run_directory == run_directory
+        assert actual_paths is paths
+        actual_run_directory.mkdir(mode=0o700)
+        return fail_or("run_directory", _identity(actual_run_directory))
+
+    monkeypatch.setattr(cli.HandoverPaths, "from_roots", from_roots)
+    monkeypatch.setattr(cli, "prepare_handover_run_directory", prepare)
+    monkeypatch.setattr(cli, "load_source_lock", lambda source: source_lock)
+    monkeypatch.setattr(
+        cli,
+        "verify_checkout_identity",
+        lambda repository, lock: fail_or("checkout_identity", GIT_SHA),
+    )
+    monkeypatch.setattr(
+        cli,
+        "verify_manifest_git_objects",
+        lambda repository, lock: fail_or("source_git_objects", source_verification),
+    )
+    monkeypatch.setattr(
+        cli,
+        "verify_source_worktree",
+        lambda repository, lock: fail_or("source_worktree", source_verification),
+    )
+    monkeypatch.setattr(
+        cli, "qualify_environment", lambda actual: fail_or("environment", environment)
+    )
+    monkeypatch.setattr(
+        cli,
+        "verify_asset_lock",
+        lambda actual: fail_or("asset_inventory", asset_verification),
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_real_hmsg_adapter",
+        lambda actual_paths, actual_run: fail_or("graph_load", adapter),
+    )
+    monkeypatch.setattr(
+        cli,
+        "evaluate_semantic_fixture",
+        lambda actual_adapter, query: fail_or("query_once", _semantic_result()),
+    )
+    monkeypatch.setattr(cli, "sha256_retained_asset_lock", lambda actual: LOCK_SHA256)
+    monkeypatch.setattr(cli, "ContractSet", lambda root: contract)
+
+    builder_names = (
+        ("build_environment_document", "environment_evidence"),
+        ("build_source_document", "source_evidence"),
+        ("build_asset_document", "asset_evidence"),
+        ("build_query_document", "query_evidence"),
+    )
+    for function_name, call_name in builder_names:
+        original = getattr(cli, function_name)
+
+        def recording_builder(*args, _original=original, _name=call_name, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(cli, function_name, recording_builder)
+
+    def publish(actual_contract, actual_run_directory, documents, **contexts):
+        calls.append("terminal_evidence")
+        captured["documents"] = documents
+        captured["contexts"] = contexts
+        return publish_handover_evidence(
+            contract,
+            actual_run_directory,
+            documents,
+            **contexts,
+        )
+
+    monkeypatch.setattr(cli, "publish_handover_evidence", publish)
+    argv = [
+        "--repository-root",
+        str(paths.repository_root),
+        "--data-root",
+        str(paths.data_root),
+        "--run-directory",
+        str(run_directory),
+    ]
+    return cli, paths, run_directory, calls, captured, adapter, argv
+
+
+def test_cli_success_order_runs_the_structured_query_exactly_once(
+    monkeypatch, tmp_path, contract
+):
+    cli, paths, _run, calls, captured, adapter, argv = _install_cli_fakes(
+        monkeypatch, tmp_path, contract
+    )
+
+    assert cli.main(argv) == 0
+
+    assert calls == [
+        "paths",
+        "run_directory",
+        "checkout_identity",
+        "source_git_objects",
+        "source_worktree",
+        "environment",
+        "asset_inventory",
+        "graph_load",
+        "query_once",
+        "environment_evidence",
+        "source_evidence",
+        "asset_evidence",
+        "query_evidence",
+        "terminal_evidence",
+    ]
+    assert captured["documents"][QUERY_FILE]["execution_count"] == 1
+    assert captured["documents"][QUERY_FILE]["status"] == "PASS"
+    assert captured["contexts"]["paths"] is paths
+    assert captured["contexts"]["source_verification"] == _pass_source_verification()
+    assert captured["contexts"]["asset_verification"] == _pass_asset_verification()
+    assert captured["contexts"]["graph_counts"] == GraphCounts(1, 3, 497)
+    assert captured["contexts"]["semantic_result"] == _semantic_result()
+    assert adapter.closed
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "checkout_identity",
+        "source_git_objects",
+        "source_worktree",
+        "environment",
+        "asset_inventory",
+        "graph_load",
+        "query_once",
+    ),
+)
+def test_cli_first_operational_exception_stops_later_gates_and_publishes_failure(
+    monkeypatch, tmp_path, contract, failure
+):
+    cli, _paths, run_directory, calls, captured, adapter, argv = _install_cli_fakes(
+        monkeypatch, tmp_path, contract, failure=failure
+    )
+
+    assert cli.main(argv) == 1
+
+    documents = captured["documents"]
+    assert {path.name for path in run_directory.iterdir()} == {
+        *EVIDENCE_ORDER,
+        RESULT_FILE,
+    }
+    terminal = json.loads((run_directory / RESULT_FILE).read_bytes())
+    first_reason = terminal["first_blocking_reason"]
+    assert terminal["status"] == "FAIL"
+    assert first_reason
+    assert terminal["reason"] == first_reason
+    failed_index = {
+        "checkout_identity": 0,
+        "source_git_objects": 0,
+        "source_worktree": 0,
+        "environment": 1,
+        "asset_inventory": 2,
+        "graph_load": 3,
+        "query_once": 3,
+    }[failure]
+    operational_order = (
+        SOURCE_FILE,
+        ENVIRONMENT_FILE,
+        ASSET_FILE,
+        QUERY_FILE,
+    )
+    for index, filename in enumerate(operational_order):
+        if index < failed_index:
+            assert documents[filename]["status"] == "PASS"
+        elif index == failed_index:
+            assert documents[filename]["status"] == "FAIL"
+            assert documents[filename]["reason"] == first_reason
+        else:
+            assert documents[filename]["status"] == "NOT_RUN"
+            assert documents[filename]["reason"] == first_reason
+    expected_execution_count = 1 if failure == "query_once" else 0
+    assert documents[QUERY_FILE]["execution_count"] == expected_execution_count
+    assert calls[-5:] == [
+        "environment_evidence",
+        "source_evidence",
+        "asset_evidence",
+        "query_evidence",
+        "terminal_evidence",
+    ]
+    if failure in {"graph_load", "query_once"}:
+        assert adapter.closed is (failure == "query_once")
+
+
+def test_cli_environment_fail_is_first_blocker_and_stops_assets(
+    monkeypatch, tmp_path, contract
+):
+    cli, _paths, run_directory, calls, captured, _adapter, argv = _install_cli_fakes(
+        monkeypatch, tmp_path, contract
+    )
+    environment_root = tmp_path / "environment-observation"
+    environment_root.mkdir()
+    environment = captured_environment = _pass_documents(_fake_paths(environment_root))[
+        ENVIRONMENT_FILE
+    ]
+    captured_environment["status"] = "FAIL"
+    captured_environment["reason"] = "IMPORT_MISSING: open3d"
+    monkeypatch.setattr(cli, "qualify_environment", lambda actual: environment)
+
+    assert cli.main(argv) == 1
+
+    assert "asset_inventory" not in calls
+    assert "graph_load" not in calls
+    assert "query_once" not in calls
+    documents = captured["documents"]
+    assert documents[ENVIRONMENT_FILE]["status"] == "FAIL"
+    assert documents[ASSET_FILE]["status"] == "NOT_RUN"
+    assert documents[QUERY_FILE]["status"] == "NOT_RUN"
+    assert all(
+        documents[filename]["reason"] == "IMPORT_MISSING: open3d"
+        for filename in (ENVIRONMENT_FILE, ASSET_FILE, QUERY_FILE)
+    )
+    assert json.loads((run_directory / RESULT_FILE).read_bytes())["status"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "HANDOVER_PATH_NOT_ABSOLUTE",
+        "HANDOVER_PATH_ALIAS",
+        "HANDOVER_PATH_OVERLAP",
+        "RUN_PATH_ALIAS",
+        "RUN_PATH_OVERLAP",
+        "RUN_DIRECTORY_NOT_EMPTY",
+    ),
+)
+def test_cli_untrusted_paths_exit_two_without_semantic_or_evidence_work(
+    monkeypatch, tmp_path, reason
+):
+    cli = importlib.import_module("holoagent0_setup.fsrvln_handover")
+    repository = tmp_path / "repository"
+    data = tmp_path / "data"
+    run_directory = tmp_path / "run"
+    repository.mkdir()
+    data.mkdir()
+    calls = []
+
+    if reason.startswith("RUN_"):
+        fake_paths = SimpleNamespace(revalidate=lambda: None)
+        monkeypatch.setattr(cli.HandoverPaths, "from_roots", lambda *args: fake_paths)
+
+        def reject_run(*args):
+            raise AssetGateError(reason, "unsafe run directory")
+
+        monkeypatch.setattr(cli, "prepare_handover_run_directory", reject_run)
+    else:
+
+        def reject_paths(*args):
+            raise AssetGateError(reason, "unsafe handover roots")
+
+        monkeypatch.setattr(cli.HandoverPaths, "from_roots", reject_paths)
+
+    for name in (
+        "qualify_environment",
+        "verify_asset_lock",
+        "load_real_hmsg_adapter",
+        "evaluate_semantic_fixture",
+        "publish_handover_evidence",
+    ):
+        monkeypatch.setattr(
+            cli, name, lambda *args, _name=name, **kwargs: calls.append(_name)
+        )
+
+    assert (
+        cli.main(
+            [
+                "--repository-root",
+                str(repository),
+                "--data-root",
+                str(data),
+                "--run-directory",
+                str(run_directory),
+            ]
+        )
+        == 2
+    )
+    assert calls == []
+    if run_directory.exists():
+        assert list(run_directory.iterdir()) == []
+
+
+def test_cli_rejects_source_verification_disagreement(monkeypatch, tmp_path, contract):
+    cli, _paths, run_directory, calls, captured, _adapter, argv = _install_cli_fakes(
+        monkeypatch, tmp_path, contract
+    )
+    monkeypatch.setattr(
+        cli,
+        "verify_source_worktree",
+        lambda repository, lock: (
+            calls.append("source_worktree")
+            or SourceVerification(
+                commit="c" * 40,
+                verified_count=72,
+                provenance=(("c" * 40, 72),),
+            )
+        ),
+    )
+
+    assert cli.main(argv) == 1
+
+    assert "environment" not in calls
+    source = captured["documents"][SOURCE_FILE]
+    assert source["status"] == "FAIL"
+    assert source["reason"] == "SOURCE_VERIFICATION_MISMATCH"
+    assert json.loads((run_directory / RESULT_FILE).read_bytes())["status"] == "FAIL"
+
+
+def test_cli_fails_if_a_forbidden_runtime_module_enters_the_query_path(
+    monkeypatch, tmp_path, contract
+):
+    cli, _paths, run_directory, _calls, captured, adapter, argv = _install_cli_fakes(
+        monkeypatch, tmp_path, contract
+    )
+
+    def load_forbidden(_adapter, _query):
+        sys.modules["rclpy.testing"] = SimpleNamespace()
+        return _semantic_result()
+
+    monkeypatch.setattr(cli, "evaluate_semantic_fixture", load_forbidden)
+    try:
+        assert cli.main(argv) == 1
+    finally:
+        sys.modules.pop("rclpy.testing", None)
+
+    query = captured["documents"][QUERY_FILE]
+    assert query["status"] == "FAIL"
+    assert query["reason"] == "FORBIDDEN_RUNTIME_MODULE: rclpy.testing"
+    assert query["execution_count"] == 1
+    assert adapter.closed
+    assert json.loads((run_directory / RESULT_FILE).read_bytes())["status"] == "FAIL"
+
+
+def test_cli_allows_historical_openai_but_never_calls_llm_or_natural_parser_seams(
+    monkeypatch, tmp_path, contract
+):
+    cli, _paths, _run, _calls, _captured, _adapter, argv = _install_cli_fakes(
+        monkeypatch, tmp_path, contract
+    )
+    forbidden_calls = []
+
+    def forbidden(name):
+        def fail(*args, **kwargs):
+            forbidden_calls.append(name)
+            raise AssertionError(f"{name} must not be called")
+
+        return fail
+
+    historical_openai = sys.modules.get("openai")
+    sys.modules["openai"] = SimpleNamespace()
+    for name in (
+        "create_llm_client",
+        "create_chat_completion",
+        "parse_hier_query",
+        "parse_hier_query_use_prompt_insentence_parse",
+        "parse_hier_query_use_prompt_insentence_parse_icra",
+        "parse_floor_room_object_gpt35",
+        "parse_floor_room_object_gpt40",
+    ):
+        monkeypatch.setattr(cli, name, forbidden(name), raising=False)
+    try:
+        assert cli.main(argv) == 0
+    finally:
+        if historical_openai is None:
+            sys.modules.pop("openai", None)
+        else:
+            sys.modules["openai"] = historical_openai
+    assert forbidden_calls == []
+
+
+@pytest.mark.parametrize("operation", ("import", "help"))
+def test_cli_import_and_help_are_light_and_non_ros_in_a_fresh_process(operation):
+    package_root = PACKAGE_ROOT
+    lines = [
+        "import sys",
+        f"sys.path.insert(0, {str(package_root)!r})",
+        "import holoagent0_setup.fsrvln_handover as cli",
+    ]
+    if operation == "help":
+        lines.extend(
+            (
+                "try:",
+                "    cli._parse_arguments(['--help'])",
+                "except SystemExit as error:",
+                "    assert error.code == 0",
+                "else:",
+                "    raise AssertionError('--help did not exit')",
+            )
+        )
+    lines.extend(
+        (
+            "forbidden=('rclpy','nav2','agentos','agentic_robot','unitree','unitree_sdk2py')",
+            "loaded=sorted(name for name in sys.modules if name.startswith(forbidden))",
+            "assert not loaded, loaded",
+        )
+    )
+    script = "\n".join(lines)
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_public_retained_asset_lock_digest_is_bound_to_the_retained_bytes(tmp_path):
+    paths = _fake_paths(tmp_path)
+    digest = getattr(evidence_module, "sha256_retained_asset_lock")
+
+    assert digest(paths) == LOCK_SHA256
+
+
+def test_checkout_identity_resolves_exact_head_and_proves_locked_commit_ancestor(
+    monkeypatch,
+):
+    source_path = PACKAGE_ROOT / "locks/semantic-source-manifest-v1.json"
+    lock = source_gate_module.load_source_lock(source_path)
+    calls = []
+
+    def run_git(repository_root, arguments):
+        calls.append((repository_root, arguments))
+        if arguments[0] == "rev-parse":
+            return f"{GIT_SHA}\n"
+        return ""
+
+    monkeypatch.setattr(source_gate_module, "_run_git", run_git)
+    verify_checkout_identity = getattr(source_gate_module, "verify_checkout_identity")
+
+    assert verify_checkout_identity(Path("/repository"), lock) == GIT_SHA
+    assert calls == [
+        (Path("/repository"), ["rev-parse", "--verify", "HEAD^{commit}"]),
+        (
+            Path("/repository"),
+            ["merge-base", "--is-ancestor", lock.commit, GIT_SHA],
+        ),
+    ]
+    assert source_gate_module.load_source_lock(lock) is lock

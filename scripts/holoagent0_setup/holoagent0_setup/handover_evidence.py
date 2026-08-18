@@ -950,7 +950,9 @@ def _require_pass_stage_bindings(
         raise _semantic_failure("semantic orientation differs from the pinned fixture")
 
 
-def _sha256_retained_asset_lock(paths: HandoverPaths) -> str:
+def sha256_retained_asset_lock(paths: HandoverPaths) -> str:
+    """Hash the retained asset-lock inode twice through a no-follow descriptor."""
+
     paths.revalidate()
     identity = _retained_identity(paths, "asset_lock")
     directory_flags = (
@@ -1055,7 +1057,7 @@ def _require_authoritative_pass_documents(
             reason=asset["reason"],
             started_at=asset["started_at"],
             finished_at=asset["finished_at"],
-            asset_lock_sha256=_sha256_retained_asset_lock(paths),
+            asset_lock_sha256=sha256_retained_asset_lock(paths),
             verification=asset_verification,
         )
         if asset != expected_asset:

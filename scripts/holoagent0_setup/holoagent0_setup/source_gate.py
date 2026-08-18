@@ -530,8 +530,10 @@ def _hex_digest(value: Any, length: int, subject: str) -> str:
     return value
 
 
-def load_source_lock(source: Path | Mapping[str, Any]) -> SourceLock:
+def load_source_lock(source: SourceLock | Path | Mapping[str, Any]) -> SourceLock:
     """Load and fully validate the closed 73-path source lock."""
+    if isinstance(source, SourceLock):
+        return source
     try:
         document = _read_document(source, SourceGateError)
         _closed(
@@ -664,8 +666,35 @@ def _run_git(repository_root: Path, arguments: list[str]) -> str:
     return completed.stdout
 
 
+def verify_checkout_identity(
+    repository_root: Path,
+    source: SourceLock | Path | Mapping[str, Any],
+) -> str:
+    """Resolve exact HEAD and prove the locked commit is its ancestor."""
+
+    lock = load_source_lock(source)
+    head_output = _run_git(
+        Path(repository_root), ["rev-parse", "--verify", "HEAD^{commit}"]
+    )
+    head_lines = head_output.splitlines()
+    if (
+        len(head_lines) != 1
+        or len(head_lines[0]) != 40
+        or any(character not in "0123456789abcdef" for character in head_lines[0])
+    ):
+        raise SourceGateError(
+            "SOURCE_CHECKOUT_INVALID", "HEAD is not one exact commit identity"
+        )
+    head = head_lines[0]
+    _run_git(
+        Path(repository_root),
+        ["merge-base", "--is-ancestor", lock.commit, head],
+    )
+    return head
+
+
 def verify_manifest_git_objects(
-    repository_root: Path, source: Path | Mapping[str, Any]
+    repository_root: Path, source: SourceLock | Path | Mapping[str, Any]
 ) -> SourceVerification:
     """Verify the lock against Git objects without touching the worktree."""
     root = Path(repository_root).resolve(strict=True)
@@ -893,7 +922,7 @@ def verify_worktree_entry(repository_root: Path, entry: SourceEntry) -> None:
 
 
 def verify_source_worktree(
-    repository_root: Path, source: Path | Mapping[str, Any]
+    repository_root: Path, source: SourceLock | Path | Mapping[str, Any]
 ) -> SourceVerification:
     """Verify all locked paths and report every mismatch deterministically."""
     lock = load_source_lock(source)
