@@ -15,16 +15,16 @@ from typing import Any, Mapping
 
 SOURCE_LOCK_SCHEMA = "holoagent0-semantic-source-manifest-v1"
 ASSET_LOCK_SCHEMA = "holoagent0-icra-ic4f-assets-v1"
-SOURCE_COMMIT = "f164095abb0045a69c0b8eb23683063be3deaa38"
+SOURCE_COMMIT = "ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8"
 REVIEWED_README_OVERRIDE = (
     "nav_agent/README.md",
     "d862782b3661e2f2cf155d6e006f11c27063a6b0",
     "100644",
     "291eea5e1969497760c5c48c62a4a04623a09eb6",
 )
-APPROVED_PATH_COUNT = 74
+APPROVED_PATH_COUNT = 73
 APPROVED_PATH_SET_SHA256 = (
-    "9a244d858cf3393cb4c0191a8cdd8679cc2d30a9d2df88bbd9d83f86b5531687"
+    "968b39b7a16021b65e4d0adbcc33528007d42c7d4c52aee03f9c70c563ad50dc"
 )
 CANONICAL_ASSET_ALGORITHM = "sha256-content-lines-v1"
 REVIEWED_GIT = Path("/usr/bin/git")
@@ -238,7 +238,7 @@ def _hex_digest(value: Any, length: int, subject: str) -> str:
 
 
 def load_source_lock(source: Path | Mapping[str, Any]) -> SourceLock:
-    """Load and fully validate the closed 74-path source lock."""
+    """Load and fully validate the closed 73-path source lock."""
     try:
         document = _read_document(source, SourceGateError)
         _closed(

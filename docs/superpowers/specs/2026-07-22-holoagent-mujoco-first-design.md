@@ -21,10 +21,10 @@ ARM64 `g1_move`/`g1_arm` builds under `robots/unitree/install_pc2`. Those
 binaries must not be started during this simulation phase.
 
 The workstation recovery source originally lived only in mutable `stash@{0}`.
-It is now preserved as branch `stash-backup-20260722`, pinned to commit
-`f164095abb0045a69c0b8eb23683063be3deaa38`. The stash diff lists 21 modified
-paths, but the build-and-smoke closure contains 74 paths because stash diff is
-not the same thing as the complete snapshot tree. The other 53 dependencies
+Its portable baseline is pinned to reachable commit
+`ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8`. The stash diff lists 21 modified
+paths, but the build-and-smoke closure contains 73 paths because stash diff is
+not the same thing as the complete snapshot tree. The other 52 dependencies
 were unchanged relative to the stash parent and therefore absent from
 `git stash show`, even though the release commit removed them.
 
@@ -129,16 +129,15 @@ whose poses are explicitly aligned to `sim_map`; it is outside this milestone.
 
 ### 1. Semantic Source Recovery
 
-Restore the exact 74-path, build-driven manifest with closed mixed
-provenance: 73 paths use immutable recovery commit
-`f164095abb0045a69c0b8eb23683063be3deaa38`; the documentation-only
+Restore the exact 73-path, build-driven manifest with closed mixed
+provenance: 72 baseline entries use reachable commit
+`ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8`; the one documentation-only
 `nav_agent/README.md` uses reviewed commit
 `d862782b3661e2f2cf155d6e006f11c27063a6b0` and blob
 `291eea5e1969497760c5c48c62a4a04623a09eb6` with Git mode `100644` so its
 later MuJoCo/PC2 handoff links are preserved. No other override is permitted:
 
 ```text
-fsr_vln/checkpoints
 fsr_vln/config/semantic_scene_reconstruction_hm3d.yaml
 fsr_vln/config/semantic_scene_reconstruction_ic3f.yaml
 fsr_vln/config/semantic_scene_reconstruction_ic4f.yaml
@@ -223,9 +222,9 @@ to this manifest and verify it against the same pin.
 
 Recovery fails rather than overwriting a path that has appeared since review.
 Each restored regular file or symlink must match its pinned Git blob. Rebuild
-into `/tmp/navagent_sem_nav_*`, verify the checkpoint symlink resolves, and
-rerun the container smoke test. Unlisted outputs, generated configs, logs, and
-unrelated dirty-worktree changes remain untouched.
+into `/tmp/navagent_sem_nav_*` and rerun the container smoke test. Unlisted
+outputs, generated configs, logs, and unrelated dirty-worktree changes remain
+untouched.
 
 Restored files are never edited to accommodate the workstation. In particular,
 `chat_loc_python/setup.py` contains a robot-specific build-script interpreter.
@@ -389,11 +388,10 @@ timeout.
 ### Stage 0: Software and Semantic Recovery
 
 - The durable recovery branch resolves to the pinned commit.
-- All 74 restored paths match their saved Git blobs: 73 from
-  `f164095abb0045a69c0b8eb23683063be3deaa38` and only
+- All 73 restored paths match their saved Git blobs: 72 from
+  `ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8` and only
   `nav_agent/README.md` from
   `d862782b3661e2f2cf155d6e006f11c27063a6b0`.
-- The checkpoint symlink resolves to both required checkpoint files.
 - Skill registry validation passes.
 - Semantic workspace builds cleanly in `/tmp`.
 - Container import/executable smoke checks pass.

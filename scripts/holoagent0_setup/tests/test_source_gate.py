@@ -35,22 +35,46 @@ APPROVED_SPEC = (
     REPOSITORY_ROOT
     / "docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md"
 )
+EXPECTED_SOURCE_COMMIT = "ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8"
+EXPECTED_PATH_SET_SHA256 = (
+    "968b39b7a16021b65e4d0adbcc33528007d42c7d4c52aee03f9c70c563ad50dc"
+)
 
 
 def _approved_paths() -> tuple[str, ...]:
     text = APPROVED_SPEC.read_text(encoding="utf-8")
-    block = text.split("Restore the exact 74-path", 1)[1]
+    block = text.split("Restore the exact 73-path", 1)[1]
     block = block.split("```text", 1)[1].split("```", 1)[0]
     return tuple(sorted(line.strip() for line in block.splitlines() if line.strip()))
 
 
-def test_source_lock_is_exact_sorted_approved_74_path_set():
+def test_source_lock_declares_reachable_portable_baseline():
+    document = json.loads(SOURCE_LOCK.read_text(encoding="utf-8"))
+    paths = tuple(entry["path"] for entry in document["entries"])
+
+    assert (
+        SOURCE_COMMIT,
+        document["commit"],
+        len(paths),
+        "fsr_vln/checkpoints" in paths,
+        document["path_set_sha256"],
+    ) == (
+        EXPECTED_SOURCE_COMMIT,
+        EXPECTED_SOURCE_COMMIT,
+        73,
+        False,
+        EXPECTED_PATH_SET_SHA256,
+    )
+
+
+def test_source_lock_is_exact_sorted_approved_73_path_set():
     lock = load_source_lock(SOURCE_LOCK)
     expected = _approved_paths()
 
     assert lock.schema_version == SOURCE_LOCK_SCHEMA
-    assert lock.commit == SOURCE_COMMIT == ("f164095abb0045a69c0b8eb23683063be3deaa38")
-    assert len(lock.entries) == 74
+    assert lock.commit == SOURCE_COMMIT == EXPECTED_SOURCE_COMMIT
+    assert len(lock.entries) == 73
+    assert "fsr_vln/checkpoints" not in expected
     assert tuple(entry.path for entry in lock.entries) == expected
     assert (
         lock.path_set_sha256
@@ -79,13 +103,29 @@ def test_source_lock_matches_pinned_git_tree_without_restoring_anything():
     before = os.stat(REPOSITORY_ROOT).st_mtime_ns
     result = verify_manifest_git_objects(REPOSITORY_ROOT, SOURCE_LOCK)
 
-    assert result.commit == SOURCE_COMMIT
-    assert result.verified_count == 74
+    assert result.commit == SOURCE_COMMIT == EXPECTED_SOURCE_COMMIT
+    assert result.verified_count == 73
     assert result.provenance == (
-        ("f164095abb0045a69c0b8eb23683063be3deaa38", 73),
+        (EXPECTED_SOURCE_COMMIT, 72),
         ("d862782b3661e2f2cf155d6e006f11c27063a6b0", 1),
     )
     assert os.stat(REPOSITORY_ROOT).st_mtime_ns == before
+
+
+@pytest.mark.parametrize(
+    "commit",
+    [
+        EXPECTED_SOURCE_COMMIT,
+        "d862782b3661e2f2cf155d6e006f11c27063a6b0",
+    ],
+)
+def test_source_provenance_commits_are_reachable_ancestors_of_head(commit):
+    assert (
+        source_gate._run_git(
+            REPOSITORY_ROOT, ["merge-base", "--is-ancestor", commit, "HEAD"]
+        )
+        == ""
+    )
 
 
 def test_current_worktree_passes_reviewed_readme_override_without_mutation():
@@ -93,7 +133,7 @@ def test_current_worktree_passes_reviewed_readme_override_without_mutation():
 
     result = verify_source_worktree(REPOSITORY_ROOT, SOURCE_LOCK)
 
-    assert result.verified_count == 74
+    assert result.verified_count == 73
     assert result.provenance[-1] == (
         "d862782b3661e2f2cf155d6e006f11c27063a6b0",
         1,
