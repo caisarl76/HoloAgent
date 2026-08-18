@@ -1,147 +1,193 @@
-# Portable FSR-VLN Workstation Handover Design
+# FSR-VLN Fixed-Query Asset and Runtime Handover Design
 
 **Date:** 2026-08-18
 
-**Status:** Approved design; implementation pending written-spec review
+**Status:** Approved scope; implementation pending
 
-**Primary document:** `docs/FSR_VLN_HOLOAGENT_HANDOVER.md`
+**Primary handover:** `docs/FSR_VLN_HOLOAGENT_HANDOVER.md`
 
 ## Problem
 
-The current handover explains the reproduced FSR-VLN result and how to rerun it
-on Jihun's workstation. It does not let a teammate start from a clean
-workstation because it lacks a validated environment bootstrap and complete
-asset-acquisition procedure. The current semantic asset gate also requires
-literal paths under `/home/jihun` and `/mnt/data/jihun`, so otherwise valid
-copies fail before content verification.
+The current handover records a reproduced FSR-VLN result, but it mixes historical
+workspace details, two different FSR-VLN source trees, host-specific asset paths,
+and broader workstation commissioning work. That makes it difficult for an
+incoming owner to determine which code and assets produced the accepted result.
 
-The verified query used the existing `fsrvln` Conda environment, which currently
-reports Python 3.9.23, PyTorch 2.4.1+cu118, Open3D 0.18.0, and CPU fallback. The
-tracked `agentic_robot/fsr_vln/environment.yaml` instead declares Python
-3.10.19, PyTorch 2.5.0+cu121, and Open3D 0.19.0. Therefore, the tracked
-environment must pass a clean-environment reproduction before the handover may
-call it authoritative.
+The incoming owner can transfer the assets from Jihun's workstation and manage
+their own Python environment. The repository therefore does not need to automate
+those mechanics. It must instead provide an unambiguous identity contract and a
+single observation-only command that proves the transferred source, assets, and
+runtime can reproduce the accepted fixed query.
+
+## Decision Summary
+
+The handover is an outcome-based acceptance contract, not a general workstation
+bootstrap guide.
+
+- The incoming owner chooses the transfer tool and environment manager.
+- The repository pins the source closure, asset inventories, fixed query,
+  expected result, and acceptance evidence.
+- Stage A uses the recovered root-level `fsr_vln/` implementation because that
+  is the implementation loaded by the existing deterministic fixture.
+- `agentic_robot/fsr_vln/` is not installed or imported for Stage A.
+- All non-Git assets live beneath one teammate-controlled `data_root` outside
+  the repository.
+- One non-ROS CLI verifies source and assets, records the runtime, executes the
+  fixed query, and emits a machine-readable PASS or FAIL result.
 
 ## Goals
 
-1. Make native Conda the authoritative workstation reproduction path.
-2. Let a teammate choose their own absolute repository and data roots without
-   weakening source or asset identity checks.
-3. Provide complete acquisition commands for the pinned graph, RGB-D dataset,
-   and checkpoint.
-4. Reproduce the exact fixed query from transferred pinned assets before any
-   mapping, ROS, Nav2, or robot work.
-5. Clearly separate the accepted query-reproduction path from the not-yet-
-   accepted RGB-D-to-HMSG rebuild path.
+1. Give the incoming owner one authoritative Stage A source tree and source
+   identity.
+2. Accept transferred assets at any reviewed absolute data root while preserving
+   exact content identity.
+3. Qualify an incoming-owner-managed environment by observed imports, module
+   origins, versions, and query behavior.
+4. Reproduce `Take me to the counter in the pantry` from the pinned graph without
+   an external LLM, ROS, Nav2, AgentOS, or robot control.
+5. Produce a compact evidence bundle that both owners can use for handover
+   sign-off.
+6. Keep raw RGB-D-to-HMSG rebuilding and navigation commissioning explicitly
+   outside Stage A.
 
 ## Non-Goals
 
-- Docker is not an authoritative setup path. The published `latest` image is
-  not accepted until it is pinned by immutable digest and independently tested.
-- This change does not claim paper-level retrieval accuracy or navigation
+- The repository does not install Conda, create a Python environment, choose an
+  environment manager, or promise one-command dependency installation.
+- The repository does not prescribe `rsync` over another safe transfer tool.
+- The handover does not qualify `agentic_robot/fsr_vln/` as the Stage A runtime.
+- The handover does not claim paper-level retrieval accuracy or navigation
   success.
-- This change does not commission Nav2, MuJoCo motion, PC2, or physical robot
-  execution.
-- This change does not automatically regenerate or approve a changed graph,
-  dataset, checkpoint, source manifest, or environment lock.
-- This change does not make external LLM parsing part of the deterministic
-  fixture.
+- The handover does not rebuild an HMSG graph, align a Nav2 map, initialize ROS,
+  or enable robot motion.
+- The handover does not make the public dataset archive authoritative. Public
+  artifact publication and equivalence testing remain follow-up work.
+- The handover does not automatically regenerate or approve a changed source or
+  asset lock.
 
-## Chosen Approach
+## Ownership Boundary
 
-The existing handover remains the single entry point. It gains two early
-sections:
+### Incoming owner
 
-1. `Clean Workstation Environment Setup`
-2. `Dataset, Graph, and Checkpoint Acquisition`
+The incoming owner is responsible for:
 
-The setup is command-driven but not hidden behind a new bootstrap script. This
-keeps each network, filesystem, and environment mutation visible to the
-teammate. A future bootstrap script may automate the reviewed commands, but it
-must not become the first portable reproduction authority.
+- selecting and operating the transfer method;
+- providing sufficient storage and a writable staging location;
+- creating and maintaining a Python environment;
+- obtaining any required internal access without copying credentials into the
+  repository or evidence bundle; and
+- retaining the accepted assets after handover.
 
-## Repository and Version Authority
+### Repository
 
-The guide uses the fork `https://github.com/caisarl76/HoloAgent.git`. The
-portable asset-root implementation is developed and reviewed on
-`feat/holoagent0-workstation-pc2-setup`. After its tests pass, that exact commit
-is tagged `holoagent0-fsrvln-workstation-repro-v1`. The handover tells the
-teammate to fetch tags and detach at that tag. Moving branch names and an
-unpinned `main` checkout are not sufficient reproduction identities.
+The repository is responsible for:
 
-The original `https://github.com/HorizonRobotics/HoloAgent.git` remains the
-canonical upstream remote. The handover includes the expected `origin` and
-`upstream` URLs but never asks the teammate to push to upstream.
+- identifying the exact source payload;
+- defining the only accepted asset roles and paths;
+- verifying the complete per-file asset inventory;
+- proving which Python modules were imported;
+- executing the fixed query without network parsing or motion-capable systems;
+- emitting deterministic acceptance evidence; and
+- failing closed on any mismatch.
 
-## Clean Workstation Environment Setup
+## Source and Release Authority
 
-### Platform contract
+The source repository is `https://github.com/caisarl76/HoloAgent.git`. The
+official `https://github.com/HorizonRobotics/HoloAgent.git` remains the upstream
+remote, but Stage A never requires push access to either remote.
 
-The authoritative path is Linux x86-64 on Ubuntu 20.04 or newer with:
+Implementation proceeds on `feat/holoagent0-workstation-pc2-setup`. Because the
+primary handover and this design currently exist on `main`, implementation first
+merges `main` into that feature branch. It does not rebase away the reviewed
+feature lineage.
 
-- Git and Git LFS;
-- `rsync`, `curl`, `unzip`, and SHA-256 tooling;
-- Conda or Miniforge;
-- enough storage for the environment and at least 7 GB of reproduction assets
-  and transfer staging;
-- optional NVIDIA GPU and a driver compatible with the tracked CUDA-enabled
-  PyTorch build.
+The current source lock names the unreachable stash commit
+`f164095abb0045a69c0b8eb23683063be3deaa38`. The same 73 non-README baseline
+entries have identical Git blob identities at the reachable feature commit
+`ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8`. The implementation updates source
+provenance to that reachable commit while preserving every approved baseline
+blob identity. The existing reviewed `nav_agent/README.md` override remains
+bound to `d862782b3661e2f2cf155d6e006f11c27063a6b0`.
 
-GPU availability is not required for the fixed observation-only query. A CPU
-pass is valid but must be labeled as CPU and must not be used for performance
-comparison.
+The host-specific tracked symlink `fsr_vln/checkpoints` is removed from the
+Stage A source closure and from the accepted release. Its target is an asset
+location, not executable source authority. Removing it changes only the reviewed
+path-set digest and count; it must not change any retained source blob identity.
 
-### Environment creation contract
+The release process creates:
 
-The handover will provide literal commands to:
+1. an accepted implementation commit containing the code, locks, tests, and
+   commands used for Stage A;
+2. a documentation-only release commit that records the accepted
+   implementation commit's full 40-character SHA; and
+3. annotated tag `holoagent0-fsrvln-handover-v1` on the documentation release
+   commit.
 
-1. clone the fork recursively;
-2. add and verify the official upstream remote;
-3. fetch and detach at `holoagent0-fsrvln-workstation-repro-v1`;
-4. create a new Conda environment from
-   `agentic_robot/fsr_vln/environment.yaml`;
-5. activate `holoagent_semantic_mapping`;
-6. install `agentic_robot/fsr_vln` in editable mode;
-7. print and record Python, PyTorch, CUDA availability, Open3D, OpenCLIP,
-   NumPy, and OmegaConf versions;
-8. run import-only and source-contract smoke tests before assets are loaded.
+The tag is a discovery aid. The full implementation commit SHA in the handover
+is the reproduction identity. The handover tells the teammate to fetch the tag,
+verify that the recorded implementation commit is its ancestor, and detach at
+the recorded implementation commit. A branch name or tag name alone is not an
+accepted identity.
 
-The environment validation must use a newly created environment. Reusing
-Jihun's existing `fsrvln` environment is evidence about the historical result,
-not evidence that the clean setup works. If clean creation or the fixed query
-fails, the tracked environment definition is corrected and reviewed before the
-handover is updated. The guide must not tell the teammate to apply ad hoc
-unrecorded `pip install` fixes.
+Stage A clones do not use `--recursive`. The only configured submodule uses an
+SSH URL and is not part of the Stage A source closure.
 
-No `.env`, API token, or external chat-completion credential is needed for the
-deterministic fixed query. Online slow reasoning is documented separately and
-is not part of this acceptance path.
+## Authoritative Stage A Runtime
 
-## Portable Asset Root Contract
-
-The literal Jihun-specific roots are replaced by one explicit configuration
-object derived from two mandatory absolute inputs:
-
-- `repository_root`: the detached HoloAgent checkout;
-- `data_root`: a teammate-controlled data directory outside the Git index.
-
-The role paths are derived without search or fallback:
+Stage A executes the recovered root-level tree:
 
 ```text
-graph      = repository_root/fsr_vln/scene_graphs_opensource/horizon/
+repository_root/fsr_vln
+```
+
+The acceptance CLI inserts that directory for the duration of the fixture and
+requires the loaded graph module to resolve exactly to:
+
+```text
+repository_root/fsr_vln/memory/hmsg/graph/graph.py
+```
+
+It does not install or import `repository_root/agentic_robot/fsr_vln`. The
+maintained `agentic_robot/fsr_vln/` API and the RGB-D mapping entry point remain
+Stage B candidates until a separate design selects and qualifies them.
+
+## Data Root and Asset Identity
+
+The acceptance CLI takes two mandatory absolute inputs:
+
+- `repository_root`: the detached accepted implementation checkout;
+- `data_root`: a teammate-controlled directory outside `repository_root`.
+
+It derives all roles internally:
+
+```text
+graph      = data_root/fsr_vln/scene_graphs_opensource/horizon/
              icra_ic4f/graph_20260629211448
 dataset    = data_root/fsr_vln/rgbd_datasets/icra_ic4f
 checkpoint = data_root/fsr_vln/checkpoints/open_clip_pytorch_model.bin
+asset_lock = repository_root/scripts/holoagent0_setup/locks/
+             icra_ic4f-assets-v1.json
 ```
 
-Both inputs must exist, be absolute, and resolve successfully before asset
-measurement. The implementation rejects relative paths, missing roots,
-unexpected role names, post-resolution path changes, and asset paths that do
-not equal the paths derived above. It does not search the filesystem and does
-not select the newest graph.
+The caller cannot supply individual graph, dataset, checkpoint, or lock paths.
+The implementation uses one immutable path object derived from the two roots.
+There is no environment-variable fallback, filesystem search, newest-file
+selection, or role substitution.
 
-Portability changes location authority only. The following identity checks
-remain mandatory:
+Both roots must:
+
+- be absolute, normalized paths;
+- exist before verification;
+- be directories;
+- equal their strict resolved paths, thereby rejecting symlink aliases;
+- remain identity-stable while opened and measured; and
+- be disjoint, with `data_root` neither inside nor above `repository_root`.
+
+The run directory must be absolute, writable, outside both roots, and must not
+pre-exist unless it is an explicitly empty owner-controlled directory. Path
+components used as retained authorities are opened without following symlinks.
+
+The locked asset identities remain:
 
 | Role | Count/size | Canonical SHA-256 |
 | --- | ---: | --- |
@@ -149,140 +195,232 @@ remain mandatory:
 | Dataset | 5,360 files; 2,391,476,669 bytes | `a28fea956a4520330a76d90f75a60f7781602bfd19cd13e510b2574d39b4a913` |
 | Checkpoint | 1 file; 1,710,631,365 bytes | `5ddb47339f44e4fd9cace3d3960d38af1b51a25857440cfae90afc44706d7e2b` |
 
-The existing per-file asset manifest remains authoritative. A canonical-root
-digest alone is not a substitute for the complete inventory comparison.
+The complete per-file lock, including file type, mode, byte size, digest, and
+reviewed internal symlink target, is authoritative. Aggregate counts and root
+digests are summaries, not substitutes.
 
-## Dataset, Graph, and Checkpoint Acquisition
+## Transfer and Custody Contract
 
-### Authoritative immediate transfer
-
-The immediate reproduction source is
-`jihun@jihun-Z590-AORUS-ELITE`. The teammate must be on a LAN or VPN where that
-hostname resolves and must have SSH read access authorized by the outgoing
-owner.
-
-The handover provides three explicit `rsync` commands. Each copies into a new
-or reviewed destination without `--delete`:
-
-- graph source:
-  `/home/jihun/work/HoloAgent/fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/graph_20260629211448/`;
-- dataset source:
-  `/mnt/data/jihun/HoloAgent/fsr_vln/rgbd_datasets/icra_ic4f/`;
-- checkpoint source:
-  `/mnt/data/jihun/HoloAgent/fsr_vln/checkpoints/open_clip_pytorch_model.bin`.
-
-Interrupted transfers may be resumed. A received asset is not usable until the
-portable verifier confirms the complete locked inventory. The guide never asks
-the teammate to copy `.env`, historical logs, build trees, or unrelated output
-directories.
-
-### Public dataset archive
-
-The public
-`HorizonRobotics/fsrvln_datasets` repository is an optional RGB-D acquisition
-source. The guide pins repository revision
-`3ae09a4d99a1afa0307fe32abc25d0a3b75cb1df` and downloads only
-`icra_ic4f.zip` from:
+The authoritative initial source is `jihun@jihun-Z590-AORUS-ELITE` at:
 
 ```text
-https://huggingface.co/datasets/HorizonRobotics/fsrvln_datasets/resolve/3ae09a4d99a1afa0307fe32abc25d0a3b75cb1df/icra_ic4f.zip
+graph:      /home/jihun/work/HoloAgent/fsr_vln/scene_graphs_opensource/
+            horizon/icra_ic4f/graph_20260629211448
+dataset:    /mnt/data/jihun/HoloAgent/fsr_vln/rgbd_datasets/icra_ic4f
+checkpoint: /mnt/data/jihun/HoloAgent/fsr_vln/checkpoints/
+            open_clip_pytorch_model.bin
 ```
 
-The server reports 2,313,731,566 bytes and linked object identifier
-`cd6c3f4fd2d925ede5c7f1a3219457bd11936065fc354dfb3e783cde5746609c`.
+The teammate may use `rsync`, removable storage, or another reviewed method. The
+handover records the sources and destinations but does not make one transfer
+command authoritative.
 
-Before the public archive is documented as equivalent to the internally
-transferred dataset, implementation must independently download it, compute its
-SHA-256, inspect extraction paths, and prove that the normalized extracted
-dataset matches the existing 5,360-file lock. Until that test passes, the guide
-labels the public archive as an optional source that is not the authoritative
-exact-reproduction transfer.
+Operational requirements are:
 
-No public source has yet been accepted for the exact pinned graph or
-checkpoint. The guide uses internal transfer for those assets and records
-public artifact publication as follow-up work, not as an invented URL.
+- transfer into a new sibling staging location;
+- do not use destructive deletion against the source or an existing destination;
+- inspect destination collisions before copying;
+- resume an interrupted transfer only with the selected tool's verified resume
+  mode;
+- optionally measure the staged copy with the same inventory algorithm;
+- promote on the same filesystem when atomic rename is available, then run the
+  mandatory verifier against the final derived paths;
+- keep Jihun's originals unchanged until the incoming owner signs off; and
+- retain a second verified copy before the outgoing workstation or its data disk
+  is repurposed.
 
-## Staged Reproduction
+The three assets total 4,252,174,099 bytes. The teammate reserves at least 10 GB
+of free space for assets and staging, excluding the Python environment and
+optional retained visualizations.
 
-### Stage A: accepted fixed-query reproduction
+The outgoing and incoming owners confirm that internal transfer is permitted by
+the applicable source, dataset, and checkpoint licenses. Secrets, `.env`, logs,
+build trees, and unrelated outputs are never transferred as part of this
+contract.
 
-After environment and asset verification, the teammate runs the deterministic
-query `Take me to the counter in the pantry`. Acceptance requires:
+## Environment Qualification
 
-- floor `0`;
-- room `0_0`, `Pantry`;
-- object `0_0_81`, `counter`;
-- frame `map`;
-- position
-  `(-21.526786203133774, -15.671372634872082, -0.27579107548158116)`;
-- no ROS initialization, Nav2 start, AgentOS action, external LLM request, or
-  robot-control process;
-- a clean asset-verification result using the configured roots.
+The environment manager and installation steps are teammate-owned. Neither
+`fsr_vln/environment.yaml` nor `agentic_robot/fsr_vln/environment.yaml` is called
+an authoritative lock by this handover.
 
-The guide then shows how to open the retained PNG and PLY visualization. The
-visualization is not described as a Nav2 occupancy-map overlay.
+The historical successful environment is recorded only as a comparison point:
 
-### Stage B: separately qualified map rebuild
+```text
+Python 3.9.23
+PyTorch 2.4.1+cu118
+Open3D 0.18.0
+CUDA unavailable; CPU execution
+```
 
-The handover describes the intended RGB-D to OVO to HMSG flow and points to the
-tracked mapping entry point, but labels it `NOT YET REPRODUCED FROM CLEAN
-SETUP`. It does not instruct the teammate to treat a newly generated graph as a
-substitute for the pinned Stage A graph.
+Before asset loading, the acceptance CLI records:
 
-Stage B becomes accepted only after Segment Anything 2 and every mapping model
-are pinned, the raw-data layout is documented, one clean rebuild completes, and
-graph structure and retrieval behavior are compared with the pinned graph.
+- operating-system release and machine architecture;
+- Python executable and version;
+- PyTorch, CUDA build, CUDA availability, Open3D, OpenCLIP, NumPy, OmegaConf,
+  FAISS, OpenCV, NetworkX, PyVista, scikit-fmm, OSS2, and Segment Anything import
+  status and version when exposed; and
+- the resolved origin of the root-level HMSG graph module.
 
-## Failure Handling and Safety
+Missing imports or a graph-module origin outside the accepted root-level tree
+fail qualification. The incoming environment may differ from the historical
+versions, but it is accepted only if the complete asset verification and fixed
+query pass. CPU and GPU runs are labeled and are not compared for performance.
 
-- A checksum, file-count, byte-count, per-file inventory, or semantic-result
-  mismatch stops the procedure. The teammate must not update a lock to make a
-  failed transfer pass.
-- Insufficient storage, unavailable SSH access, missing Conda packages, and an
-  unavailable public archive are reported as setup blockers rather than worked
-  around with unreviewed assets.
-- Transfer commands do not use destructive deletion flags.
-- Secrets remain outside Git, command transcripts, evidence archives, and the
-  handover.
-- All setup and query commands retain motion-disabled, observation-only
-  boundaries.
+No API token, `.env`, OSS credential, external chat-completion credential, ROS
+installation, or robot SDK is required for Stage A.
+
+## Single Acceptance Command
+
+The handover exposes one non-ROS module entry point:
+
+```text
+PYTHONPATH=<repository_root>/scripts/holoagent0_setup \
+python -m holoagent0_setup.fsrvln_handover \
+  --repository-root <repository_root> \
+  --data-root <data_root> \
+  --run-directory <new_absolute_run_directory>
+```
+
+The CLI performs these steps in order:
+
+1. verify the checkout identity and reachable source provenance;
+2. verify the current locked source files without modifying them;
+3. capture the environment, required imports, and exact module origins;
+4. derive and verify all asset roles and complete inventories;
+5. load the real root-level HMSG graph;
+6. execute the pinned structured form of
+   `Take me to the counter in the pantry` exactly once;
+7. compare the result with the accepted identity and pose tolerance; and
+8. atomically write the evidence bundle and terminal result.
+
+The CLI does not import `rclpy`, initialize ROS, start Nav2 or AgentOS, call an
+external LLM, or launch a robot-control process.
+
+## Expected Result
+
+Acceptance requires:
+
+- graph counts: one floor, three rooms, and 497 objects;
+- floor: `0`;
+- room: `0_0`, `Pantry`;
+- object: `0_0_81`, `counter`;
+- frame: `map`;
+- position:
+  `(-21.526786203133774, -15.671372634872082, -0.27579107548158116)`,
+  with absolute tolerance `1e-6` per coordinate;
+- orientation: `(0.0, 0.0, 0.0, 1.0)`;
+- the pinned structured-query, graph, dataset, checkpoint, and room-name-mapping
+  digests; and
+- no network parser or motion-capable subsystem in the execution path.
+
+The retained PNG and PLY may be opened after acceptance, but visualization is
+optional and is not a Nav2 occupancy-map overlay.
+
+## Evidence and Sign-Off
+
+The run directory contains at least:
+
+```text
+environment.json
+source-verification.json
+asset-verification.json
+query-result.json
+handover-result.json
+```
+
+Every document uses a closed schema and canonical JSON. `handover-result.json`
+records the terminal `PASS` or `FAIL`, the accepted implementation commit, input
+root identities, evidence-file digests, CPU/GPU label, start and finish times,
+and the first blocking reason on failure.
+
+The handover sign-off records:
+
+- outgoing owner and incoming owner;
+- transfer and acceptance dates;
+- repository URL, release tag, and full accepted implementation commit;
+- the three asset root digests;
+- environment summary and module origin;
+- evidence-bundle location and digest;
+- final PASS or FAIL; and
+- custody confirmation that a second verified asset copy exists.
+
+## Failure Handling
+
+- Any source, asset, module-origin, graph-count, object, pose, or evidence mismatch
+  produces FAIL and a nonzero exit status.
+- The verifier never repairs, searches for, downloads, or substitutes content.
+- A failed transfer does not authorize editing the lock.
+- A failed environment import is diagnosed in the teammate-owned environment;
+  it does not authorize switching to `agentic_robot/fsr_vln` silently.
+- Partial evidence is retained as diagnostic output but cannot be labeled PASS.
+- Jihun's source assets remain unchanged until PASS and custody sign-off.
+
+## Stage B and Later Work
+
+The handover may summarize the intended RGB-D to OVO to HMSG flow, but it labels
+it `NOT QUALIFIED BY THIS HANDOVER`. Stage B requires a separate design that
+chooses the maintained source tree, pins Segment Anything 2 and all mapping
+models, defines raw-data layout, performs a clean rebuild, and compares graph
+structure and retrieval behavior.
+
+Nav2 frame alignment, MuJoCo, PC2, and physical robot execution remain separate
+commissioning projects.
 
 ## Implementation Scope
 
-The portability implementation updates the existing feature worktree before
-the handover claims clean-workstation support:
+Implementation updates the feature branch in this order:
 
-1. amend the workstation setup design and offline implementation plan to
-   replace literal host roots with the two-root contract;
-2. replace `APPROVED_ASSET_ROOTS` constant use with an explicit derivation and
-   validation API;
-3. thread the root configuration through semantic fixture invocation without
-   environment-variable fallback;
-4. add adversarial tests for relative roots, missing roots, role substitution,
-   symlink/path aliasing, and correct assets at alternate absolute roots;
-5. create and validate a fresh Conda environment;
-6. verify the internal-transfer command structure; independently validate the
-   public archive or keep it explicitly outside exact-reproduction authority;
-7. add the two approved sections to the handover;
-8. rerun the focused source/semantic suite and the complete tracked manifest;
-9. tag the accepted feature commit and publish the handover update.
+1. Merge `main` into `feat/holoagent0-workstation-pc2-setup` so the primary
+   handover and this design share the release lineage.
+2. Update `scripts/holoagent0_setup/holoagent0_setup/source_gate.py`,
+   `scripts/holoagent0_setup/locks/semantic-source-manifest-v1.json`, and the
+   superseded 74-path section of
+   `docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md` to use
+   reachable source provenance, remove the host checkpoint symlink from the
+   closure, and introduce the immutable two-root path contract.
+3. Update `semantic_gate.py` to consume the derived path object and enforce the
+   root-level HMSG module origin.
+4. Add
+   `scripts/holoagent0_setup/holoagent0_setup/fsrvln_handover.py` as the one
+   non-ROS acceptance CLI and add closed evidence schemas.
+5. Update `test_source_gate.py` and `test_semantic_gate.py`; add
+   `test_fsrvln_handover.py` with clean-clone, alternate-root, dependency,
+   evidence, and fixed-query coverage.
+6. Make `test-manifest-v1.txt` equal the complete tracked `tests/test_*.py` set,
+   including the currently omitted `test_offline_cli.py`, and test that equality.
+7. Rewrite the top of `docs/FSR_VLN_HOLOAGENT_HANDOVER.md` as the concise Stage A
+   runbook while retaining historical results as clearly labeled background.
+8. Run the focused tests, complete tracked manifest, clean-tag clone test, and
+   real transferred-asset query under a teammate-managed environment.
+9. Create the accepted implementation commit, record its full SHA in a
+   documentation-only release commit, create the annotated release tag, and
+   publish both commits and the tag.
 
 ## Acceptance Criteria
 
-The documentation change is complete only when all of the following are true:
+The handover implementation is complete only when all of the following are true:
 
-1. A fresh Conda environment can be created from the tracked definition without
-   undocumented commands.
-2. The portable gate accepts correctly transferred assets under a non-Jihun
-   absolute data root.
-3. The gate continues to reject wrong content, wrong role mappings, relative
-   roots, and unapproved aliases.
-4. The internal transfer commands name all three exact source assets and never
-   include secrets or unrelated workspace data.
-5. The fixed query returns the exact accepted object and pose.
-6. The handover clearly marks the public dataset archive's validated or
-   unvalidated status.
-7. The handover clearly marks full HMSG rebuilding, Nav2, and robot execution
-   as outside Stage A acceptance.
-8. Documentation formatting, command tests, focused tests, and the tracked test
-   manifest report zero failures.
+1. A clone fetching the documented release tag can detach at the literal
+   implementation SHA and resolve every commit and blob required by the source
+   verifier without another local ref.
+2. The accepted CLI imports the root-level HMSG graph from the exact expected
+   file and never imports `agentic_robot/fsr_vln` for Stage A.
+3. A teammate-managed environment either passes the import qualification or
+   fails with an explicit missing dependency or wrong-origin reason.
+4. Correct assets pass under a non-Jihun absolute `data_root`; relative roots,
+   aliases, overlaps, role substitution, missing files, extra files, and changed
+   content fail.
+5. The fixed query returns the accepted graph counts, node identities,
+   orientation, and pose within `1e-6` absolute tolerance per coordinate.
+6. The execution initializes no ROS, Nav2, AgentOS, external LLM, or robot-control
+   component.
+7. The evidence bundle is complete, schema-valid, digest-bound, and records a
+   terminal PASS before owner sign-off.
+8. The tracked test manifest contains exactly every tracked
+   `scripts/holoagent0_setup/tests/test_*.py` file, and the complete manifest
+   reports zero failures.
+9. The handover includes no placeholder commit, owner, path, digest, or status
+   in its signed-off record.
+10. Stage B, public artifact equivalence, map alignment, Nav2, and robot execution
+    remain explicitly unqualified.
