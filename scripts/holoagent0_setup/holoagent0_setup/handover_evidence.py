@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from importlib import import_module, metadata
+import inspect
+import os
 from pathlib import Path
 import platform
+import stat
 import sys
 from typing import Mapping
 
 from .atomic_io import (
     ArtifactDescriptor,
     AtomicIOError,
+    AtomicPublicationAmbiguity,
     atomic_write_json_no_replace,
     canonical_json_bytes,
 )
-from .contract import ContractSet
+from .contract import ContractError, ContractSet
 from .semantic_gate import (
     GraphCounts,
     SemanticFixtureResult,
@@ -36,6 +41,7 @@ ASSET_FILE = "asset-verification.json"
 QUERY_FILE = "query-result.json"
 RESULT_FILE = "handover-result.json"
 EVIDENCE_ORDER = (ENVIRONMENT_FILE, SOURCE_FILE, ASSET_FILE, QUERY_FILE)
+BLOCKING_ORDER = (SOURCE_FILE, ENVIRONMENT_FILE, ASSET_FILE, QUERY_FILE)
 
 REQUIRED_IMPORTS = (
     ("pytorch", "torch"),
@@ -78,6 +84,30 @@ _STAGE_SCHEMAS = {
     ASSET_FILE: "fsrvln-asset-verification-v1",
     QUERY_FILE: "fsrvln-query-result-v1",
 }
+_MISSING = object()
+
+
+@dataclass(frozen=True)
+class PublicationFailure:
+    """One failed validation, write, authority, or terminal publication attempt."""
+
+    filename: str
+    phase: str
+    error: Exception
+
+
+class EvidencePublicationError(RuntimeError):
+    """One or more evidence artifacts could not be published unambiguously."""
+
+    def __init__(self, failures: tuple[PublicationFailure, ...]) -> None:
+        if not failures:
+            raise ValueError("publication failure set must not be empty")
+        self.failures = failures
+        detail = "; ".join(
+            f"{failure.filename}/{failure.phase}: {failure.error}"
+            for failure in failures
+        )
+        super().__init__(detail)
 
 
 def _utc_timestamp() -> str:
@@ -163,16 +193,24 @@ def _module_origin(module: object) -> str | None:
 
 
 def _module_version(display_name: str, module: object) -> str | None:
-    direct = getattr(module, "__version__", None)
-    if type(direct) is str and direct:
+    try:
+        inspect.getattr_static(module, "__version__")
+    except AttributeError:
+        direct = _MISSING
+    else:
+        direct = getattr(module, "__version__")
+    if direct is not _MISSING:
+        if type(direct) is not str or not direct:
+            raise ValueError("module __version__ must be nonempty text when exposed")
         return direct
     for candidate in _DISTRIBUTION_CANDIDATES[display_name]:
         try:
             observed = metadata.version(candidate)
-        except Exception:
+        except metadata.PackageNotFoundError:
             continue
-        if type(observed) is str and observed:
-            return observed
+        if type(observed) is not str or not observed:
+            raise ValueError(f"distribution {candidate} returned an invalid version")
+        return observed
     return None
 
 
@@ -225,26 +263,35 @@ def qualify_environment(paths: HandoverPaths) -> dict[str, object]:
             failures.append(reason)
             continue
 
-        observed_name = getattr(module, "__name__", None)
-        if observed_name != module_name:
-            reason = (
-                "IMPORT_IDENTITY_MISMATCH: "
-                f"expected {module_name}, got {observed_name!r}"
+        try:
+            observed_name = getattr(module, "__name__", None)
+            if observed_name != module_name:
+                raise ValueError(f"expected {module_name}, got {observed_name!r}")
+            version = _module_version(display_name, module)
+            origin = _module_origin(module)
+        except Exception as error:
+            prefix = (
+                "IMPORT_IDENTITY_MISMATCH"
+                if isinstance(error, ValueError)
+                and str(error).startswith(f"expected {module_name},")
+                else "IMPORT_OBSERVATION_FAILED"
             )
+            reason = f"{prefix}: {module_name}: {type(error).__name__}: {error}"
             rows.append(_failed_import_row(display_name, module_name, reason))
             failures.append(reason)
             continue
-        imported[module_name] = module
-        rows.append(
-            {
-                "name": display_name,
-                "module": module_name,
-                "status": "PASS",
-                "version": _module_version(display_name, module),
-                "origin": _module_origin(module),
-                "reason": "OK",
-            }
-        )
+        else:
+            imported[module_name] = module
+            rows.append(
+                {
+                    "name": display_name,
+                    "module": module_name,
+                    "status": "PASS",
+                    "version": version,
+                    "origin": origin,
+                    "reason": "OK",
+                }
+            )
 
     accelerator: dict[str, object] | None = None
     torch_module = imported.get("torch")
@@ -510,6 +557,9 @@ def validate_and_publish_stage(
     run_directory: Path,
     filename: str,
     document: dict[str, object],
+    *,
+    parent_fd: int | None = None,
+    expected_parent_identity: tuple[int, int] | None = None,
 ) -> ArtifactDescriptor:
     """Validate one stage and atomically install its canonical JSON once."""
 
@@ -518,6 +568,8 @@ def validate_and_publish_stage(
         run_directory / filename,
         document,
         relative_to=run_directory,
+        parent_fd=parent_fd,
+        expected_parent_identity=expected_parent_identity,
     )
 
 
@@ -531,6 +583,257 @@ def _require_descriptor_matches(
         or descriptor.size != len(payload)
     ):
         raise AtomicIOError(f"atomic descriptor differs from canonical {filename}")
+
+
+class _RunDirectoryAuthority:
+    """One retained no-follow directory descriptor for the complete publication."""
+
+    def __init__(self, path: Path, identity: PathIdentity, descriptor: int) -> None:
+        self.path = path
+        self.identity = identity
+        self._descriptor = descriptor
+
+    @classmethod
+    def retain(
+        cls, run_directory: Path, identity: PathIdentity
+    ) -> "_RunDirectoryAuthority":
+        if not isinstance(identity, PathIdentity):
+            raise AtomicIOError("run directory identity is not retained")
+        try:
+            raw = os.fspath(run_directory)
+        except TypeError as error:
+            raise AtomicIOError("run directory is not path-like") from error
+        if type(raw) is not str:
+            raise AtomicIOError("run directory path must be text")
+        path = Path(raw)
+        if (
+            not path.is_absolute()
+            or raw != os.path.normpath(raw)
+            or raw != path.as_posix()
+            or identity.path != path
+        ):
+            raise AtomicIOError("run directory path differs from retained identity")
+
+        flags = (
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path.anchor, flags)
+        try:
+            for component in path.parts[1:]:
+                next_descriptor = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = next_descriptor
+            authority = cls(path, identity, descriptor)
+            authority.revalidate()
+            return authority
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @property
+    def descriptor(self) -> int:
+        if self._descriptor < 0:
+            raise AtomicIOError("run directory authority is closed")
+        return self._descriptor
+
+    @property
+    def parent_identity(self) -> tuple[int, int]:
+        return self.identity.device, self.identity.inode
+
+    def revalidate(self) -> None:
+        retained = os.fstat(self.descriptor)
+        try:
+            lexical = os.stat(self.path, follow_symlinks=False)
+            resolved = self.path.resolve(strict=True)
+        except OSError as error:
+            raise AtomicIOError(
+                "run directory lexical binding is unavailable"
+            ) from error
+        expected = (self.identity.device, self.identity.inode, self.identity.mode)
+        if (
+            not stat.S_ISDIR(retained.st_mode)
+            or retained.st_uid != os.getuid()
+            or (retained.st_dev, retained.st_ino, retained.st_mode) != expected
+            or (lexical.st_dev, lexical.st_ino, lexical.st_mode) != expected
+            or resolved != self.path
+        ):
+            raise AtomicIOError("run directory lexical binding changed")
+
+    def close(self) -> None:
+        if self._descriptor >= 0:
+            os.close(self._descriptor)
+            self._descriptor = -1
+
+
+def _semantic_failure(detail: str) -> EvidencePublicationError:
+    return EvidencePublicationError(
+        (
+            PublicationFailure(
+                ENVIRONMENT_FILE,
+                "cross_document_validation",
+                ValueError(detail),
+            ),
+        )
+    )
+
+
+def _environment_runtime_label(document: Mapping[str, object]) -> str | None:
+    status = document.get("status")
+    rows = document.get("imports")
+    accelerator = document.get("accelerator")
+    if status == "NOT_RUN":
+        if rows is not None or accelerator is not None:
+            raise _semantic_failure(
+                "NOT_RUN environment must contain null imports and accelerator"
+            )
+        return None
+    if not isinstance(rows, list) or len(rows) != len(REQUIRED_IMPORTS):
+        raise _semantic_failure("environment must contain all 12 required imports")
+    observed_order = tuple(
+        (row.get("name"), row.get("module")) if isinstance(row, dict) else (None, None)
+        for row in rows
+    )
+    if observed_order != REQUIRED_IMPORTS:
+        raise _semantic_failure("environment required imports are out of order")
+    row_statuses = tuple(
+        row.get("status") if isinstance(row, dict) else None for row in rows
+    )
+    if any(row_status not in {"PASS", "FAIL"} for row_status in row_statuses):
+        raise _semantic_failure("environment import row status is invalid")
+    if status == "PASS" and any(row_status != "PASS" for row_status in row_statuses):
+        raise _semantic_failure("environment PASS requires every import row to PASS")
+
+    torch_status = row_statuses[0]
+    if accelerator is None:
+        if status == "PASS" or torch_status == "PASS":
+            raise _semantic_failure(
+                "a successful PyTorch import requires accelerator observations"
+            )
+        return None
+    if not isinstance(accelerator, dict) or torch_status != "PASS":
+        raise _semantic_failure("accelerator evidence disagrees with PyTorch import")
+    cuda_available = accelerator.get("cuda_available")
+    cuda_build = accelerator.get("torch_cuda_build")
+    label = accelerator.get("label")
+    if type(cuda_available) is not bool:
+        raise _semantic_failure("CUDA availability must be boolean")
+    expected_label = "GPU" if cuda_available else "CPU"
+    if label != expected_label:
+        raise _semantic_failure("accelerator label disagrees with CUDA availability")
+    if cuda_build is not None and (type(cuda_build) is not str or not cuda_build):
+        raise _semantic_failure("PyTorch CUDA build must be nonempty text or null")
+    if cuda_available and cuda_build is None:
+        raise _semantic_failure("CUDA availability requires a PyTorch CUDA build")
+    return expected_label
+
+
+def _read_authoritative_file(
+    authority: _RunDirectoryAuthority,
+    filename: str,
+    expected: bytes,
+    proof: ArtifactDescriptor,
+) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=authority.descriptor,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or (before.st_dev, before.st_ino, before.st_size)
+            != (proof.device, proof.inode, proof.size)
+        ):
+            raise AtomicIOError("ambiguous terminal identity differs from proof")
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, len(expected) - observed + 1))
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > len(expected):
+                raise AtomicIOError("ambiguous terminal exceeds expected bytes")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        path_stat = os.stat(
+            filename, dir_fd=authority.descriptor, follow_symlinks=False
+        )
+        payload = b"".join(chunks)
+        if (
+            payload != expected
+            or hashlib.sha256(payload).hexdigest() != proof.sha256
+            or (after.st_dev, after.st_ino, after.st_size)
+            != (before.st_dev, before.st_ino, before.st_size)
+            or (path_stat.st_dev, path_stat.st_ino, path_stat.st_size)
+            != (before.st_dev, before.st_ino, before.st_size)
+        ):
+            raise AtomicIOError("ambiguous terminal bytes differ from proof")
+    except AtomicIOError:
+        raise
+    except OSError as error:
+        raise AtomicIOError("ambiguous terminal proof is unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _remove_authoritative_terminal(
+    authority: _RunDirectoryAuthority,
+) -> Exception | None:
+    try:
+        os.unlink(RESULT_FILE, dir_fd=authority.descriptor)
+        os.fsync(authority.descriptor)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return error
+    try:
+        os.stat(RESULT_FILE, dir_fd=authority.descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return error
+    return AtomicIOError("authoritative terminal filename still exists")
+
+
+def _quarantine_ambiguous_terminal(
+    authority: _RunDirectoryAuthority,
+    proof: ArtifactDescriptor,
+    terminal: dict[str, object],
+) -> None:
+    expected = canonical_json_bytes(terminal)
+    quarantine = f".{RESULT_FILE}.quarantine-{proof.sha256}"
+    try:
+        authority.revalidate()
+        if proof.relative_path != RESULT_FILE:
+            raise AtomicIOError("ambiguous terminal proof has the wrong path")
+        _read_authoritative_file(authority, RESULT_FILE, expected, proof)
+        os.link(
+            RESULT_FILE,
+            quarantine,
+            src_dir_fd=authority.descriptor,
+            dst_dir_fd=authority.descriptor,
+            follow_symlinks=False,
+        )
+        os.fsync(authority.descriptor)
+        _read_authoritative_file(authority, quarantine, expected, proof)
+        removal_error = _remove_authoritative_terminal(authority)
+        if removal_error is not None:
+            raise removal_error
+        _read_authoritative_file(authority, quarantine, expected, proof)
+        authority.revalidate()
+    except Exception as error:
+        removal_error = _remove_authoritative_terminal(authority)
+        if removal_error is not None:
+            raise AtomicIOError(
+                "terminal quarantine and authoritative removal both failed"
+            ) from removal_error
+        raise AtomicIOError("terminal quarantine could not be proven") from error
 
 
 def build_handover_result_document(
@@ -586,60 +889,185 @@ def publish_handover_evidence(
     """Publish all four stage files and then their digest-bound terminal record."""
 
     if set(stage_documents) != set(EVIDENCE_ORDER):
-        raise ValueError("stage documents must use the exact evidence filename set")
-    descriptors: list[ArtifactDescriptor] = []
-    for filename in EVIDENCE_ORDER:
-        document = stage_documents[filename]
-        if type(document) is not dict:
-            raise TypeError(f"stage document must be an exact dict: {filename}")
-        descriptor = validate_and_publish_stage(
-            contract,
-            _STAGE_SCHEMAS[filename],
-            run_directory,
-            filename,
-            document,
+        raise EvidencePublicationError(
+            (
+                PublicationFailure(
+                    RESULT_FILE,
+                    "input_validation",
+                    ValueError(
+                        "stage documents must use the exact evidence filename set"
+                    ),
+                ),
+            )
         )
-        _require_descriptor_matches(descriptor, filename, document)
-        descriptors.append(descriptor)
+    for filename in EVIDENCE_ORDER:
+        if type(stage_documents[filename]) is not dict:
+            raise EvidencePublicationError(
+                (
+                    PublicationFailure(
+                        filename,
+                        "input_validation",
+                        TypeError("stage document must be an exact dict"),
+                    ),
+                )
+            )
+    derived_cpu_gpu_label = _environment_runtime_label(
+        stage_documents[ENVIRONMENT_FILE]
+    )
+    if cpu_gpu_label != derived_cpu_gpu_label:
+        raise _semantic_failure(
+            "terminal CPU/GPU label disagrees with environment evidence"
+        )
 
-    evidence_files = [
-        {"name": filename, "sha256": descriptor.sha256, "size": descriptor.size}
-        for filename, descriptor in zip(EVIDENCE_ORDER, descriptors)
-    ]
-    first_blocking_reason = next(
-        (
-            stage_documents[filename]["reason"]
+    authority = _RunDirectoryAuthority.retain(
+        Path(run_directory), run_directory_identity
+    )
+    try:
+        descriptors: dict[str, ArtifactDescriptor] = {}
+        failures: list[PublicationFailure] = []
+        for filename in EVIDENCE_ORDER:
+            document = stage_documents[filename]
+            attempt_errors: list[Exception] = []
+            try:
+                authority.revalidate()
+            except Exception as error:
+                attempt_errors.append(error)
+            descriptor: ArtifactDescriptor | None = None
+            try:
+                descriptor = validate_and_publish_stage(
+                    contract,
+                    _STAGE_SCHEMAS[filename],
+                    authority.path,
+                    filename,
+                    document,
+                    parent_fd=authority.descriptor,
+                    expected_parent_identity=authority.parent_identity,
+                )
+                _require_descriptor_matches(descriptor, filename, document)
+            except Exception as error:
+                attempt_errors.append(error)
+            try:
+                authority.revalidate()
+            except Exception as error:
+                attempt_errors.append(error)
+            if attempt_errors:
+                phase = (
+                    "validation"
+                    if any(isinstance(error, ContractError) for error in attempt_errors)
+                    else "write_or_authority"
+                )
+                combined = RuntimeError(
+                    "; ".join(
+                        f"{type(error).__name__}: {error}" for error in attempt_errors
+                    )
+                )
+                failures.append(PublicationFailure(filename, phase, combined))
+            elif descriptor is not None:
+                descriptors[filename] = descriptor
+
+        if failures or tuple(descriptors) != EVIDENCE_ORDER:
+            if not failures:
+                failures.append(
+                    PublicationFailure(
+                        RESULT_FILE,
+                        "descriptor_closure",
+                        AtomicIOError("stage descriptor set is incomplete"),
+                    )
+                )
+            raise EvidencePublicationError(tuple(failures))
+
+        evidence_files = [
+            {
+                "name": filename,
+                "sha256": descriptors[filename].sha256,
+                "size": descriptors[filename].size,
+            }
             for filename in EVIDENCE_ORDER
-            if stage_documents[filename]["status"] != "PASS"
-        ),
-        None,
-    )
-    status = "PASS" if first_blocking_reason is None else "FAIL"
-    reason = "OK" if first_blocking_reason is None else first_blocking_reason
-    bundle_sha256 = hashlib.sha256(canonical_json_bytes(evidence_files)).hexdigest()
-    terminal = build_handover_result_document(
-        status=status,
-        reason=reason,
-        started_at=started_at,
-        finished_at=finished_at,
-        accepted_implementation_commit=accepted_implementation_commit,
-        repository_root=repository_root,
-        data_root=data_root,
-        run_directory=run_directory_identity,
-        cpu_gpu_label=cpu_gpu_label,
-        evidence_files=evidence_files,
-        bundle_sha256=bundle_sha256,
-        first_blocking_reason=first_blocking_reason,
-    )
-    terminal_descriptor = validate_and_publish_stage(
-        contract,
-        "fsrvln-handover-result-v1",
-        run_directory,
-        RESULT_FILE,
-        terminal,
-    )
-    _require_descriptor_matches(terminal_descriptor, RESULT_FILE, terminal)
-    return terminal_descriptor
+        ]
+        first_blocking_reason = next(
+            (
+                stage_documents[filename]["reason"]
+                for filename in BLOCKING_ORDER
+                if stage_documents[filename]["status"] != "PASS"
+            ),
+            None,
+        )
+        status = "PASS" if first_blocking_reason is None else "FAIL"
+        reason = "OK" if first_blocking_reason is None else first_blocking_reason
+        bundle_sha256 = hashlib.sha256(canonical_json_bytes(evidence_files)).hexdigest()
+        terminal = build_handover_result_document(
+            status=status,
+            reason=reason,
+            started_at=started_at,
+            finished_at=finished_at,
+            accepted_implementation_commit=accepted_implementation_commit,
+            repository_root=repository_root,
+            data_root=data_root,
+            run_directory=authority.identity,
+            cpu_gpu_label=derived_cpu_gpu_label,
+            evidence_files=evidence_files,
+            bundle_sha256=bundle_sha256,
+            first_blocking_reason=first_blocking_reason,
+        )
+        terminal_descriptor: ArtifactDescriptor | None = None
+        try:
+            authority.revalidate()
+            terminal_descriptor = validate_and_publish_stage(
+                contract,
+                "fsrvln-handover-result-v1",
+                authority.path,
+                RESULT_FILE,
+                terminal,
+                parent_fd=authority.descriptor,
+                expected_parent_identity=authority.parent_identity,
+            )
+            _require_descriptor_matches(terminal_descriptor, RESULT_FILE, terminal)
+            authority.revalidate()
+        except AtomicPublicationAmbiguity as error:
+            quarantine_error: Exception | None = None
+            try:
+                _quarantine_ambiguous_terminal(
+                    authority, error.expected_artifact, terminal
+                )
+            except Exception as observed:
+                quarantine_error = observed
+            detail = RuntimeError(
+                f"{error}; quarantine="
+                f"{'PROVEN' if quarantine_error is None else quarantine_error}"
+            )
+            raise EvidencePublicationError(
+                (PublicationFailure(RESULT_FILE, "ambiguous_terminal", detail),)
+            ) from error
+        except Exception as error:
+            quarantine_error: Exception | None = None
+            if terminal_descriptor is not None:
+                try:
+                    _quarantine_ambiguous_terminal(
+                        authority, terminal_descriptor, terminal
+                    )
+                except Exception as observed:
+                    quarantine_error = observed
+            detail = (
+                error
+                if quarantine_error is None
+                else RuntimeError(f"{error}; quarantine={quarantine_error}")
+            )
+            raise EvidencePublicationError(
+                (PublicationFailure(RESULT_FILE, "terminal", detail),)
+            ) from error
+        if terminal_descriptor is None:
+            raise EvidencePublicationError(
+                (
+                    PublicationFailure(
+                        RESULT_FILE,
+                        "terminal",
+                        AtomicIOError("terminal descriptor is absent"),
+                    ),
+                )
+            )
+        return terminal_descriptor
+    finally:
+        authority.close()
 
 
 publish_evidence_bundle = publish_handover_evidence
