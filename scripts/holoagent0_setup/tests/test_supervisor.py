@@ -4848,12 +4848,7 @@ def test_production_tracked_file_inventory_covers_code_outside_contract_root():
         ".git" not in path.relative_to(REPOSITORY_ROOT).parts
         for path in tracked.regular_paths
     )
-    assert tracked.symlinks == (
-        (
-            REPOSITORY_ROOT / "fsr_vln/checkpoints",
-            "dd9ed2846596bfad50a8d2619dcaa54f68f7a32a",
-        ),
-    )
+    assert tracked.symlinks == ()
 
 
 def test_supervisor_audit_violation_fails_network_gate_even_without_trace(
