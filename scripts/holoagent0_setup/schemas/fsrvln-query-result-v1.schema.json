@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "holoagent0.fsrvln.query-result.v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "reason",
+    "started_at",
+    "finished_at",
+    "query_sha256",
+    "execution_count",
+    "result"
+  ],
+  "properties": {
+    "schema_version": {"const": "holoagent0.fsrvln.query-result.v1"},
+    "status": {"type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"]},
+    "reason": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "query_sha256": {"$ref": "#/$defs/sha256"},
+    "execution_count": {"type": "integer", "minimum": 0},
+    "result": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/result"}
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "graphCounts": {
+      "type": "object",
+      "required": ["floors", "rooms", "objects"],
+      "properties": {
+        "floors": {"type": "integer", "minimum": 0},
+        "rooms": {"type": "integer", "minimum": 0},
+        "objects": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "namedIdentity": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "position": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {"type": "number"}
+    },
+    "orientation": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {"type": "number"}
+    },
+    "result": {
+      "type": "object",
+      "required": [
+        "graph_counts",
+        "graph_identity",
+        "floor_id",
+        "room",
+        "object",
+        "frame_id",
+        "position",
+        "orientation",
+        "structured_query_sha256",
+        "graph_root_sha256",
+        "dataset_root_sha256",
+        "checkpoint_sha256",
+        "room_name_mapping_sha256"
+      ],
+      "properties": {
+        "graph_counts": {"$ref": "#/$defs/graphCounts"},
+        "graph_identity": {"type": "string", "minLength": 1},
+        "floor_id": {"type": "string", "minLength": 1},
+        "room": {"$ref": "#/$defs/namedIdentity"},
+        "object": {"$ref": "#/$defs/namedIdentity"},
+        "frame_id": {"type": "string", "minLength": 1},
+        "position": {"$ref": "#/$defs/position"},
+        "orientation": {"$ref": "#/$defs/orientation"},
+        "structured_query_sha256": {"$ref": "#/$defs/sha256"},
+        "graph_root_sha256": {"$ref": "#/$defs/sha256"},
+        "dataset_root_sha256": {"$ref": "#/$defs/sha256"},
+        "checkpoint_sha256": {"$ref": "#/$defs/sha256"},
+        "room_name_mapping_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

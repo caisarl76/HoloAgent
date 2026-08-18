@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "holoagent0.fsrvln.asset-verification.v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "reason",
+    "started_at",
+    "finished_at",
+    "data_root",
+    "asset_lock_sha256",
+    "assets"
+  ],
+  "properties": {
+    "schema_version": {"const": "holoagent0.fsrvln.asset-verification.v1"},
+    "status": {"type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"]},
+    "reason": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "data_root": {"$ref": "#/$defs/pathIdentity"},
+    "asset_lock_sha256": {"$ref": "#/$defs/nullableSha256"},
+    "assets": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "array",
+          "items": {"$ref": "#/$defs/asset"}
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nullableSha256": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/sha256"}
+      ]
+    },
+    "pathIdentity": {
+      "type": "object",
+      "required": ["path", "device", "inode", "mode"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "minLength": 2,
+          "maxLength": 4096
+        },
+        "device": {"type": "integer", "minimum": 0},
+        "inode": {"type": "integer", "minimum": 0},
+        "mode": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "asset": {
+      "type": "object",
+      "required": [
+        "role",
+        "path",
+        "device",
+        "inode",
+        "file_count",
+        "byte_count",
+        "sha256"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": ["graph", "dataset", "checkpoint"]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "minLength": 2,
+          "maxLength": 4096
+        },
+        "device": {"type": "integer", "minimum": 0},
+        "inode": {"type": "integer", "minimum": 0},
+        "file_count": {"type": "integer", "minimum": 0},
+        "byte_count": {"type": "integer", "minimum": 0},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

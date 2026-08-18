@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "holoagent0.fsrvln.handover-result.v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "reason",
+    "started_at",
+    "finished_at",
+    "accepted_implementation_commit",
+    "repository_root",
+    "data_root",
+    "run_directory",
+    "cpu_gpu_label",
+    "evidence_files",
+    "bundle_sha256",
+    "first_blocking_reason",
+    "terminal_filename"
+  ],
+  "properties": {
+    "schema_version": {"const": "holoagent0.fsrvln.handover-result.v1"},
+    "status": {"type": "string", "enum": ["PASS", "FAIL"]},
+    "reason": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "accepted_implementation_commit": {"$ref": "#/$defs/nullableGitSha"},
+    "repository_root": {"$ref": "#/$defs/pathIdentity"},
+    "data_root": {"$ref": "#/$defs/pathIdentity"},
+    "run_directory": {"$ref": "#/$defs/pathIdentity"},
+    "cpu_gpu_label": {"type": ["string", "null"], "minLength": 1},
+    "evidence_files": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        {
+          "type": "object",
+          "required": ["name", "sha256", "size"],
+          "properties": {
+            "name": {"const": "environment.json"},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "size": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["name", "sha256", "size"],
+          "properties": {
+            "name": {"const": "source-verification.json"},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "size": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["name", "sha256", "size"],
+          "properties": {
+            "name": {"const": "asset-verification.json"},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "size": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["name", "sha256", "size"],
+          "properties": {
+            "name": {"const": "query-result.json"},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "size": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        }
+      ],
+      "items": false
+    },
+    "bundle_sha256": {"$ref": "#/$defs/sha256"},
+    "first_blocking_reason": {"type": ["string", "null"], "minLength": 1},
+    "terminal_filename": {"const": "handover-result.json"}
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "PASS"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "accepted_implementation_commit": {"$ref": "#/$defs/gitSha"},
+          "cpu_gpu_label": {"type": "string", "minLength": 1},
+          "first_blocking_reason": {"type": "null"}
+        }
+      },
+      "else": {
+        "properties": {
+          "first_blocking_reason": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "gitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "nullableGitSha": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/gitSha"}
+      ]
+    },
+    "pathIdentity": {
+      "type": "object",
+      "required": ["path", "device", "inode", "mode"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "minLength": 2,
+          "maxLength": 4096
+        },
+        "device": {"type": "integer", "minimum": 0},
+        "inode": {"type": "integer", "minimum": 0},
+        "mode": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  }
+}

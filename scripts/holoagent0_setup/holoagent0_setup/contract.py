@@ -24,6 +24,11 @@ from .atomic_io import canonical_json_bytes
 
 _SCHEMA_FILES = {
     "agentos-plan-v1",
+    "fsrvln-asset-verification-v1",
+    "fsrvln-environment-v1",
+    "fsrvln-handover-result-v1",
+    "fsrvln-query-result-v1",
+    "fsrvln-source-verification-v1",
     "holoagent0-offline-ledger-v1",
     "holoagent0-result-v1",
     "holoagent0-trace-tool-policy-v1",
@@ -36,6 +41,11 @@ _POLICY_FILES = {
 }
 _EXPECTED_SCHEMA_IDS = {
     "agentos-plan-v1": "holoagent.agentos.plan.v1",
+    "fsrvln-asset-verification-v1": "holoagent0.fsrvln.asset-verification.v1",
+    "fsrvln-environment-v1": "holoagent0.fsrvln.environment.v1",
+    "fsrvln-handover-result-v1": "holoagent0.fsrvln.handover-result.v1",
+    "fsrvln-query-result-v1": "holoagent0.fsrvln.query-result.v1",
+    "fsrvln-source-verification-v1": "holoagent0.fsrvln.source-verification.v1",
     "holoagent0-offline-ledger-v1": "holoagent0.offline-ledger.v1",
     "holoagent0-result-v1": "holoagent0.result.v1",
     "holoagent0-trace-tool-policy-v1": "holoagent0.trace-tool-policy.v1",

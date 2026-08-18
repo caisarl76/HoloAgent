@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "holoagent0.fsrvln.environment.v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "reason",
+    "started_at",
+    "finished_at",
+    "os_release",
+    "machine_architecture",
+    "python",
+    "accelerator",
+    "imports",
+    "graph_module_origin"
+  ],
+  "properties": {
+    "schema_version": {"const": "holoagent0.fsrvln.environment.v1"},
+    "status": {"type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"]},
+    "reason": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "os_release": {"type": ["string", "null"], "minLength": 1},
+    "machine_architecture": {"type": ["string", "null"], "minLength": 1},
+    "python": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/python"}
+      ]
+    },
+    "accelerator": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/accelerator"}
+      ]
+    },
+    "imports": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "array",
+          "items": {"$ref": "#/$defs/import"}
+        }
+      ]
+    },
+    "graph_module_origin": {
+      "type": ["string", "null"],
+      "pattern": "^/",
+      "minLength": 2,
+      "maxLength": 4096
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "python": {
+      "type": "object",
+      "required": ["executable", "version"],
+      "properties": {
+        "executable": {
+          "type": "string",
+          "pattern": "^/",
+          "minLength": 2,
+          "maxLength": 4096
+        },
+        "version": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "accelerator": {
+      "type": "object",
+      "required": ["label", "torch_cuda_build", "cuda_available"],
+      "properties": {
+        "label": {"type": "string", "minLength": 1},
+        "torch_cuda_build": {"type": ["string", "null"], "minLength": 1},
+        "cuda_available": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "import": {
+      "type": "object",
+      "required": ["name", "module", "status", "version", "origin", "reason"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "module": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["PASS", "FAIL"]},
+        "version": {"type": ["string", "null"], "minLength": 1},
+        "origin": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "reason": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    }
+  }
+}

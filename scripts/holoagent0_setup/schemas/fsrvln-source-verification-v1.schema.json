@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "holoagent0.fsrvln.source-verification.v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "reason",
+    "started_at",
+    "finished_at",
+    "repository_root",
+    "checkout_commit",
+    "source_lock_commit",
+    "verified_count",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": {"const": "holoagent0.fsrvln.source-verification.v1"},
+    "status": {"type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"]},
+    "reason": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"},
+    "repository_root": {"$ref": "#/$defs/pathIdentity"},
+    "checkout_commit": {"$ref": "#/$defs/nullableGitSha"},
+    "source_lock_commit": {"$ref": "#/$defs/nullableGitSha"},
+    "verified_count": {"type": ["integer", "null"], "minimum": 0},
+    "provenance": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "array",
+          "items": {"$ref": "#/$defs/provenance"}
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "gitSha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "nullableGitSha": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/gitSha"}
+      ]
+    },
+    "pathIdentity": {
+      "type": "object",
+      "required": ["path", "device", "inode", "mode"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "minLength": 2,
+          "maxLength": 4096
+        },
+        "device": {"type": "integer", "minimum": 0},
+        "inode": {"type": "integer", "minimum": 0},
+        "mode": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["commit", "count"],
+      "properties": {
+        "commit": {"$ref": "#/$defs/gitSha"},
+        "count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    }
+  }
+}

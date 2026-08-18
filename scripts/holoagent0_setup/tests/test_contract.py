@@ -14,6 +14,14 @@ from holoagent0_setup.result_policy import ResultPolicy, ResultPolicyError
 PACKAGE_ROOT = Path(__file__).parents[1]
 CONTRACT_ROOT = PACKAGE_ROOT
 SHA256 = "a" * 64
+GIT_SHA = "b" * 40
+FSRVLN_SCHEMA_IDS = {
+    "fsrvln-environment-v1": "holoagent0.fsrvln.environment.v1",
+    "fsrvln-source-verification-v1": "holoagent0.fsrvln.source-verification.v1",
+    "fsrvln-asset-verification-v1": "holoagent0.fsrvln.asset-verification.v1",
+    "fsrvln-query-result-v1": "holoagent0.fsrvln.query-result.v1",
+    "fsrvln-handover-result-v1": "holoagent0.fsrvln.handover-result.v1",
+}
 EVIDENCE_IDENTITY = {
     "pid": 801,
     "pgid": 801,
@@ -25,6 +33,117 @@ EVIDENCE_IDENTITY = {
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _path_identity(path: str) -> dict[str, object]:
+    return {"path": path, "device": 1, "inode": 2, "mode": 16877}
+
+
+def _fsrvln_stage(schema_version: str) -> dict[str, object]:
+    return {
+        "schema_version": schema_version,
+        "status": "PASS",
+        "reason": "OK",
+        "started_at": "2026-08-18T00:00:00Z",
+        "finished_at": "2026-08-18T00:00:01Z",
+    }
+
+
+def _fsrvln_documents() -> dict[str, dict[str, object]]:
+    environment = {
+        **_fsrvln_stage(FSRVLN_SCHEMA_IDS["fsrvln-environment-v1"]),
+        "os_release": "Linux-6.8.0",
+        "machine_architecture": "x86_64",
+        "python": {"executable": "/usr/bin/python3.10", "version": "3.10.12"},
+        "accelerator": {
+            "label": "CPU",
+            "torch_cuda_build": None,
+            "cuda_available": False,
+        },
+        "imports": [
+            {
+                "name": "pytorch",
+                "module": "torch",
+                "status": "PASS",
+                "version": "2.7.1",
+                "origin": "/opt/python/torch/__init__.py",
+                "reason": "OK",
+            }
+        ],
+        "graph_module_origin": "/checkout/fsr_vln/memory/hmsg/graph/graph.py",
+    }
+    source = {
+        **_fsrvln_stage(FSRVLN_SCHEMA_IDS["fsrvln-source-verification-v1"]),
+        "repository_root": _path_identity("/checkout"),
+        "checkout_commit": GIT_SHA,
+        "source_lock_commit": "c" * 40,
+        "verified_count": 73,
+        "provenance": [{"commit": GIT_SHA, "count": 73}],
+    }
+    asset = {
+        **_fsrvln_stage(FSRVLN_SCHEMA_IDS["fsrvln-asset-verification-v1"]),
+        "data_root": _path_identity("/data"),
+        "asset_lock_sha256": SHA256,
+        "assets": [
+            {
+                "role": "graph",
+                "path": "/data/fsr_vln/graph",
+                "device": 1,
+                "inode": 3,
+                "file_count": 4,
+                "byte_count": 5,
+                "sha256": "d" * 64,
+            }
+        ],
+    }
+    query = {
+        **_fsrvln_stage(FSRVLN_SCHEMA_IDS["fsrvln-query-result-v1"]),
+        "query_sha256": "e" * 64,
+        "execution_count": 1,
+        "result": {
+            "graph_counts": {"floors": 1, "rooms": 3, "objects": 497},
+            "graph_identity": "icra_ic4f/graph_20260629211448",
+            "floor_id": "0",
+            "room": {"id": "0_0", "name": "Pantry"},
+            "object": {"id": "0_0_81", "name": "counter"},
+            "frame_id": "map",
+            "position": [-21.5, -15.6, -0.2],
+            "orientation": [0.0, 0.0, 0.0, 1.0],
+            "structured_query_sha256": "e" * 64,
+            "graph_root_sha256": "f" * 64,
+            "dataset_root_sha256": "1" * 64,
+            "checkpoint_sha256": "2" * 64,
+            "room_name_mapping_sha256": "3" * 64,
+        },
+    }
+    evidence_names = (
+        "environment.json",
+        "source-verification.json",
+        "asset-verification.json",
+        "query-result.json",
+    )
+    terminal = {
+        **_fsrvln_stage(FSRVLN_SCHEMA_IDS["fsrvln-handover-result-v1"]),
+        "accepted_implementation_commit": GIT_SHA,
+        "repository_root": _path_identity("/checkout"),
+        "data_root": _path_identity("/data"),
+        "run_directory": _path_identity("/run"),
+        "cpu_gpu_label": "CPU",
+        "evidence_files": [
+            {"name": name, "sha256": f"{index:064x}", "size": index}
+            for index, name in enumerate(evidence_names, start=1)
+        ],
+        "bundle_sha256": "4" * 64,
+        "first_blocking_reason": None,
+        "terminal_filename": "handover-result.json",
+    }
+    return {
+        "fsrvln-environment-v1": environment,
+        "fsrvln-source-verification-v1": source,
+        "fsrvln-asset-verification-v1": asset,
+        "fsrvln-query-result-v1": query,
+        "fsrvln-handover-result-v1": terminal,
+    }
 
 
 PROFILE_GATES = {
@@ -444,6 +563,145 @@ def contract(tmp_path_factory: pytest.TempPathFactory) -> ContractSet:
 @pytest.fixture
 def offline_pass_result() -> dict[str, object]:
     return make_pass_result("workstation_offline")
+
+
+def test_fsrvln_schema_inventory_has_exact_registered_ids(contract: ContractSet):
+    assert {
+        name: contract.schemas[name]["$id"] for name in FSRVLN_SCHEMA_IDS
+    } == FSRVLN_SCHEMA_IDS
+
+
+@pytest.mark.parametrize("schema_name", tuple(FSRVLN_SCHEMA_IDS))
+def test_fsrvln_minimal_documents_validate(contract: ContractSet, schema_name: str):
+    decision = contract.validate_document(schema_name, _fsrvln_documents()[schema_name])
+    assert decision.ok, decision.errors
+
+
+@pytest.mark.parametrize("schema_name", tuple(FSRVLN_SCHEMA_IDS))
+def test_fsrvln_schemas_reject_unknown_top_level_fields(
+    contract: ContractSet, schema_name: str
+):
+    document = _fsrvln_documents()[schema_name]
+    document["local_extension"] = True
+
+    decision = contract.validate_document(schema_name, document)
+
+    assert decision.code == "EVIDENCE_SCHEMA_INVALID"
+    assert not decision.ok
+
+
+@pytest.mark.parametrize(
+    ("schema_name", "nested_path", "field"),
+    (
+        ("fsrvln-environment-v1", ("python",), "executable"),
+        ("fsrvln-source-verification-v1", ("repository_root",), "inode"),
+        ("fsrvln-asset-verification-v1", ("assets", 0), "file_count"),
+        ("fsrvln-query-result-v1", ("result", "room"), "name"),
+        ("fsrvln-handover-result-v1", ("evidence_files", 0), "sha256"),
+    ),
+)
+def test_fsrvln_schemas_require_nested_fields(
+    contract: ContractSet,
+    schema_name: str,
+    nested_path: tuple[str | int, ...],
+    field: str,
+):
+    document = _fsrvln_documents()[schema_name]
+    target = document
+    for part in nested_path:
+        target = target[part]
+    target.pop(field)
+
+    decision = contract.validate_document(schema_name, document)
+
+    assert decision.code == "EVIDENCE_SCHEMA_INVALID"
+    assert not decision.ok
+
+
+@pytest.mark.parametrize(
+    ("schema_name", "nested_path", "field", "replacement"),
+    (
+        ("fsrvln-environment-v1", ("accelerator",), "cuda_available", "false"),
+        ("fsrvln-source-verification-v1", ("provenance", 0), "count", 1.5),
+        ("fsrvln-asset-verification-v1", ("assets", 0), "byte_count", -1),
+        ("fsrvln-query-result-v1", ("result", "object"), "id", 81),
+        ("fsrvln-handover-result-v1", ("run_directory",), "device", -1),
+    ),
+)
+def test_fsrvln_schemas_reject_nested_type_and_range_mutations(
+    contract: ContractSet,
+    schema_name: str,
+    nested_path: tuple[str | int, ...],
+    field: str,
+    replacement: object,
+):
+    document = _fsrvln_documents()[schema_name]
+    target = document
+    for part in nested_path:
+        target = target[part]
+    target[field] = replacement
+
+    decision = contract.validate_document(schema_name, document)
+
+    assert decision.code == "EVIDENCE_SCHEMA_INVALID"
+    assert not decision.ok
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "extra", "out_of_order", "wrong_name", "terminal_name"),
+)
+def test_fsrvln_terminal_requires_exact_evidence_filenames_and_order(
+    contract: ContractSet, mutation: str
+):
+    document = _fsrvln_documents()["fsrvln-handover-result-v1"]
+    if mutation == "missing":
+        document["evidence_files"].pop()
+    elif mutation == "extra":
+        document["evidence_files"].append(
+            {"name": "extra.json", "sha256": SHA256, "size": 1}
+        )
+    elif mutation == "out_of_order":
+        document["evidence_files"][0], document["evidence_files"][1] = (
+            document["evidence_files"][1],
+            document["evidence_files"][0],
+        )
+    elif mutation == "wrong_name":
+        document["evidence_files"][0]["name"] = "local-environment.json"
+    else:
+        document["terminal_filename"] = "result.json"
+
+    assert not contract.validate_document("fsrvln-handover-result-v1", document).ok
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("position", [0.0, 0.0]),
+        ("position", [0.0, 0.0, 0.0, 0.0]),
+        ("position", [0.0, float("inf"), 0.0]),
+        ("orientation", [0.0, 0.0, 1.0]),
+        ("orientation", [0.0, 0.0, 0.0, 1.0, 0.0]),
+        ("orientation", [0.0, 0.0, float("nan"), 1.0]),
+    ),
+)
+def test_fsrvln_query_vectors_have_exact_finite_cardinality(
+    contract: ContractSet, field: str, replacement: list[float]
+):
+    document = _fsrvln_documents()["fsrvln-query-result-v1"]
+    document["result"][field] = replacement
+
+    assert not contract.validate_document("fsrvln-query-result-v1", document).ok
+
+
+def test_fsrvln_stage_and_terminal_status_enums_are_distinct(contract: ContractSet):
+    stage = _fsrvln_documents()["fsrvln-environment-v1"]
+    stage["status"] = "NOT_RUN"
+    assert contract.validate_document("fsrvln-environment-v1", stage).ok
+
+    terminal = _fsrvln_documents()["fsrvln-handover-result-v1"]
+    terminal["status"] = "NOT_RUN"
+    assert not contract.validate_document("fsrvln-handover-result-v1", terminal).ok
 
 
 @pytest.mark.parametrize("mode", tuple(PROFILE_GATES))
