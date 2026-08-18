@@ -523,7 +523,9 @@ def hmsg_query_configuration(
     }
 
 
-def _validate_root_memory_module(name: str, module: Any, memory_root: Path) -> None:
+def _validate_root_namespace_module(
+    name: str, module: Any, namespace_root: Path
+) -> None:
     specification = getattr(module, "__spec__", None)
     origin = getattr(specification, "origin", None)
     if origin not in {None, "namespace"}:
@@ -533,7 +535,7 @@ def _validate_root_memory_module(name: str, module: Any, memory_root: Path) -> N
         if not resolved.is_absolute():
             raise ValueError(f"unexpected {name} module origin: {origin}")
         resolved = resolved.resolve(strict=True)
-        if memory_root not in resolved.parents:
+        if namespace_root not in resolved.parents:
             raise ValueError(f"unexpected {name} module origin: {resolved}")
         return
     locations = getattr(specification, "submodule_search_locations", None)
@@ -545,7 +547,7 @@ def _validate_root_memory_module(name: str, module: Any, memory_root: Path) -> N
         Path(location).resolve(strict=True) for location in locations
     )
     if not resolved_locations or any(
-        location != memory_root and memory_root not in location.parents
+        location != namespace_root and namespace_root not in location.parents
         for location in resolved_locations
     ):
         raise ValueError(
@@ -568,28 +570,39 @@ def import_root_hmsg_runtime(
         raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
 
     fsr_root = paths.repository_root / "fsr_vln"
-    memory_root = fsr_root / "memory"
-    fsr_path = str(fsr_root)
+    namespace_roots = {
+        "memory": fsr_root / "memory",
+        "perception": fsr_root / "perception",
+    }
     expected_module_path = fsr_root / "memory/hmsg/graph/graph.py"
     original_sys_path = list(sys.path)
     original_sys_modules = dict(sys.modules)
-    original_memory_modules = {
+    original_repository_modules = {
         name: module
         for name, module in sys.modules.items()
-        if name == "memory" or name.startswith("memory.")
+        if any(
+            name == namespace or name.startswith(f"{namespace}.")
+            for namespace in namespace_roots
+        )
     }
-    for name in tuple(original_memory_modules):
+    for name in tuple(original_repository_modules):
         sys.modules.pop(name, None)
-    memory_module = ModuleType("memory")
-    memory_specification = importlib.machinery.ModuleSpec(
-        "memory", loader=None, is_package=True
-    )
-    memory_specification.submodule_search_locations = [str(memory_root)]
-    memory_module.__spec__ = memory_specification
-    memory_module.__path__ = [str(memory_root)]
-    memory_module.__package__ = "memory"
-    sys.modules["memory"] = memory_module
-    sys.path.insert(0, fsr_path)
+    for namespace, namespace_root in namespace_roots.items():
+        namespace_module = ModuleType(namespace)
+        namespace_specification = importlib.machinery.ModuleSpec(
+            namespace, loader=None, is_package=True
+        )
+        namespace_specification.submodule_search_locations = [str(namespace_root)]
+        namespace_module.__spec__ = namespace_specification
+        namespace_module.__path__ = [str(namespace_root)]
+        namespace_module.__package__ = namespace
+        sys.modules[namespace] = namespace_module
+    fsr_resolved = fsr_root.resolve(strict=True)
+    sys.path[:] = [
+        entry
+        for entry in sys.path
+        if Path(entry or ".").resolve(strict=False) != fsr_resolved
+    ]
     try:
         graph_module = importlib.import_module("memory.hmsg.graph.graph")
         OmegaConf = importlib.import_module("omegaconf").OmegaConf
@@ -609,9 +622,10 @@ def import_root_hmsg_runtime(
             or module_path != expected_module_path
         ):
             raise ValueError(f"unexpected HMSG module origin: {module_path}")
-        for name, module in tuple(sys.modules.items()):
-            if name == "memory" or name.startswith("memory."):
-                _validate_root_memory_module(name, module, memory_root)
+        for namespace, namespace_root in namespace_roots.items():
+            for name, module in tuple(sys.modules.items()):
+                if name == namespace or name.startswith(f"{namespace}."):
+                    _validate_root_namespace_module(name, module, namespace_root)
         return graph_module, OmegaConf, module_path
     except SemanticGateError:
         raise

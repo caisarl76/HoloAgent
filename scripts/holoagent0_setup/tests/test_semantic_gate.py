@@ -67,6 +67,7 @@ def _portable_handover_paths(tmp_path: Path) -> HandoverPaths:
     graph_module = repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
     graph_module.parent.mkdir(parents=True)
     graph_module.write_text("SOURCE = 'root'\n", encoding="utf-8")
+    (repository_root / "fsr_vln/perception").mkdir()
     graph = (
         data_root
         / "fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/graph_20260629211448"
@@ -124,6 +125,14 @@ def _memory_module_snapshot():
         name: module
         for name, module in sys.modules.items()
         if name == "memory" or name.startswith("memory.")
+    }
+
+
+def _perception_module_snapshot():
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "perception" or name.startswith("perception.")
     }
 
 
@@ -382,10 +391,11 @@ def test_root_hmsg_runtime_import_uses_exact_root_origin_and_restores_sys_path(
     graph_module = _fake_graph_module(expected)
     omega_conf = object()
     imports = []
+    before = tuple(sys.path)
 
     def import_module(name):
         imports.append((name, tuple(sys.path)))
-        assert sys.path[0] == str(paths.repository_root / "fsr_vln")
+        assert tuple(sys.path) == before
         if name == "memory.hmsg.graph.graph":
             return graph_module
         if name == "omegaconf":
@@ -395,7 +405,6 @@ def test_root_hmsg_runtime_import_uses_exact_root_origin_and_restores_sys_path(
     monkeypatch.setattr(
         "holoagent0_setup.semantic_gate.importlib.import_module", import_module
     )
-    before = tuple(sys.path)
 
     loaded_module, loaded_omega_conf, origin = import_root_hmsg_runtime(paths)
 
@@ -485,6 +494,77 @@ def test_root_hmsg_runtime_does_not_execute_competing_regular_memory_package(
     assert tuple(sys.path) == before_path
 
 
+def test_root_hmsg_runtime_does_not_execute_untracked_local_omegaconf_shadow(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    fsr_root = paths.repository_root / "fsr_vln"
+    shadow_marker = tmp_path / "local-omegaconf-executed"
+    (fsr_root / "omegaconf.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(shadow_marker)!r}).write_text('executed')\n"
+        "raise RuntimeError('untracked OmegaConf shadow executed')\n",
+        encoding="utf-8",
+    )
+    environment = tmp_path / "environment"
+    environment.mkdir()
+    (environment / "omegaconf.py").write_text(
+        "class OmegaConf:\n    SOURCE = 'environment'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delitem(sys.modules, "omegaconf", raising=False)
+    monkeypatch.syspath_prepend(str(environment))
+    monkeypatch.syspath_prepend(str(fsr_root))
+    before_path = tuple(sys.path)
+
+    graph_module, omega_conf, _origin = import_root_hmsg_runtime(paths)
+
+    assert graph_module.SOURCE == "root"
+    assert omega_conf.SOURCE == "environment"
+    assert not shadow_marker.exists()
+    assert tuple(sys.path) == before_path
+
+
+def test_root_hmsg_runtime_isolates_exact_local_perception_from_competing_package(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    fsr_root = paths.repository_root / "fsr_vln"
+    local_helper = fsr_root / "perception/helpers.py"
+    local_helper.write_text("SOURCE = 'root perception'\n", encoding="utf-8")
+    (fsr_root / "memory/hmsg/graph/graph.py").write_text(
+        "from perception import helpers\nSOURCE = helpers.SOURCE\n",
+        encoding="utf-8",
+    )
+    hostile = tmp_path / "hostile"
+    hostile_perception = hostile / "perception"
+    hostile_perception.mkdir(parents=True)
+    hostile_marker = tmp_path / "hostile-perception-executed"
+    (hostile_perception / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(hostile_marker)!r}).write_text('executed')\n",
+        encoding="utf-8",
+    )
+    (hostile_perception / "helpers.py").write_text(
+        "SOURCE = 'hostile perception'\n", encoding="utf-8"
+    )
+    for name in tuple(_perception_module_snapshot()):
+        monkeypatch.delitem(sys.modules, name)
+    omega_module = ModuleType("omegaconf")
+    omega_module.OmegaConf = object()
+    monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
+    monkeypatch.syspath_prepend(str(hostile))
+    before_path = tuple(sys.path)
+
+    graph_module, _omega_conf, _origin = import_root_hmsg_runtime(paths)
+
+    assert graph_module.SOURCE == "root perception"
+    assert Path(graph_module.helpers.__file__) == local_helper
+    assert not hostile_marker.exists()
+    assert _perception_module_snapshot() == {}
+    assert tuple(sys.path) == before_path
+
+
 def test_root_hmsg_runtime_ignores_mixed_cache_and_restores_exact_objects(
     tmp_path, monkeypatch
 ):
@@ -512,6 +592,41 @@ def test_root_hmsg_runtime_ignores_mixed_cache_and_restores_exact_objects(
     assert tuple(sys.path) == before_path
 
 
+def test_root_hmsg_runtime_ignores_and_restores_stale_perception_cache(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    fsr_root = paths.repository_root / "fsr_vln"
+    local_helper = fsr_root / "perception/helpers.py"
+    local_helper.write_text("SOURCE = 'root perception'\n", encoding="utf-8")
+    (fsr_root / "memory/hmsg/graph/graph.py").write_text(
+        "from perception import helpers\nSOURCE = helpers.SOURCE\n",
+        encoding="utf-8",
+    )
+    stale_root = ModuleType("perception")
+    stale_root.__path__ = [str(tmp_path / "stale-perception")]
+    stale_helper = ModuleType("perception.helpers")
+    stale_helper.SOURCE = "stale perception"
+    monkeypatch.setitem(sys.modules, "perception", stale_root)
+    monkeypatch.setitem(sys.modules, "perception.helpers", stale_helper)
+    omega_module = ModuleType("omegaconf")
+    omega_module.OmegaConf = object()
+    monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
+    before_modules = _perception_module_snapshot()
+    before_path = tuple(sys.path)
+
+    graph_module, _omega_conf, _origin = import_root_hmsg_runtime(paths)
+
+    assert graph_module.SOURCE == "root perception"
+    assert Path(graph_module.helpers.__file__) == local_helper
+    assert _perception_module_snapshot() == before_modules
+    assert all(
+        _perception_module_snapshot()[name] is module
+        for name, module in before_modules.items()
+    )
+    assert tuple(sys.path) == before_path
+
+
 def test_root_hmsg_runtime_restores_cache_and_path_after_import_failure(
     tmp_path, monkeypatch
 ):
@@ -534,7 +649,9 @@ def test_root_hmsg_runtime_restores_cache_and_path_after_import_failure(
 def test_root_hmsg_runtime_restores_the_entire_module_cache(tmp_path, monkeypatch):
     paths = _portable_handover_paths(tmp_path)
     fsr_root = paths.repository_root / "fsr_vln"
-    (fsr_root / "transient_dependency.py").write_text(
+    environment = tmp_path / "environment"
+    environment.mkdir()
+    (environment / "transient_dependency.py").write_text(
         "VALUE = 'transient'\n", encoding="utf-8"
     )
     (fsr_root / "memory/hmsg/graph/graph.py").write_text(
@@ -542,6 +659,7 @@ def test_root_hmsg_runtime_restores_the_entire_module_cache(tmp_path, monkeypatc
         encoding="utf-8",
     )
     monkeypatch.delitem(sys.modules, "transient_dependency", raising=False)
+    monkeypatch.syspath_prepend(str(environment))
     omega_module = ModuleType("omegaconf")
     omega_module.OmegaConf = object()
     monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
