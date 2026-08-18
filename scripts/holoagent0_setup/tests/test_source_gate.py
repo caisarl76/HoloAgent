@@ -520,6 +520,35 @@ def test_prepare_handover_run_directory_rejects_replacement_during_final_revalid
     assert caught.value.reason == "RUN_IDENTITY_CHANGED"
 
 
+def test_prepare_handover_run_directory_rejects_addition_during_final_revalidation(
+    tmp_path, monkeypatch
+):
+    paths = _handover_paths(tmp_path)
+    run = tmp_path / "run"
+    run.mkdir()
+    original_revalidate = source_gate.HandoverPaths.revalidate
+    calls = 0
+
+    def add_file_during_final_revalidation(self):
+        nonlocal calls
+        calls += 1
+        original_revalidate(self)
+        if calls == 2:
+            (run / "late-file").write_bytes(b"late")
+
+    monkeypatch.setattr(
+        source_gate.HandoverPaths,
+        "revalidate",
+        add_file_during_final_revalidation,
+    )
+
+    with pytest.raises(AssetGateError) as caught:
+        prepare_handover_run_directory(run, paths)
+
+    assert calls == 2
+    assert caught.value.reason == "RUN_DIRECTORY_NOT_EMPTY"
+
+
 def _approved_paths() -> tuple[str, ...]:
     text = APPROVED_SPEC.read_text(encoding="utf-8")
     block = text.split("Restore the exact 73-path", 1)[1]

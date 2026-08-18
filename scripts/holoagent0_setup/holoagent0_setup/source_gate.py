@@ -1426,6 +1426,11 @@ def prepare_handover_run_directory(path: Path, paths: HandoverPaths) -> PathIden
                 "RUN_IDENTITY_CHANGED",
                 "run_directory or its parent changed during final revalidation",
             )
+        if os.listdir(run_fd):
+            raise AssetGateError(
+                "RUN_DIRECTORY_NOT_EMPTY",
+                f"run_directory changed from empty before return: {run}",
+            )
         return run_identity
     except AssetGateError:
         raise
