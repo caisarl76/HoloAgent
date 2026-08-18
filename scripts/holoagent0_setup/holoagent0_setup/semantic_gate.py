@@ -164,8 +164,13 @@ class RuntimeImportAudit:
         self._active_stack.append(self)
         return self
 
-    def __exit__(self, *_exc_info: object) -> None:
-        self.close()
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc_value: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        self._close(primary_active=exc_type is not None)
 
     def _restore_top_owner(self) -> bool:
         hooks_replaced = not self._hooks_intact()
@@ -176,10 +181,13 @@ class RuntimeImportAudit:
         return hooks_replaced
 
     def close(self) -> None:
+        self._close(primary_active=False)
+
+    def _close(self, *, primary_active: bool) -> None:
         if not self._active:
             return
         if not self._active_stack or self._active_stack[-1] is not self:
-            if sys.exc_info()[0] is None:
+            if not primary_active:
                 raise self._invalid("out-of-order close is forbidden")
             while self._active_stack:
                 owner = self._active_stack[-1]
@@ -188,7 +196,7 @@ class RuntimeImportAudit:
                     break
             return
         hooks_replaced = self._restore_top_owner()
-        if hooks_replaced and sys.exc_info()[0] is None:
+        if hooks_replaced and not primary_active:
             raise self._invalid("import hooks were replaced")
 
     def require_allowed(self) -> None:
@@ -652,7 +660,9 @@ class RealHMSGRetrievalAdapter:
             raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
 
     def close(self) -> None:
-        active_exception = sys.exc_info()[0] is not None
+        self._close(primary_active=False)
+
+    def _close(self, *, primary_active: bool) -> None:
         self._closed = True
         guard = self._llm_guard
         self._llm_guard = None
@@ -666,17 +676,22 @@ class RealHMSGRetrievalAdapter:
         if authority is not None:
             actions.append(authority.close)
         if audit is not None:
-            if not active_exception:
+            if not primary_active:
                 actions.append(audit.require_allowed)
-            actions.append(audit.close)
-        _run_cleanup_actions(tuple(actions), primary_active=active_exception)
+            actions.append(lambda: audit._close(primary_active=primary_active))
+        _run_cleanup_actions(tuple(actions), primary_active=primary_active)
 
     def __enter__(self) -> "RealHMSGRetrievalAdapter":
         self._revalidate_run_authority()
         return self
 
-    def __exit__(self, *_exc_info: object) -> None:
-        self.close()
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc_value: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        self._close(primary_active=exc_type is not None)
 
     def __del__(self) -> None:
         try:
@@ -1011,10 +1026,8 @@ def load_real_hmsg_adapter(
             actions.append(llm_guard.close)
         if run_authority is not None:
             actions.append(run_authority.close)
-        actions.append(import_audit.close)
-        _run_cleanup_actions(
-            tuple(actions), primary_active=sys.exc_info()[0] is not None
-        )
+        actions.append(lambda: import_audit._close(primary_active=True))
+        _run_cleanup_actions(tuple(actions), primary_active=True)
 
     try:
         graph_module, OmegaConf, _module_origin = import_root_hmsg_runtime(paths)

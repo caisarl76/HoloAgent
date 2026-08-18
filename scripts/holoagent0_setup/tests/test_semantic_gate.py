@@ -236,9 +236,37 @@ def test_runtime_import_audit_force_unwinds_out_of_order_close_during_primary_er
         try:
             raise AssertionError("primary programmer failure")
         finally:
-            outer.close()
+            outer._close(primary_active=True)
 
     inner.close()
+    assert semantic_gate_module.RuntimeImportAudit._active_stack == []
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+
+
+def test_runtime_import_audit_reports_out_of_order_close_inside_handled_except():
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+    outer = semantic_gate_module.RuntimeImportAudit()
+    inner = semantic_gate_module.RuntimeImportAudit()
+    outer.__enter__()
+    inner.__enter__()
+    try:
+        try:
+            raise LookupError("handled")
+        except LookupError:
+            with pytest.raises(
+                SemanticGateError,
+                match="RUNTIME_IMPORT_AUDIT_INVALID: out-of-order close",
+            ):
+                outer.close()
+
+        inner.close()
+        outer.close()
+    finally:
+        semantic_gate_module.builtins.__import__ = original_builtin_import
+        importlib.import_module = original_import_module
+
     assert semantic_gate_module.RuntimeImportAudit._active_stack == []
     assert semantic_gate_module.builtins.__import__ is original_builtin_import
     assert importlib.import_module is original_import_module
@@ -261,6 +289,27 @@ def test_runtime_import_audit_detects_hook_tamper_and_restores_originals():
     assert importlib.import_module is original_import_module
 
 
+def test_runtime_import_audit_reports_hook_tamper_inside_handled_except():
+    original_builtin_import = semantic_gate_module.builtins.__import__
+    original_import_module = importlib.import_module
+    audit = semantic_gate_module.RuntimeImportAudit()
+    audit.__enter__()
+
+    try:
+        raise LookupError("handled")
+    except LookupError:
+        importlib.import_module = lambda *_args, **_kwargs: None
+        with pytest.raises(
+            SemanticGateError,
+            match="RUNTIME_IMPORT_AUDIT_INVALID: import hooks were replaced",
+        ):
+            audit.close()
+
+    assert semantic_gate_module.RuntimeImportAudit._active_stack == []
+    assert semantic_gate_module.builtins.__import__ is original_builtin_import
+    assert importlib.import_module is original_import_module
+
+
 def test_runtime_import_audit_hook_tamper_does_not_mask_active_programmer_error():
     original_builtin_import = semantic_gate_module.builtins.__import__
     original_import_module = importlib.import_module
@@ -272,7 +321,7 @@ def test_runtime_import_audit_hook_tamper_does_not_mask_active_programmer_error(
         try:
             raise AssertionError("primary programmer failure")
         finally:
-            audit.close()
+            audit._close(primary_active=True)
 
     assert semantic_gate_module.builtins.__import__ is original_builtin_import
     assert importlib.import_module is original_import_module
@@ -1187,6 +1236,42 @@ def test_real_adapter_closes_run_authority_when_llm_guard_detects_tampering():
     assert closed == [True]
 
 
+def test_real_adapter_reports_llm_guard_tamper_inside_handled_except():
+    def seam(*_args, **_kwargs):
+        raise AssertionError("original LLM seam must not run")
+
+    llm_utils = SimpleNamespace(
+        **{name: seam for name in semantic_gate_module._LLM_UTILS_SEAMS}
+    )
+    graph_module = SimpleNamespace(
+        **{name: seam for name in semantic_gate_module._GRAPH_LLM_SEAMS}
+    )
+    setattr(
+        graph_module,
+        semantic_gate_module._LLM_UTILS_MODULE_ATTRIBUTE,
+        llm_utils,
+    )
+    guard = semantic_gate_module._guard_external_llm_seams(graph_module)
+    adapter = RealHMSGRetrievalAdapter(
+        SimpleNamespace(),
+        graph_identity=EXPECTED_SEMANTIC.graph_identity,
+        llm_guard=guard,
+    )
+
+    try:
+        raise LookupError("handled")
+    except LookupError:
+        graph_module.create_llm_client = seam
+        with pytest.raises(
+            SemanticGateError,
+            match="SEMANTIC_EXTERNAL_LLM_ATTEMPT: guarded seam binding changed: "
+            "create_llm_client",
+        ):
+            adapter.close()
+
+    assert graph_module.create_llm_client is seam
+
+
 @pytest.mark.parametrize(
     "primary_error",
     (
@@ -1194,7 +1279,7 @@ def test_real_adapter_closes_run_authority_when_llm_guard_detects_tampering():
         SemanticGateError("QUERY_FIRST_BLOCKER", "query anticipated failure"),
     ),
 )
-@pytest.mark.parametrize("exit_style", ("finally", "context_manager"))
+@pytest.mark.parametrize("exit_style", ("explicit_rethrow", "context_manager"))
 def test_real_adapter_cleanup_failures_do_not_mask_active_query_error(
     primary_error, exit_style, tmp_path, monkeypatch
 ):
@@ -1253,7 +1338,7 @@ def test_real_adapter_cleanup_failures_do_not_mask_active_query_error(
                 try:
                     adapter.retrieve_structured(EXPECTED_SEMANTIC.query)
                 finally:
-                    adapter.close()
+                    adapter._close(primary_active=True)
     finally:
         os.close(write_descriptor)
         audit.close()
@@ -1624,7 +1709,7 @@ def test_real_adapter_rejects_transient_forbidden_import_during_fixed_query(
     assert "rclpy.transient_probe" not in sys.modules
 
 
-def test_real_adapter_close_does_not_mask_query_programmer_exception_after_forbidden_import(
+def test_real_adapter_context_exit_does_not_mask_query_programmer_exception_after_forbidden_import(
     tmp_path, monkeypatch
 ):
     trigger = _install_transient_forbidden_probe(tmp_path, monkeypatch)
@@ -1655,10 +1740,8 @@ def test_real_adapter_close_does_not_mask_query_programmer_exception_after_forbi
 
     try:
         with pytest.raises(AssertionError, match="query programmer failure"):
-            try:
+            with adapter:
                 adapter.retrieve_structured(EXPECTED_SEMANTIC.query)
-            finally:
-                adapter.close()
     finally:
         os.close(write_descriptor)
         audit.close()

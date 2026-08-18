@@ -2070,6 +2070,9 @@ class _CliAdapter:
     def close(self):
         self.closed = True
 
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        self.close()
+
 
 def _install_cli_fakes(monkeypatch, tmp_path, contract, *, failure=None):
     cli = importlib.import_module("holoagent0_setup.fsrvln_handover")
@@ -2219,6 +2222,50 @@ def test_cli_success_order_runs_the_structured_query_exactly_once(
     assert captured["contexts"]["graph_counts"] == GraphCounts(1, 3, 497)
     assert captured["contexts"]["semantic_result"] == _semantic_result()
     assert adapter.closed
+
+
+def test_cli_outer_audit_tamper_is_recorded_once_and_still_publishes_five_records(
+    monkeypatch, tmp_path, contract
+):
+    cli, _paths, run_directory, calls, captured, _adapter, argv = _install_cli_fakes(
+        monkeypatch, tmp_path, contract
+    )
+    original_import_module = importlib.import_module
+
+    def tamper_import_hook(_repository, _lock):
+        calls.append("source_worktree")
+        importlib.import_module = lambda *_args, **_kwargs: None
+        return _pass_source_verification()
+
+    monkeypatch.setattr(cli, "verify_source_worktree", tamper_import_hook)
+
+    assert cli.main(argv) == 1
+
+    assert importlib.import_module is original_import_module
+    assert calls == [
+        "paths",
+        "run_directory",
+        "checkout_identity",
+        "source_git_objects",
+        "source_worktree",
+        "environment_evidence",
+        "source_evidence",
+        "asset_evidence",
+        "query_evidence",
+        "terminal_evidence",
+    ]
+    documents = captured["documents"]
+    assert documents[SOURCE_FILE]["status"] == "FAIL"
+    assert documents[SOURCE_FILE]["reason"] == "RUNTIME_IMPORT_AUDIT_INVALID"
+    for filename in (ENVIRONMENT_FILE, ASSET_FILE, QUERY_FILE):
+        assert documents[filename]["status"] == "NOT_RUN"
+        assert documents[filename]["reason"] == "RUNTIME_IMPORT_AUDIT_INVALID"
+    assert sorted(path.name for path in run_directory.iterdir()) == sorted(
+        (*EVIDENCE_ORDER, RESULT_FILE)
+    )
+    terminal = json.loads((run_directory / RESULT_FILE).read_bytes())
+    assert terminal["status"] == "FAIL"
+    assert terminal["first_blocking_reason"] == "RUNTIME_IMPORT_AUDIT_INVALID"
 
 
 @pytest.mark.parametrize(
