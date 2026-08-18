@@ -19,7 +19,7 @@ from .semantic_gate import (
     validate_fixture_runtime_environment,
     verify_cyclone_roles,
 )
-from .source_gate import HandoverPaths
+from .source_gate import AssetGateError, HandoverPaths
 
 
 QUERY_TOPIC = "/holoagent0/semantic_fixture_query"
@@ -107,7 +107,7 @@ def build_ros_node(adapter: HMSGRetrievalAdapter):
 
 
 def _parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--repository-root", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--run-directory", type=Path, required=True)
@@ -126,20 +126,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SemanticGateError(
             "SEMANTIC_CARDINALITY_MISMATCH", "timeout must be in (0, 60] seconds"
         )
-    paths = HandoverPaths.from_roots(
-        arguments.repository_root,
-        arguments.data_root,
-    )
-    cyclone = verify_cyclone_roles(paths)
-    validate_fixture_runtime_environment(cyclone, os.environ)
-    adapter = load_real_hmsg_adapter(paths, arguments.run_directory)
     try:
-        import rclpy
-    except ImportError as error:
-        raise SemanticGateError("SEMANTIC_ROS_UNAVAILABLE", str(error)) from error
+        paths = HandoverPaths.from_roots(
+            arguments.repository_root,
+            arguments.data_root,
+        )
+    except AssetGateError as error:
+        raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
+    adapter = load_real_hmsg_adapter(paths, arguments.run_directory)
     node = None
     initialized = False
     try:
+        try:
+            import rclpy
+        except ImportError as error:
+            raise SemanticGateError("SEMANTIC_ROS_UNAVAILABLE", str(error)) from error
+        cyclone = verify_cyclone_roles(paths)
+        validate_fixture_runtime_environment(cyclone, os.environ)
         rclpy.init(args=[])
         initialized = True
         node = build_ros_node(adapter)
@@ -161,11 +164,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     finally:
         try:
-            if node is not None:
-                node.destroy_node()
+            try:
+                if node is not None:
+                    node.destroy_node()
+            finally:
+                if initialized and rclpy.ok():
+                    rclpy.shutdown()
         finally:
-            if initialized and rclpy.ok():
-                rclpy.shutdown()
+            close_adapter = getattr(adapter, "close", None)
+            if callable(close_adapter):
+                close_adapter()
     return 0
 
 

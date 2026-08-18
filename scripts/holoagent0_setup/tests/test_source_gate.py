@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import inspect
 import json
@@ -74,6 +75,27 @@ def _make_handover_layout(tmp_path):
 
 def _handover_paths(tmp_path):
     return HandoverPaths.from_roots(*_make_handover_layout(tmp_path))
+
+
+def _portable_verified_lock(paths):
+    lock = load_asset_lock(paths)
+    manifests = tuple(
+        canonical_asset_manifest(getattr(paths, role))
+        for role in ("graph", "dataset", "checkpoint")
+    )
+    specs = tuple(
+        replace(
+            next(asset for asset in lock.assets if asset.role == role),
+            file_count=manifest.file_count,
+            byte_count=manifest.byte_count,
+            sha256=manifest.sha256,
+            files=manifest.files,
+        )
+        for role, manifest in zip(("graph", "dataset", "checkpoint"), manifests)
+    )
+    return source_gate.VerifiedAssetLock(
+        lock=replace(lock, assets=specs), manifests=manifests
+    )
 
 
 def test_handover_paths_derives_the_exact_roles_and_retains_identity(tmp_path):
@@ -525,6 +547,57 @@ def test_prepare_handover_run_directory_accepts_empty_existing_real_directory(
     assert identity.path == run
     assert identity.inode == run.stat().st_ino
     assert stat.S_IMODE(identity.mode) == 0o750
+
+
+def test_retained_run_directory_authority_uses_fd_path_and_detects_swap(tmp_path):
+    paths = _handover_paths(tmp_path)
+    run = tmp_path / "run"
+    identity = prepare_handover_run_directory(run, paths)
+
+    with source_gate.open_handover_run_directory(paths, identity) as authority:
+        descriptor = int(authority.descriptor_path.name)
+        assert os.path.samefile(authority.descriptor_path, run)
+        run.rename(tmp_path / "original-run")
+        run.mkdir()
+        with pytest.raises(AssetGateError, match="RUN_IDENTITY_CHANGED"):
+            authority.revalidate()
+
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_retained_asset_use_authority_binds_descriptors_and_detects_content_drift(
+    tmp_path,
+):
+    repository_root, data_root = _make_handover_layout(tmp_path)
+    asset_lock = (
+        repository_root / "scripts/holoagent0_setup/locks/icra_ic4f-assets-v1.json"
+    )
+    asset_lock.write_bytes(ASSET_LOCK.read_bytes())
+    paths = HandoverPaths.from_roots(repository_root, data_root)
+    (paths.graph / "graph.bin").write_bytes(b"graph")
+    (paths.dataset / "frame.bin").write_bytes(b"dataset")
+    verification = _portable_verified_lock(paths)
+
+    with source_gate.open_handover_asset_use(paths, verification) as authority:
+        descriptors = tuple(
+            int(authority.descriptor_path(role).name)
+            for role in ("graph", "checkpoint")
+        )
+        assert os.path.samefile(authority.descriptor_path("graph"), paths.graph)
+        assert os.path.samefile(
+            authority.descriptor_path("checkpoint"), paths.checkpoint
+        )
+        paths.checkpoint.write_bytes(b"checkpoinX")
+        with pytest.raises(
+            AssetGateError,
+            match="ASSET_(?:INVENTORY_MISMATCH|IDENTITY_CHANGED)",
+        ):
+            authority.revalidate()
+
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_prepare_handover_run_directory_rejects_relative_path(tmp_path):

@@ -1575,6 +1575,195 @@ def prepare_handover_run_directory(path: Path, paths: HandoverPaths) -> PathIden
             os.close(parent_fd)
 
 
+class HandoverRunDirectoryAuthority:
+    """Retain the exact prepared run directory through its consumer lifetime."""
+
+    def __init__(
+        self, paths: HandoverPaths, identity: PathIdentity, descriptor: int
+    ) -> None:
+        self._paths = paths
+        self._identity = identity
+        self._descriptor = descriptor
+
+    @property
+    def descriptor_path(self) -> Path:
+        if self._descriptor < 0:
+            raise AssetGateError("RUN_IDENTITY_CHANGED", "run authority is closed")
+        return Path(f"/proc/self/fd/{self._descriptor}")
+
+    def revalidate(self) -> None:
+        if self._descriptor < 0:
+            raise AssetGateError("RUN_IDENTITY_CHANGED", "run authority is closed")
+        self._paths.revalidate()
+        try:
+            opened = os.fstat(self._descriptor)
+            current = _snapshot_handover_path(
+                self._identity.path, "run_directory", "directory"
+            )
+        except (AssetGateError, OSError) as error:
+            raise AssetGateError("RUN_IDENTITY_CHANGED", str(error)) from error
+        if current != self._identity or _identity_triplet(opened) != (
+            self._identity.device,
+            self._identity.inode,
+            self._identity.mode,
+        ):
+            raise AssetGateError(
+                "RUN_IDENTITY_CHANGED", "run_directory no longer matches authority"
+            )
+
+    def close(self) -> None:
+        if self._descriptor >= 0:
+            os.close(self._descriptor)
+            self._descriptor = -1
+
+    def __enter__(self) -> "HandoverRunDirectoryAuthority":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+
+def open_handover_run_directory(
+    paths: HandoverPaths, identity: PathIdentity
+) -> HandoverRunDirectoryAuthority:
+    """Open a prepared run directory and retain its descriptor authority."""
+    if not isinstance(paths, HandoverPaths) or not isinstance(identity, PathIdentity):
+        raise AssetGateError(
+            "RUN_PATH_INVALID", "validated handover paths and run identity are required"
+        )
+    confirmed = prepare_handover_run_directory(identity.path, paths)
+    if confirmed != identity:
+        raise AssetGateError(
+            "RUN_IDENTITY_CHANGED", "run_directory changed before authority opened"
+        )
+    descriptor = -1
+    try:
+        descriptor = _open_absolute_no_follow(identity.path, directory=True)
+        authority = HandoverRunDirectoryAuthority(paths, identity, descriptor)
+        authority.revalidate()
+        return authority
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+class HandoverAssetUseAuthority:
+    """Retain verified graph/checkpoint descriptors through HMSG loading."""
+
+    def __init__(
+        self,
+        paths: HandoverPaths,
+        assets: tuple[AssetSpec, ...],
+        descriptors: dict[str, int],
+    ) -> None:
+        self._paths = paths
+        self._assets = assets
+        self._descriptors = descriptors
+
+    def descriptor_path(self, role: str) -> Path:
+        descriptor = self._descriptors.get(role, -1)
+        if descriptor < 0:
+            raise AssetGateError(
+                "ASSET_IDENTITY_CHANGED", f"{role} authority is closed or unavailable"
+            )
+        return Path(f"/proc/self/fd/{descriptor}")
+
+    def revalidate(self) -> None:
+        self._paths.revalidate()
+        for asset in self._assets:
+            descriptor = self._descriptors.get(asset.role, -1)
+            if descriptor < 0:
+                raise AssetGateError(
+                    "ASSET_IDENTITY_CHANGED", f"{asset.role} authority is closed"
+                )
+            expected = _retained_path_identity(self._paths, asset.role)
+            try:
+                opened = os.fstat(descriptor)
+                if _identity_triplet(opened) != (
+                    expected.device,
+                    expected.inode,
+                    expected.mode,
+                ):
+                    raise AssetGateError(
+                        "ASSET_IDENTITY_CHANGED",
+                        f"retained {asset.role} descriptor changed",
+                    )
+                if stat.S_ISREG(opened.st_mode):
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                measured = _canonical_asset_manifest_from_fd(expected.path, descriptor)
+            except AssetGateError:
+                raise
+            except OSError as error:
+                raise AssetGateError(
+                    "ASSET_IDENTITY_CHANGED", f"{asset.role}: {error}"
+                ) from error
+            if (
+                measured.file_count != asset.file_count
+                or measured.byte_count != asset.byte_count
+                or measured.sha256 != asset.sha256
+                or measured.files != asset.files
+            ):
+                raise AssetGateError("ASSET_INVENTORY_MISMATCH", asset.role)
+        self._paths.revalidate()
+
+    def close(self) -> None:
+        descriptors = self._descriptors
+        self._descriptors = {}
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+
+    def __enter__(self) -> "HandoverAssetUseAuthority":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+
+def open_handover_asset_use(
+    paths: HandoverPaths, verification: VerifiedAssetLock
+) -> HandoverAssetUseAuthority:
+    """Retain graph/checkpoint FDs and remeasure their verified snapshots."""
+    if not isinstance(paths, HandoverPaths) or not isinstance(
+        verification, VerifiedAssetLock
+    ):
+        raise AssetGateError(
+            "ASSET_ROOT_MISMATCH", "validated paths and asset verification are required"
+        )
+    assets_by_role = {asset.role: asset for asset in verification.lock.assets}
+    roles = ("graph", "checkpoint")
+    if set(assets_by_role) != {"graph", "dataset", "checkpoint"}:
+        raise AssetGateError(
+            "ASSET_ROOT_MISMATCH", "asset verification has an unexpected role set"
+        )
+    descriptors: dict[str, int] = {}
+    try:
+        paths.revalidate()
+        for role in roles:
+            expected = _retained_path_identity(paths, role)
+            descriptor = _open_absolute_no_follow(
+                expected.path, directory=role == "graph"
+            )
+            descriptors[role] = descriptor
+            if _identity_triplet(os.fstat(descriptor)) != (
+                expected.device,
+                expected.inode,
+                expected.mode,
+            ):
+                raise AssetGateError(
+                    "ASSET_IDENTITY_CHANGED", f"opened {role} identity changed"
+                )
+        authority = HandoverAssetUseAuthority(
+            paths, tuple(assets_by_role[role] for role in roles), descriptors
+        )
+        authority.revalidate()
+        return authority
+    except Exception:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+        raise
+
+
 def measure_approved_asset_roots(
     paths: HandoverPaths,
 ) -> dict[str, AssetManifest]:

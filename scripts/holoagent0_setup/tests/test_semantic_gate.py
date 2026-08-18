@@ -6,10 +6,11 @@ import importlib.machinery
 import inspect
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -47,7 +48,11 @@ from holoagent0_setup.source_gate import (
     AssetGateError,
     HandoverPaths,
     VerifiedAssetLock,
+    canonical_asset_manifest,
     load_asset_lock,
+    open_handover_asset_use,
+    open_handover_run_directory,
+    prepare_handover_run_directory,
 )
 
 
@@ -61,7 +66,7 @@ def _portable_handover_paths(tmp_path: Path) -> HandoverPaths:
     data_root = tmp_path / "data"
     graph_module = repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
     graph_module.parent.mkdir(parents=True)
-    graph_module.write_text("# portable test module\n", encoding="utf-8")
+    graph_module.write_text("SOURCE = 'root'\n", encoding="utf-8")
     graph = (
         data_root
         / "fsr_vln/scene_graphs_opensource/horizon/icra_ic4f/graph_20260629211448"
@@ -87,7 +92,20 @@ def _portable_handover_paths(tmp_path: Path) -> HandoverPaths:
 
 
 def _verified_lock(paths: HandoverPaths) -> VerifiedAssetLock:
-    return VerifiedAssetLock(lock=load_asset_lock(paths), manifests=())
+    lock = load_asset_lock(paths)
+    roles = ("graph", "dataset", "checkpoint")
+    manifests = tuple(canonical_asset_manifest(getattr(paths, role)) for role in roles)
+    assets = tuple(
+        replace(
+            next(asset for asset in lock.assets if asset.role == role),
+            file_count=manifest.file_count,
+            byte_count=manifest.byte_count,
+            sha256=manifest.sha256,
+            files=manifest.files,
+        )
+        for role, manifest in zip(roles, manifests)
+    )
+    return VerifiedAssetLock(lock=replace(lock, assets=assets), manifests=manifests)
 
 
 def _fake_graph_module(origin: Path, graph_type=object):
@@ -99,6 +117,14 @@ def _fake_graph_module(origin: Path, graph_type=object):
         ),
     )
     return module
+
+
+def _memory_module_snapshot():
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "memory" or name.startswith("memory.")
+    }
 
 
 class FakeAdapter:
@@ -325,16 +351,20 @@ def test_real_hmsg_query_configuration_derives_assets_only_from_handover_paths(
 ):
     paths = _portable_handover_paths(tmp_path)
     run_directory = tmp_path / "run"
-    configuration = hmsg_query_configuration(paths, run_directory)
+    run_identity = prepare_handover_run_directory(run_directory, paths)
 
-    assert configuration == {
-        "main": {
-            "use_gpt": False,
-            "graph_path": str(paths.graph),
-            "save_path": str(run_directory),
-        },
-        "models": {"clip": {"type": "ViT-L/14", "checkpoint": str(paths.checkpoint)}},
-    }
+    with open_handover_run_directory(paths, run_identity) as run_authority:
+        with open_handover_asset_use(paths, _verified_lock(paths)) as asset_authority:
+            configuration = hmsg_query_configuration(
+                paths, asset_authority, run_authority
+            )
+            assert configuration["main"]["use_gpt"] is False
+            assert configuration["models"]["clip"]["type"] == "ViT-L/14"
+            assert os.path.samefile(configuration["main"]["graph_path"], paths.graph)
+            assert os.path.samefile(
+                configuration["models"]["clip"]["checkpoint"], paths.checkpoint
+            )
+            assert os.path.samefile(configuration["main"]["save_path"], run_directory)
 
 
 def test_real_adapter_public_api_accepts_only_paths_and_run_directory():
@@ -400,7 +430,9 @@ def test_root_hmsg_runtime_rejects_agentic_origin(tmp_path, monkeypatch):
         import_root_hmsg_runtime(paths)
 
 
-def test_root_hmsg_runtime_rejects_stale_cached_wrong_module(tmp_path, monkeypatch):
+def test_root_hmsg_runtime_ignores_and_restores_stale_cached_wrong_module(
+    tmp_path, monkeypatch
+):
     paths = _portable_handover_paths(tmp_path)
     stale = tmp_path / "stale/memory/hmsg/graph/graph.py"
     stale.parent.mkdir(parents=True)
@@ -414,8 +446,112 @@ def test_root_hmsg_runtime_rejects_stale_cached_wrong_module(tmp_path, monkeypat
         SimpleNamespace(OmegaConf=object()),
     )
 
-    with pytest.raises(SemanticGateError, match="unexpected HMSG module origin"):
+    stale_module = sys.modules["memory.hmsg.graph.graph"]
+
+    graph_module, _omega_conf, origin = import_root_hmsg_runtime(paths)
+
+    assert graph_module is not stale_module
+    assert graph_module.SOURCE == "root"
+    assert origin == paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    assert sys.modules["memory.hmsg.graph.graph"] is stale_module
+
+
+def test_root_hmsg_runtime_does_not_execute_competing_regular_memory_package(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    hostile = tmp_path / "hostile"
+    marker = tmp_path / "hostile-executed"
+    hostile_memory = hostile / "memory"
+    hostile_memory.mkdir(parents=True)
+    (hostile_memory / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n",
+        encoding="utf-8",
+    )
+    for name in tuple(_memory_module_snapshot()):
+        monkeypatch.delitem(sys.modules, name)
+    omega_module = ModuleType("omegaconf")
+    omega_module.OmegaConf = object()
+    monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
+    monkeypatch.syspath_prepend(str(hostile))
+    before_path = tuple(sys.path)
+
+    graph_module, _omega_conf, origin = import_root_hmsg_runtime(paths)
+
+    assert graph_module.SOURCE == "root"
+    assert origin == paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    assert not marker.exists()
+    assert _memory_module_snapshot() == {}
+    assert tuple(sys.path) == before_path
+
+
+def test_root_hmsg_runtime_ignores_mixed_cache_and_restores_exact_objects(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    stale_root = ModuleType("memory")
+    stale_root.__path__ = [str(tmp_path / "stale-memory")]
+    stale_leaf = _fake_graph_module(tmp_path / "stale/graph.py")
+    monkeypatch.setitem(sys.modules, "memory", stale_root)
+    monkeypatch.setitem(sys.modules, "memory.hmsg.graph.graph", stale_leaf)
+    omega_module = ModuleType("omegaconf")
+    omega_module.OmegaConf = object()
+    monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
+    before_modules = _memory_module_snapshot()
+    before_path = tuple(sys.path)
+
+    graph_module, _omega_conf, _origin = import_root_hmsg_runtime(paths)
+
+    assert graph_module is not stale_leaf
+    assert graph_module.SOURCE == "root"
+    assert _memory_module_snapshot() == before_modules
+    assert all(
+        _memory_module_snapshot()[name] is module
+        for name, module in before_modules.items()
+    )
+    assert tuple(sys.path) == before_path
+
+
+def test_root_hmsg_runtime_restores_cache_and_path_after_import_failure(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    expected = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    expected.write_text("raise RuntimeError('import boom')\n", encoding="utf-8")
+    stale_root = ModuleType("memory")
+    monkeypatch.setitem(sys.modules, "memory", stale_root)
+    before_modules = _memory_module_snapshot()
+    before_path = tuple(sys.path)
+
+    with pytest.raises(SemanticGateError, match="import boom"):
         import_root_hmsg_runtime(paths)
+
+    assert _memory_module_snapshot() == before_modules
+    assert sys.modules["memory"] is stale_root
+    assert tuple(sys.path) == before_path
+
+
+def test_root_hmsg_runtime_restores_the_entire_module_cache(tmp_path, monkeypatch):
+    paths = _portable_handover_paths(tmp_path)
+    fsr_root = paths.repository_root / "fsr_vln"
+    (fsr_root / "transient_dependency.py").write_text(
+        "VALUE = 'transient'\n", encoding="utf-8"
+    )
+    (fsr_root / "memory/hmsg/graph/graph.py").write_text(
+        "import transient_dependency\nSOURCE = transient_dependency.VALUE\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delitem(sys.modules, "transient_dependency", raising=False)
+    omega_module = ModuleType("omegaconf")
+    omega_module.OmegaConf = object()
+    monkeypatch.setitem(sys.modules, "omegaconf", omega_module)
+    before = dict(sys.modules)
+
+    graph_module, _omega_conf, _origin = import_root_hmsg_runtime(paths)
+
+    assert graph_module.SOURCE == "transient"
+    assert set(sys.modules) == set(before)
+    assert all(sys.modules[name] is module for name, module in before.items())
 
 
 def test_real_adapter_uses_verified_paths_configuration_and_room_mapping(
@@ -434,9 +570,18 @@ def test_real_adapter_uses_verified_paths_configuration_and_room_mapping(
     class FakeGraph:
         def __init__(self, configuration):
             observed["constructed"] = configuration
+            observed["graph_bound"] = os.path.samefile(
+                configuration["main"]["graph_path"], paths.graph
+            )
+            observed["checkpoint_bound"] = os.path.samefile(
+                configuration["models"]["clip"]["checkpoint"], paths.checkpoint
+            )
+            observed["run_bound"] = os.path.samefile(
+                configuration["main"]["save_path"], run_directory
+            )
 
         def load_graph(self, graph_path):
-            observed["loaded"] = graph_path
+            observed["load_bound"] = os.path.samefile(graph_path, paths.graph)
 
         def set_room_names(self, *, room_names):
             observed["room_names"] = room_names
@@ -454,24 +599,235 @@ def test_real_adapter_uses_verified_paths_configuration_and_room_mapping(
     adapter = load_real_hmsg_adapter(paths, run_directory)
 
     assert isinstance(adapter, RealHMSGRetrievalAdapter)
-    assert observed == {
-        "configuration": {
-            "main": {
-                "use_gpt": False,
-                "graph_path": str(paths.graph),
-                "save_path": str(run_directory),
-            },
-            "models": {
-                "clip": {
-                    "type": "ViT-L/14",
-                    "checkpoint": str(paths.checkpoint),
-                }
-            },
-        },
-        "constructed": observed["configuration"],
-        "loaded": str(paths.graph),
-        "room_names": ["Pantry", "Office", "Hallway"],
-    }
+    configuration = observed["configuration"]
+    assert configuration["main"]["use_gpt"] is False
+    assert configuration["models"]["clip"]["type"] == "ViT-L/14"
+    assert configuration["main"]["graph_path"].startswith("/proc/self/fd/")
+    assert configuration["main"]["save_path"].startswith("/proc/self/fd/")
+    assert configuration["models"]["clip"]["checkpoint"].startswith("/proc/self/fd/")
+    assert observed["constructed"] is configuration
+    assert observed["graph_bound"] is True
+    assert observed["checkpoint_bound"] is True
+    assert observed["run_bound"] is True
+    assert observed["load_bound"] is True
+    assert observed["room_names"] == ["Pantry", "Office", "Hallway"]
+    run_descriptor = int(Path(configuration["main"]["save_path"]).name)
+    assert os.fstat(run_descriptor)
+    adapter.close()
+    with pytest.raises(OSError):
+        os.fstat(run_descriptor)
+    with pytest.raises(SemanticGateError, match="SEMANTIC_ASSET_UNAVAILABLE"):
+        adapter.graph_counts()
+
+
+def test_real_adapter_detects_checkpoint_drift_during_graph_construction(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    leaked_descriptors = []
+
+    class FakeGraph:
+        def __init__(self, configuration):
+            for value in (
+                configuration["main"]["graph_path"],
+                configuration["main"]["save_path"],
+                configuration["models"]["clip"]["checkpoint"],
+            ):
+                leaked_descriptors.append(int(Path(value).name))
+            paths.checkpoint.write_bytes(b"tampering!")
+
+        def load_graph(self, _graph_path):
+            raise AssertionError("load_graph must not run after checkpoint drift")
+
+    origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "import_root_hmsg_runtime",
+        lambda _bound: (
+            _fake_graph_module(origin, FakeGraph),
+            SimpleNamespace(create=lambda value: value),
+            origin,
+        ),
+    )
+
+    with pytest.raises(SemanticGateError, match="SEMANTIC_ASSET_UNAVAILABLE"):
+        load_real_hmsg_adapter(paths, tmp_path / "run")
+
+    assert leaked_descriptors
+    for descriptor in leaked_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_real_adapter_detects_graph_child_replacement_during_load(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+
+    class FakeGraph:
+        def __init__(self, _configuration):
+            pass
+
+        def load_graph(self, _graph_path):
+            target = paths.graph / "graph.bin"
+            target.rename(paths.graph / "original-graph.bin")
+            target.write_bytes(b"graph")
+
+        def set_room_names(self, *, room_names):
+            raise AssertionError("room mapping must not run after graph drift")
+
+    origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "import_root_hmsg_runtime",
+        lambda _bound: (
+            _fake_graph_module(origin, FakeGraph),
+            SimpleNamespace(create=lambda value: value),
+            origin,
+        ),
+    )
+
+    with pytest.raises(SemanticGateError, match="SEMANTIC_ASSET_UNAVAILABLE"):
+        load_real_hmsg_adapter(paths, tmp_path / "run")
+
+
+def test_real_adapter_detects_run_swap_during_graph_construction(tmp_path, monkeypatch):
+    paths = _portable_handover_paths(tmp_path)
+    run_directory = tmp_path / "run"
+
+    class FakeGraph:
+        def __init__(self, _configuration):
+            run_directory.rename(tmp_path / "original-run")
+            run_directory.mkdir()
+
+        def load_graph(self, _graph_path):
+            raise AssertionError("load_graph must not run after run swap")
+
+    origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "import_root_hmsg_runtime",
+        lambda _bound: (
+            _fake_graph_module(origin, FakeGraph),
+            SimpleNamespace(create=lambda value: value),
+            origin,
+        ),
+    )
+
+    with pytest.raises(SemanticGateError, match="SEMANTIC_ASSET_UNAVAILABLE"):
+        load_real_hmsg_adapter(paths, run_directory)
+
+
+def test_real_adapter_revalidates_run_authority_before_later_graph_access(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    run_directory = tmp_path / "run"
+
+    class FakeGraph:
+        floors = [object()]
+        rooms = [object(), object(), object()]
+        objects = [object()] * 497
+
+        def __init__(self, _configuration):
+            pass
+
+        def load_graph(self, _graph_path):
+            pass
+
+        def set_room_names(self, *, room_names):
+            pass
+
+    origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "import_root_hmsg_runtime",
+        lambda _bound: (
+            _fake_graph_module(origin, FakeGraph),
+            SimpleNamespace(create=lambda value: value),
+            origin,
+        ),
+    )
+    adapter = load_real_hmsg_adapter(paths, run_directory)
+    run_directory.rename(tmp_path / "original-run")
+    run_directory.mkdir()
+
+    try:
+        with pytest.raises(SemanticGateError, match="SEMANTIC_ASSET_UNAVAILABLE"):
+            adapter.graph_counts()
+    finally:
+        adapter.close()
+
+
+def test_real_adapter_revalidates_run_authority_after_later_graph_access(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    run_directory = tmp_path / "run"
+
+    class FakeGraph:
+        rooms = [object(), object(), object()]
+        objects = [object()] * 497
+
+        def __init__(self, _configuration):
+            self._swapped = False
+
+        @property
+        def floors(self):
+            if not self._swapped:
+                self._swapped = True
+                run_directory.rename(tmp_path / "original-run")
+                run_directory.mkdir()
+            return [object()]
+
+        def load_graph(self, _graph_path):
+            pass
+
+        def set_room_names(self, *, room_names):
+            pass
+
+    origin = paths.repository_root / "fsr_vln/memory/hmsg/graph/graph.py"
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "verify_asset_lock",
+        lambda bound: _verified_lock(bound),
+    )
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "import_root_hmsg_runtime",
+        lambda _bound: (
+            _fake_graph_module(origin, FakeGraph),
+            SimpleNamespace(create=lambda value: value),
+            origin,
+        ),
+    )
+    adapter = load_real_hmsg_adapter(paths, run_directory)
+
+    try:
+        with pytest.raises(SemanticGateError, match="SEMANTIC_ASSET_UNAVAILABLE"):
+            adapter.graph_counts()
+    finally:
+        adapter.close()
 
 
 def test_real_adapter_rejects_path_identity_drift_immediately_before_graph_load(
@@ -670,8 +1026,10 @@ def test_cyclone_verification_rejects_handover_identity_drift(tmp_path, monkeypa
         load_then_replace_lock,
     )
 
-    with pytest.raises(SemanticGateError, match="CYCLONE_CONFIG_MISMATCH"):
+    with pytest.raises(SemanticGateError) as caught:
         verify_cyclone_roles(paths)
+
+    assert caught.value.reason == "SEMANTIC_ASSET_UNAVAILABLE"
 
 
 def _valid_graph_snapshot(*, capture=False):
@@ -816,6 +1174,82 @@ def test_fixture_cli_accepts_only_the_two_handover_roots_and_run_controls():
                     "/legacy",
                 ]
             )
+
+    with pytest.raises(SystemExit):
+        fixture_module._parse_arguments(
+            [
+                "--repo",
+                "/repository",
+                "--data",
+                "/data",
+                "--run",
+                "/run",
+            ]
+        )
+
+
+def test_fixture_translates_handover_construction_failure_to_semantic_asset_error(
+    tmp_path,
+):
+    with pytest.raises(SemanticGateError) as caught:
+        fixture_module.main(
+            [
+                "--repository-root",
+                str(tmp_path / "missing-repository"),
+                "--data-root",
+                str(tmp_path / "missing-data"),
+                "--run-directory",
+                str(tmp_path / "run"),
+            ]
+        )
+
+    assert caught.value.reason == "SEMANTIC_ASSET_UNAVAILABLE"
+
+
+def test_fixture_rechecks_cyclone_after_heavy_adapter_loading(tmp_path, monkeypatch):
+    paths = _portable_handover_paths(tmp_path)
+    events = []
+
+    class ClosingAdapter(FakeAdapter):
+        def close(self):
+            events.append("close")
+
+    def load_adapter(_paths, _run_directory):
+        events.append("load_adapter")
+        target = (
+            paths.repository_root
+            / "scripts/holoagent0_setup/config/cyclonedds-offline-p0.xml"
+        )
+        target.write_text(
+            target.read_text().replace('<Domain Id="77">', '<Domain Id="76">')
+        )
+        assert '<Domain Id="76">' in target.read_text()
+        return ClosingAdapter()
+
+    fake_rclpy = SimpleNamespace(
+        init=lambda **_kwargs: events.append("init"),
+        ok=lambda: False,
+        shutdown=lambda: events.append("shutdown"),
+    )
+    monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
+    monkeypatch.setattr(fixture_module, "load_real_hmsg_adapter", load_adapter)
+    monkeypatch.setattr(
+        fixture_module, "validate_fixture_runtime_environment", lambda *_: None
+    )
+
+    with pytest.raises(SemanticGateError, match="CYCLONE_CONFIG_MISMATCH"):
+        fixture_module.main(
+            [
+                "--repository-root",
+                str(paths.repository_root),
+                "--data-root",
+                str(paths.data_root),
+                "--run-directory",
+                str(tmp_path / "run"),
+            ]
+        )
+
+    assert events == ["load_adapter", "close"]
 
 
 @pytest.mark.parametrize("build_fails", [False, True])

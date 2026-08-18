@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import importlib
+import importlib.machinery
 import json
 import math
 from pathlib import Path
 import sys
+from types import ModuleType
 from typing import Any, Mapping, Protocol
 
 from .cyclone_policy import (
@@ -19,8 +21,12 @@ from .cyclone_policy import (
 )
 from .source_gate import (
     AssetGateError,
+    HandoverAssetUseAuthority,
     HandoverPaths,
+    HandoverRunDirectoryAuthority,
     load_asset_lock,
+    open_handover_asset_use,
+    open_handover_run_directory,
     prepare_handover_run_directory,
     verify_asset_lock,
 )
@@ -381,18 +387,69 @@ def evaluate_semantic_fixture(
 class RealHMSGRetrievalAdapter:
     """Thin adapter around the restored HMSG retrieval methods."""
 
-    def __init__(self, graph: Any, *, graph_identity: str) -> None:
+    def __init__(
+        self,
+        graph: Any,
+        *,
+        graph_identity: str,
+        run_authority: HandoverRunDirectoryAuthority | None = None,
+    ) -> None:
         self._graph = graph
         self._graph_identity = graph_identity
+        self._run_authority = run_authority
+        self._closed = False
+
+    def _revalidate_run_authority(self) -> None:
+        if self._closed:
+            raise SemanticGateError(
+                "SEMANTIC_ASSET_UNAVAILABLE", "HMSG adapter is closed"
+            )
+        if self._run_authority is None:
+            return
+        try:
+            self._run_authority.revalidate()
+        except AssetGateError as error:
+            raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
+
+    def close(self) -> None:
+        self._closed = True
+        authority = self._run_authority
+        self._run_authority = None
+        if authority is not None:
+            authority.close()
+
+    def __enter__(self) -> "RealHMSGRetrievalAdapter":
+        self._revalidate_run_authority()
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def graph_counts(self) -> GraphCounts:
-        return GraphCounts(
-            floors=len(self._graph.floors),
-            rooms=len(self._graph.rooms),
-            objects=len(self._graph.objects),
-        )
+        self._revalidate_run_authority()
+        try:
+            return GraphCounts(
+                floors=len(self._graph.floors),
+                rooms=len(self._graph.rooms),
+                objects=len(self._graph.objects),
+            )
+        finally:
+            self._revalidate_run_authority()
 
     def retrieve_structured(self, query: StructuredQuery) -> HMSGSelection:
+        self._revalidate_run_authority()
+        try:
+            return self._retrieve_structured(query)
+        finally:
+            self._revalidate_run_authority()
+
+    def _retrieve_structured(self, query: StructuredQuery) -> HMSGSelection:
         if query.canonical_json() != EXPECTED_SEMANTIC.query.canonical_json():
             _fixture_failure("adapter received an unapproved structured query")
         room_indices = self._graph.query_hmsg_room(
@@ -437,26 +494,63 @@ class RealHMSGRetrievalAdapter:
 
 
 def hmsg_query_configuration(
-    paths: HandoverPaths, run_directory: Path
+    paths: HandoverPaths,
+    asset_authority: HandoverAssetUseAuthority,
+    run_authority: HandoverRunDirectoryAuthority,
 ) -> dict[str, Any]:
     """Build the minimal real-Graph query configuration with owned outputs."""
-    if not isinstance(paths, HandoverPaths):
+    if (
+        not isinstance(paths, HandoverPaths)
+        or not isinstance(asset_authority, HandoverAssetUseAuthority)
+        or not isinstance(run_authority, HandoverRunDirectoryAuthority)
+    ):
         raise AssetGateError(
-            "ASSET_ROOT_MISMATCH", "a validated HandoverPaths instance is required"
+            "ASSET_ROOT_MISMATCH",
+            "validated handover and retained descriptor authorities are required",
         )
     return {
         "main": {
             "use_gpt": False,
-            "graph_path": str(paths.graph),
-            "save_path": str(run_directory),
+            "graph_path": str(asset_authority.descriptor_path("graph")),
+            "save_path": str(run_authority.descriptor_path),
         },
         "models": {
             "clip": {
                 "type": "ViT-L/14",
-                "checkpoint": str(paths.checkpoint),
+                "checkpoint": str(asset_authority.descriptor_path("checkpoint")),
             }
         },
     }
+
+
+def _validate_root_memory_module(name: str, module: Any, memory_root: Path) -> None:
+    specification = getattr(module, "__spec__", None)
+    origin = getattr(specification, "origin", None)
+    if origin not in {None, "namespace"}:
+        if not isinstance(origin, str):
+            raise ValueError(f"unexpected {name} module origin: {origin!r}")
+        resolved = Path(origin)
+        if not resolved.is_absolute():
+            raise ValueError(f"unexpected {name} module origin: {origin}")
+        resolved = resolved.resolve(strict=True)
+        if memory_root not in resolved.parents:
+            raise ValueError(f"unexpected {name} module origin: {resolved}")
+        return
+    locations = getattr(specification, "submodule_search_locations", None)
+    if locations is None:
+        locations = getattr(module, "__path__", None)
+    if locations is None:
+        raise ValueError(f"namespace module {name} has no search locations")
+    resolved_locations = tuple(
+        Path(location).resolve(strict=True) for location in locations
+    )
+    if not resolved_locations or any(
+        location != memory_root and memory_root not in location.parents
+        for location in resolved_locations
+    ):
+        raise ValueError(
+            f"unexpected {name} namespace locations: {resolved_locations!r}"
+        )
 
 
 def import_root_hmsg_runtime(
@@ -474,8 +568,27 @@ def import_root_hmsg_runtime(
         raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
 
     fsr_root = paths.repository_root / "fsr_vln"
+    memory_root = fsr_root / "memory"
     fsr_path = str(fsr_root)
     expected_module_path = fsr_root / "memory/hmsg/graph/graph.py"
+    original_sys_path = list(sys.path)
+    original_sys_modules = dict(sys.modules)
+    original_memory_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "memory" or name.startswith("memory.")
+    }
+    for name in tuple(original_memory_modules):
+        sys.modules.pop(name, None)
+    memory_module = ModuleType("memory")
+    memory_specification = importlib.machinery.ModuleSpec(
+        "memory", loader=None, is_package=True
+    )
+    memory_specification.submodule_search_locations = [str(memory_root)]
+    memory_module.__spec__ = memory_specification
+    memory_module.__path__ = [str(memory_root)]
+    memory_module.__package__ = "memory"
+    sys.modules["memory"] = memory_module
     sys.path.insert(0, fsr_path)
     try:
         graph_module = importlib.import_module("memory.hmsg.graph.graph")
@@ -496,6 +609,9 @@ def import_root_hmsg_runtime(
             or module_path != expected_module_path
         ):
             raise ValueError(f"unexpected HMSG module origin: {module_path}")
+        for name, module in tuple(sys.modules.items()):
+            if name == "memory" or name.startswith("memory."):
+                _validate_root_memory_module(name, module, memory_root)
         return graph_module, OmegaConf, module_path
     except SemanticGateError:
         raise
@@ -504,10 +620,12 @@ def import_root_hmsg_runtime(
             "SEMANTIC_DEPENDENCY_UNAVAILABLE", str(error)
         ) from error
     finally:
-        try:
-            sys.path.remove(fsr_path)
-        except ValueError:
-            pass
+        for name in tuple(sys.modules):
+            if name not in original_sys_modules:
+                sys.modules.pop(name, None)
+        for name, module in original_sys_modules.items():
+            sys.modules[name] = module
+        sys.path[:] = original_sys_path
 
 
 def load_real_hmsg_adapter(
@@ -528,32 +646,39 @@ def load_real_hmsg_adapter(
         raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
 
     graph_module, OmegaConf, _module_origin = import_root_hmsg_runtime(paths)
+    run_authority: HandoverRunDirectoryAuthority | None = None
     try:
         paths.revalidate()
-        confirmed_run_identity = prepare_handover_run_directory(
-            run_identity.path, paths
-        )
-        if confirmed_run_identity != run_identity:
-            raise AssetGateError(
-                "RUN_IDENTITY_CHANGED",
-                "run_directory changed after its initial validation",
+        run_authority = open_handover_run_directory(paths, run_identity)
+        with open_handover_asset_use(paths, verification) as asset_authority:
+            configuration = OmegaConf.create(
+                hmsg_query_configuration(
+                    paths,
+                    asset_authority,
+                    run_authority,
+                )
             )
-        configuration = OmegaConf.create(
-            hmsg_query_configuration(paths, confirmed_run_identity.path)
-        )
-        graph = graph_module.Graph(configuration)
-        paths.revalidate()
-        graph.load_graph(str(paths.graph))
-        paths.revalidate()
-        graph.set_room_names(room_names=list(verification.lock.room_name_mapping))
+            graph = graph_module.Graph(configuration)
+            run_authority.revalidate()
+            asset_authority.revalidate()
+            graph.load_graph(str(asset_authority.descriptor_path("graph")))
+            run_authority.revalidate()
+            asset_authority.revalidate()
+            graph.set_room_names(room_names=list(verification.lock.room_name_mapping))
     except AssetGateError as error:
+        if run_authority is not None:
+            run_authority.close()
         raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
     except Exception as error:
+        if run_authority is not None:
+            run_authority.close()
         raise SemanticGateError(
             "SEMANTIC_DEPENDENCY_UNAVAILABLE", str(error)
         ) from error
     return RealHMSGRetrievalAdapter(
-        graph, graph_identity=verification.lock.graph_identity
+        graph,
+        graph_identity=verification.lock.graph_identity,
+        run_authority=run_authority,
     )
 
 
@@ -597,7 +722,9 @@ def verify_cyclone_roles(paths: HandoverPaths) -> CycloneConfigSet:
         ):
             raise ValueError("asset lock and Cyclone policy disagree")
         return contract
-    except (AssetGateError, CycloneConfigError, OSError, ValueError) as error:
+    except AssetGateError as error:
+        raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
+    except (CycloneConfigError, OSError, ValueError) as error:
         raise SemanticGateError("CYCLONE_CONFIG_MISMATCH", str(error)) from error
 
 
