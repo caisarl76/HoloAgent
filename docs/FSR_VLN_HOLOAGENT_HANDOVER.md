@@ -30,6 +30,7 @@ submodules, inspect the annotated tag, verify the recorded implementation
 commit is an ancestor of the release, then detach at that exact commit:
 
 ```bash
+set -euo pipefail
 REPOSITORY_URL='https://github.com/caisarl76/HoloAgent.git'
 REPOSITORY_ROOT='<replace with an absolute checkout path>'
 ACCEPTED_IMPLEMENTATION_COMMIT='<replace with the signed 40-character commit>'

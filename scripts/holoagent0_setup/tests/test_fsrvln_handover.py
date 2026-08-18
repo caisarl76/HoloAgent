@@ -187,6 +187,28 @@ def test_documentation_commit_field_supports_release_identity_extraction():
     assert completed.stdout == implementation_sha + "\n"
 
 
+def test_documentation_clone_and_ancestry_verification_is_fail_closed():
+    document = (REPOSITORY_ROOT / "docs/FSR_VLN_HOLOAGENT_HANDOVER.md").read_text(
+        encoding="utf-8"
+    )
+    clone_block = document.split("```bash\n", 1)[1].split("\n```", 1)[0]
+
+    assert clone_block.splitlines()[0] == "set -euo pipefail"
+    assert clone_block.index("merge-base --is-ancestor") < clone_block.index(
+        "checkout --detach"
+    )
+    fail_fast = subprocess.run(
+        ["/bin/bash", "-c", "set -euo pipefail\n/bin/false\necho continued"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert fail_fast.returncode != 0
+    assert fail_fast.stdout == ""
+
+
 def _identity(path: Path) -> PathIdentity:
     observed = path.stat()
     return PathIdentity(path, observed.st_dev, observed.st_ino, observed.st_mode)
