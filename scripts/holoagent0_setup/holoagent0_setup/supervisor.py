@@ -51,6 +51,7 @@ from .evidence import (
 )
 from .cyclone_policy import CONFIG_ROLES, CONFIG_SET_SHA256, EXPECTED_CONFIG_SHA256
 from .ledger import LedgerCandidate, LedgerChainError, LedgerHead, LedgerStore
+from .invocation import RunRootAuthority
 from .process_identity import ProcessIdentity
 from .process_identity import read_process_identity
 from .result_policy import ResultPolicy
@@ -105,7 +106,7 @@ _TRACKED_MANIFEST_AUTHORITY_REPO_PATH = (
 )
 _TRACKED_MANIFEST_SELF_OID = "SELF"
 _TRACKED_FILE_MANIFEST_SHA256 = (
-    "28f4180faff1e3ce24cbc618f9d442a8e80759f357422cf11e42ce4e734553d4"
+    "ab50d0f51cd1c5856a571361e58cbc43e98fac0badba4d41672164e3c9de69bc"
 )
 _SAFETY_FACT_REASONS = {
     "safety.workstation_preflight": frozenset(
@@ -1522,6 +1523,7 @@ class BootstrapInvocation:
     facts: BootstrapFacts
     bootstrap_report: Mapping[str, object]
     precommit_signal: str | None = None
+    run_root_authority: RunRootAuthority | None = None
 
 
 @dataclass(frozen=True)
@@ -1591,6 +1593,7 @@ class BootstrapRuntime:
         signal_runtime: SupervisorSignalRuntime | None = None,
         signal_runtime_factory: Callable[[str], SupervisorSignalRuntime] | None = None,
         require_complete_report: bool = False,
+        require_run_root_authority: bool = False,
     ) -> None:
         if type(contract) is not ContractSet:
             raise SupervisorError("bootstrap contract is not exact")
@@ -1612,6 +1615,9 @@ class BootstrapRuntime:
         if type(require_complete_report) is not bool:
             raise SupervisorError("bootstrap report requirement is invalid")
         self._require_complete_report = require_complete_report
+        if type(require_run_root_authority) is not bool:
+            raise SupervisorError("run root authority requirement is invalid")
+        self._require_run_root_authority = require_run_root_authority
 
     @classmethod
     def production(
@@ -1631,6 +1637,7 @@ class BootstrapRuntime:
                 identity_validator=signal_identity_validator,
             ),
             require_complete_report=True,
+            require_run_root_authority=True,
         )
 
     def run(self, invocation: BootstrapInvocation) -> BootstrapState:
@@ -1641,6 +1648,17 @@ class BootstrapRuntime:
         started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         started_monotonic = time.monotonic()
         try:
+            if (
+                self._require_run_root_authority
+                and type(invocation.run_root_authority) is not RunRootAuthority
+            ):
+                raise SupervisorError("production run root authority is missing")
+            if (
+                self._require_run_root_authority
+                and invocation.run_id
+                != invocation.run_root_authority.expected_run_root.name
+            ):
+                raise SupervisorError("production run id authority is inconsistent")
             signal_runtime = (
                 self._signal_runtime_factory(invocation.run_nonce)
                 if self._signal_runtime_factory is not None
@@ -1650,7 +1668,10 @@ class BootstrapRuntime:
                 signal_runtime.start()
             if self._require_complete_report:
                 _validate_bootstrap_report_inputs(invocation.bootstrap_report)
-            run_root.mkdir(mode=0o700, parents=False, exist_ok=False)
+            if self._require_run_root_authority:
+                run_root = invocation.run_root_authority.create(run_root)
+            else:
+                run_root.mkdir(mode=0o700, parents=False, exist_ok=False)
             ledger = LedgerStore.create(
                 run_root / "ledger",
                 self._contract,
@@ -1726,11 +1747,22 @@ class BootstrapRuntime:
             )
         except Exception as error:
             cleanup_error: BaseException | None = None
+            authority = invocation.run_root_authority
+            if (
+                self._require_run_root_authority
+                and type(authority) is RunRootAuthority
+                and not authority.consumed
+            ):
+                try:
+                    authority.close()
+                except Exception as observed_cleanup_error:
+                    cleanup_error = observed_cleanup_error
             if signal_runtime is not None and signal_runtime._started:
                 try:
                     signal_runtime.close(restore_mask=True)
                 except Exception as observed_cleanup_error:
-                    cleanup_error = observed_cleanup_error
+                    if cleanup_error is None:
+                        cleanup_error = observed_cleanup_error
             if cleanup_error is not None:
                 raise SupervisorError(
                     "bootstrap zero-state cleanup failed"

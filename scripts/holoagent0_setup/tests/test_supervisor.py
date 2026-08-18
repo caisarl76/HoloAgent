@@ -21,6 +21,7 @@ import pytest
 import holoagent0_setup.supervisor as supervisor_module
 from holoagent0_setup.constants import OFFLINE_GATE_ORDER
 from holoagent0_setup.contract import ContractSet
+from holoagent0_setup.invocation import RunRootAuthority
 from holoagent0_setup.cyclone_policy import CONFIG_ROLES, EXPECTED_CONFIG_SHA256
 from holoagent0_setup.coordinator import LinuxHandoffMarker, Task4SignalBarrier
 from holoagent0_setup.atomic_io import (
@@ -96,6 +97,15 @@ def _complete_bootstrap_inputs(*, live_fixture_passed=True):
         "rebinding_actions": [],
         "live_fixture_passed": live_fixture_passed,
     }
+
+
+def _production_run_root(tmp_path, label):
+    output_root = tmp_path / f"{label}-output"
+    output_root.mkdir(mode=0o700)
+    output_root.chmod(0o700)
+    suffix = hashlib.sha256(label.encode("utf-8")).hexdigest()[:32]
+    run_id = f"workstation-offline-20260818T010203Z-{suffix}"
+    return output_root / run_id, run_id, RunRootAuthority.open(output_root, run_id)
 
 
 def _gate(result, gate_id):
@@ -614,6 +624,91 @@ def test_bootstrap_runtime_initializes_closed_zero_state(tmp_path):
         (state.run_root / "bootstrap_report.json").read_text(encoding="utf-8")
     )
     assert report["terminal_launch_state"] == state.decision.launch_state
+
+
+def test_production_bootstrap_creates_run_root_through_retained_authority(
+    tmp_path, reviewed_trace_contract, monkeypatch
+):
+    run_root, run_id, authority = _production_run_root(tmp_path, "retained-authority")
+    original_mkdir = Path.mkdir
+    original_create = RunRootAuthority.create
+    authority_calls = []
+
+    def prohibit_run_root_pathname_fallback(path, *args, **kwargs):
+        if path == run_root:
+            pytest.fail("production bootstrap used a pathname mkdir fallback")
+        return original_mkdir(path, *args, **kwargs)
+
+    def count_authority_call(observed_authority, path):
+        authority_calls.append((observed_authority, path))
+        return original_create(observed_authority, path)
+
+    monkeypatch.setattr(Path, "mkdir", prohibit_run_root_pathname_fallback)
+    monkeypatch.setattr(RunRootAuthority, "create", count_authority_call)
+    invocation = BootstrapInvocation(
+        run_root=run_root,
+        run_id=run_id,
+        run_nonce="a" * 64,
+        facts=BootstrapFacts.clean(),
+        bootstrap_report=_complete_bootstrap_inputs(),
+        run_root_authority=authority,
+    )
+
+    state = BootstrapRuntime(
+        reviewed_trace_contract,
+        require_run_root_authority=True,
+    ).run(invocation)
+
+    assert state.run_root == run_root
+    assert stat.S_IMODE(state.run_root.stat().st_mode) == 0o700
+    assert authority.consumed is True
+    assert authority_calls == [(authority, run_root)]
+
+
+def test_production_bootstrap_rejects_missing_run_root_authority(
+    tmp_path, reviewed_trace_contract
+):
+    runtime = BootstrapRuntime(
+        reviewed_trace_contract,
+        require_run_root_authority=True,
+    )
+
+    with pytest.raises(SupervisorError, match="zero-state"):
+        runtime.run(
+            BootstrapInvocation(
+                run_root=tmp_path / "forbidden-path-fallback",
+                run_id="workstation-offline-20260818T010203Z-" + "a" * 32,
+                run_nonce="a" * 64,
+                facts=BootstrapFacts.clean(),
+                bootstrap_report=_complete_bootstrap_inputs(),
+            )
+        )
+
+    assert not (tmp_path / "forbidden-path-fallback").exists()
+
+
+def test_production_bootstrap_binds_run_id_to_run_root_authority(
+    tmp_path, reviewed_trace_contract
+):
+    run_root, _run_id, authority = _production_run_root(tmp_path, "run-id-binding")
+
+    with pytest.raises(SupervisorError, match="zero-state"):
+        BootstrapRuntime(
+            reviewed_trace_contract,
+            require_run_root_authority=True,
+        ).run(
+            BootstrapInvocation(
+                run_root=run_root,
+                run_id="workstation-offline-20260818T010203Z-" + "f" * 32,
+                run_nonce="a" * 64,
+                facts=BootstrapFacts.clean(),
+                bootstrap_report=_complete_bootstrap_inputs(),
+                run_root_authority=authority,
+            )
+        )
+
+    assert authority.consumed is True
+    assert not run_root.exists()
 
 
 def test_bootstrap_state_retains_dynamic_owned_tracee_authority(
@@ -2663,6 +2758,7 @@ def test_production_bootstrap_uses_live_signal_handoff_and_observed_launch_repor
             response_read,
         )
 
+    run_root, run_id, authority = _production_run_root(tmp_path, "production-live")
     bootstrap_runtime = BootstrapRuntime.production(
         reviewed_trace_contract,
         signal_forwarder=lambda _pgid, _name: None,
@@ -2670,11 +2766,12 @@ def test_production_bootstrap_uses_live_signal_handoff_and_observed_launch_repor
     )
     state = bootstrap_runtime.run(
         BootstrapInvocation(
-            run_root=tmp_path / "production-live",
-            run_id="production-live",
+            run_root=run_root,
+            run_id=run_id,
             run_nonce="6" * 64,
             facts=BootstrapFacts.clean(),
             bootstrap_report=_complete_bootstrap_inputs(),
+            run_root_authority=authority,
         )
     )
     assert not (state.run_root / "bootstrap_report.json").exists()
@@ -3255,6 +3352,7 @@ def test_production_precommit_signal_launches_only_finalizer_trace(
     tracer, normalizer, _coordinator = process_identities
     operations = FakeProcessOperations({tracer.pid: tracer, normalizer.pid: normalizer})
     modes = []
+    run_root, run_id, authority = _production_run_root(tmp_path, "precommit-live")
     runtime = BootstrapRuntime.production(
         reviewed_trace_contract,
         signal_forwarder=lambda _pgid, _name: None,
@@ -3262,11 +3360,12 @@ def test_production_precommit_signal_launches_only_finalizer_trace(
     )
     state = runtime.run(
         BootstrapInvocation(
-            run_root=tmp_path / "precommit-live",
-            run_id="precommit-live",
+            run_root=run_root,
+            run_id=run_id,
             run_nonce="5" * 64,
             facts=BootstrapFacts.clean(),
             bootstrap_report=_complete_bootstrap_inputs(),
+            run_root_authority=authority,
         )
     )
     os.kill(os.getpid(), signal.SIGTERM)
@@ -3303,6 +3402,9 @@ def test_production_bootstrap_failure_launches_finalizer_without_full_handoff(
     tracer, normalizer, _coordinator = process_identities
     operations = FakeProcessOperations({tracer.pid: tracer, normalizer.pid: normalizer})
     modes = []
+    run_root, run_id, authority = _production_run_root(
+        tmp_path, "finalizer-bootstrap-failure"
+    )
     runtime = BootstrapRuntime.production(
         reviewed_trace_contract,
         signal_forwarder=lambda _pgid, _name: None,
@@ -3310,11 +3412,12 @@ def test_production_bootstrap_failure_launches_finalizer_without_full_handoff(
     )
     state = runtime.run(
         BootstrapInvocation(
-            run_root=tmp_path / "finalizer-bootstrap-failure",
-            run_id="finalizer-bootstrap-failure",
+            run_root=run_root,
+            run_id=run_id,
             run_nonce="4" * 64,
             facts=BootstrapFacts.clean().replaced(inherited_fd_safe=False),
             bootstrap_report=_complete_bootstrap_inputs(),
+            run_root_authority=authority,
         )
     )
 
@@ -3353,6 +3456,9 @@ def test_full_readiness_deadline_monitors_attached_trace_roles(
             if name != lost_role
         },
     )
+    run_root, run_id, authority = _production_run_root(
+        tmp_path, f"readiness-{lost_role}"
+    )
     runtime = BootstrapRuntime.production(
         reviewed_trace_contract,
         signal_forwarder=lambda _pgid, _name: None,
@@ -3360,11 +3466,12 @@ def test_full_readiness_deadline_monitors_attached_trace_roles(
     )
     state = runtime.run(
         BootstrapInvocation(
-            run_root=tmp_path / f"readiness-{lost_role}",
-            run_id=f"readiness-{lost_role}",
+            run_root=run_root,
+            run_id=run_id,
             run_nonce="2" * 64,
             facts=BootstrapFacts.clean(),
             bootstrap_report=_complete_bootstrap_inputs(),
+            run_root_authority=authority,
         )
     )
     request_read, request_write = os.pipe()
@@ -3441,6 +3548,7 @@ def test_bootstrap_exception_closes_signal_collector_and_restores_mask(
 def test_production_bootstrap_rejects_incomplete_caller_asserted_report(
     tmp_path, reviewed_trace_contract
 ):
+    run_root, run_id, authority = _production_run_root(tmp_path, "incomplete-report")
     runtime = BootstrapRuntime.production(
         reviewed_trace_contract,
         signal_forwarder=lambda _pgid, _name: None,
@@ -3452,19 +3560,22 @@ def test_production_bootstrap_rejects_incomplete_caller_asserted_report(
         with pytest.raises(RuntimeError, match="zero-state"):
             state = runtime.run(
                 BootstrapInvocation(
-                    run_root=tmp_path / "incomplete-report",
-                    run_id="incomplete-report",
+                    run_root=run_root,
+                    run_id=run_id,
                     run_nonce="0" * 64,
                     facts=BootstrapFacts.clean(),
                     bootstrap_report={
                         "schema_version": "holoagent0.bootstrap-report.v1"
                     },
+                    run_root_authority=authority,
                 )
             )
     finally:
         if state is not None and state.signal_runtime._started:
             state.signal_runtime.close(restore_mask=True)
     assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == original_mask
+    assert authority.consumed is True
+    assert not run_root.exists()
 
 
 def test_trace_launch_runtime_collects_not_started_without_launch(
@@ -5094,6 +5205,7 @@ import sys
 from pathlib import Path
 
 from holoagent0_setup.contract import ContractSet
+from holoagent0_setup.invocation import RunRootAuthority
 from holoagent0_setup.supervisor import (
     BootstrapFacts,
     BootstrapInvocation,
@@ -5101,7 +5213,10 @@ from holoagent0_setup.supervisor import (
 )
 
 package_root = Path(sys.argv[1])
-run_root = Path(sys.argv[2])
+output_root = Path(sys.argv[2])
+output_root.mkdir(mode=0o700)
+run_id = "workstation-offline-20260818T010203Z-" + "a" * 32
+run_root = output_root / run_id
 launcher_calls = []
 supervisor = EvidenceSupervisor.production(
     ContractSet(package_root),
@@ -5112,7 +5227,7 @@ supervisor = EvidenceSupervisor.production(
 )
 invocation = BootstrapInvocation(
     run_root=run_root,
-    run_id="task8-production-pending",
+    run_id=run_id,
     run_nonce="a" * 64,
     facts=BootstrapFacts.clean(),
     bootstrap_report={
@@ -5127,6 +5242,7 @@ invocation = BootstrapInvocation(
         "rebinding_actions": [],
         "live_fixture_passed": False,
     },
+    run_root_authority=RunRootAuthority.open(output_root, run_id),
 )
 exit_code = supervisor.execute_authoritative(invocation)
 result = json.loads((run_root / "result.json").read_text(encoding="utf-8"))
@@ -5179,6 +5295,7 @@ import sys
 from pathlib import Path
 
 from holoagent0_setup.contract import ContractSet
+from holoagent0_setup.invocation import RunRootAuthority
 from holoagent0_setup.supervisor import (
     BootstrapFacts,
     BootstrapInvocation,
@@ -5186,7 +5303,10 @@ from holoagent0_setup.supervisor import (
 )
 
 package_root = Path(sys.argv[1])
-run_root = Path(sys.argv[2])
+output_root = Path(sys.argv[2])
+output_root.mkdir(mode=0o700)
+run_id = "workstation-offline-20260818T010203Z-" + "b" * 32
+run_root = output_root / run_id
 launcher_calls = []
 supervisor = EvidenceSupervisor.production(
     ContractSet(package_root),
@@ -5197,7 +5317,7 @@ supervisor = EvidenceSupervisor.production(
 )
 invocation = BootstrapInvocation(
     run_root=run_root,
-    run_id="task8-production-pending-unsafe-fd",
+    run_id=run_id,
     run_nonce="b" * 64,
     facts=BootstrapFacts.clean().replaced(inherited_fd_safe=False),
     bootstrap_report={
@@ -5214,6 +5334,7 @@ invocation = BootstrapInvocation(
         "rebinding_actions": [],
         "live_fixture_passed": False,
     },
+    run_root_authority=RunRootAuthority.open(output_root, run_id),
 )
 exit_code = supervisor.execute_authoritative(invocation)
 result = json.loads((run_root / "result.json").read_text(encoding="utf-8"))
