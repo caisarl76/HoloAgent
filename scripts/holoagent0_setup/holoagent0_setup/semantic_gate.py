@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass
 import hashlib
 import importlib
@@ -43,6 +44,30 @@ ROOM_NAME_MAPPING = ("Pantry", "Office", "Hallway")
 ROOM_NAME_MAPPING_SHA256 = (
     "05a9439d16575a1fd76d0bf7bccd7d9f62a24424ac5516f2728c4e04b51d4845"
 )
+FORBIDDEN_RUNTIME_MODULE_PREFIXES = (
+    "rclpy",
+    "nav2",
+    "agentos",
+    "agentic_robot",
+    "unitree",
+    "unitree_sdk2py",
+)
+_GRAPH_LLM_SEAMS = (
+    "create_llm_client",
+    "create_chat_completion",
+    "get_llm_model",
+    "parse_hier_query",
+    "parse_hier_query_use_prompt_insentence_parse",
+    "parse_hier_query_use_prompt_insentence_parse_icra",
+    "parse_floor_room_object_gpt35",
+    "infer_floor_id_from_query",
+)
+_LLM_UTILS_SEAMS = (
+    *_GRAPH_LLM_SEAMS,
+    "parse_floor_room_object_gpt40",
+    "infer_room_type_from_object_list_chat",
+)
+_LLM_UTILS_MODULE_ATTRIBUTE = "_holoagent0_llm_utils_module"
 
 
 class SemanticGateError(RuntimeError):
@@ -51,6 +76,118 @@ class SemanticGateError(RuntimeError):
     def __init__(self, reason: str, detail: str) -> None:
         self.reason = reason
         super().__init__(f"{reason}: {detail}")
+
+
+class _ImportBoundaryAudit:
+    """Record every requested import even when the module cache is restored."""
+
+    def __init__(self) -> None:
+        self._requested: set[str] = set()
+        self._original_builtin_import = None
+        self._original_import_module = None
+
+    def __enter__(self) -> "_ImportBoundaryAudit":
+        original_builtin_import = builtins.__import__
+        original_import_module = importlib.import_module
+        self._original_builtin_import = original_builtin_import
+        self._original_import_module = original_import_module
+
+        def audited_builtin_import(
+            name, globals=None, locals=None, fromlist=(), level=0
+        ):
+            if isinstance(name, str):
+                self._requested.add(name)
+            return original_builtin_import(name, globals, locals, fromlist, level)
+
+        def audited_import_module(name, package=None):
+            if isinstance(name, str):
+                self._requested.add(name)
+            if package is None:
+                return original_import_module(name)
+            return original_import_module(name, package)
+
+        builtins.__import__ = audited_builtin_import
+        importlib.import_module = audited_import_module
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        if self._original_builtin_import is not None:
+            builtins.__import__ = self._original_builtin_import
+        if self._original_import_module is not None:
+            importlib.import_module = self._original_import_module
+
+    def require_allowed(self) -> None:
+        forbidden = sorted(
+            name
+            for name in self._requested
+            if name.startswith(FORBIDDEN_RUNTIME_MODULE_PREFIXES)
+        )
+        if forbidden:
+            raise SemanticGateError(
+                "FORBIDDEN_RUNTIME_MODULE",
+                forbidden[0],
+            )
+
+
+class _ExternalLLMGuard:
+    """Keep every networked or natural-language LLM seam fail-closed."""
+
+    def __init__(self, graph_module: Any, llm_utils_module: Any) -> None:
+        self._bindings: list[tuple[Any, str, Any, Any]] = []
+        try:
+            self._guard(graph_module, _GRAPH_LLM_SEAMS)
+            self._guard(llm_utils_module, _LLM_UTILS_SEAMS)
+        except Exception:
+            self._restore()
+            raise
+
+    def _guard(self, owner: Any, names: tuple[str, ...]) -> None:
+        for name in names:
+            original = getattr(owner, name, None)
+            if not callable(original):
+                raise SemanticGateError(
+                    "SEMANTIC_DEPENDENCY_UNAVAILABLE",
+                    f"required external LLM seam is absent: {name}",
+                )
+
+            def reject(*_args, _name=name, **_kwargs):
+                raise SemanticGateError(
+                    "SEMANTIC_EXTERNAL_LLM_ATTEMPT",
+                    _name,
+                )
+
+            setattr(owner, name, reject)
+            self._bindings.append((owner, name, original, reject))
+
+    def _restore(self) -> tuple[str, ...]:
+        changed: list[str] = []
+        for owner, name, original, guard in reversed(self._bindings):
+            if getattr(owner, name, None) is not guard:
+                changed.append(name)
+            setattr(owner, name, original)
+        self._bindings.clear()
+        return tuple(sorted(set(changed)))
+
+    def close(self) -> None:
+        changed = self._restore()
+        if changed:
+            raise SemanticGateError(
+                "SEMANTIC_EXTERNAL_LLM_ATTEMPT",
+                f"guarded seam binding changed: {', '.join(changed)}",
+            )
+
+
+def _guard_external_llm_seams(graph_module: Any) -> _ExternalLLMGuard | None:
+    llm_utils_module = getattr(graph_module, _LLM_UTILS_MODULE_ATTRIBUTE, None)
+    has_graph_seam = any(hasattr(graph_module, name) for name in _GRAPH_LLM_SEAMS)
+    if llm_utils_module is None and not has_graph_seam:
+        return None
+    if llm_utils_module is None:
+        raise SemanticGateError(
+            "SEMANTIC_DEPENDENCY_UNAVAILABLE",
+            "Graph LLM bindings have no retained llm_utils module",
+        )
+    return _ExternalLLMGuard(graph_module, llm_utils_module)
 
 
 def offline_natural_language_parser_gate() -> dict[str, object]:
@@ -393,10 +530,12 @@ class RealHMSGRetrievalAdapter:
         *,
         graph_identity: str,
         run_authority: HandoverRunDirectoryAuthority | None = None,
+        llm_guard: _ExternalLLMGuard | None = None,
     ) -> None:
         self._graph = graph
         self._graph_identity = graph_identity
         self._run_authority = run_authority
+        self._llm_guard = llm_guard
         self._closed = False
 
     def _revalidate_run_authority(self) -> None:
@@ -413,10 +552,16 @@ class RealHMSGRetrievalAdapter:
 
     def close(self) -> None:
         self._closed = True
+        guard = self._llm_guard
+        self._llm_guard = None
         authority = self._run_authority
         self._run_authority = None
-        if authority is not None:
-            authority.close()
+        try:
+            if guard is not None:
+                guard.close()
+        finally:
+            if authority is not None:
+                authority.close()
 
     def __enter__(self) -> "RealHMSGRetrievalAdapter":
         self._revalidate_run_authority()
@@ -668,8 +813,11 @@ def import_root_hmsg_runtime(
             for entry in sys.path
             if _environment_import_path_allowed(entry, fsr_resolved)
         ]
-        graph_module = importlib.import_module("memory.hmsg.graph.graph")
-        omega_module = importlib.import_module("omegaconf")
+        audit = _ImportBoundaryAudit()
+        with audit:
+            graph_module = importlib.import_module("memory.hmsg.graph.graph")
+            omega_module = importlib.import_module("omegaconf")
+        audit.require_allowed()
         omega_origins = _module_filesystem_origins(omega_module)
         if not omega_origins:
             raise ValueError("OmegaConf module has no filesystem origin")
@@ -696,6 +844,13 @@ def import_root_hmsg_runtime(
             for name, module in tuple(sys.modules.items()):
                 if name == namespace or name.startswith(f"{namespace}."):
                     _validate_root_namespace_module(name, module, namespace_root)
+        llm_utils_module = sys.modules.get("memory.hmsg.utils.llm_utils")
+        if llm_utils_module is not None:
+            setattr(
+                graph_module,
+                _LLM_UTILS_MODULE_ATTRIBUTE,
+                llm_utils_module,
+            )
         return graph_module, OmegaConf, module_path
     except AssetGateError as error:
         raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
@@ -732,6 +887,7 @@ def load_real_hmsg_adapter(
         raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
 
     graph_module, OmegaConf, _module_origin = import_root_hmsg_runtime(paths)
+    llm_guard = _guard_external_llm_seams(graph_module)
     run_authority: HandoverRunDirectoryAuthority | None = None
     try:
         paths.revalidate()
@@ -751,13 +907,23 @@ def load_real_hmsg_adapter(
             run_authority.revalidate()
             asset_authority.revalidate()
             graph.set_room_names(room_names=list(verification.lock.room_name_mapping))
+    except SemanticGateError:
+        if run_authority is not None:
+            run_authority.close()
+        if llm_guard is not None:
+            llm_guard.close()
+        raise
     except AssetGateError as error:
         if run_authority is not None:
             run_authority.close()
+        if llm_guard is not None:
+            llm_guard.close()
         raise SemanticGateError("SEMANTIC_ASSET_UNAVAILABLE", str(error)) from error
     except Exception as error:
         if run_authority is not None:
             run_authority.close()
+        if llm_guard is not None:
+            llm_guard.close()
         raise SemanticGateError(
             "SEMANTIC_DEPENDENCY_UNAVAILABLE", str(error)
         ) from error
@@ -765,6 +931,7 @@ def load_real_hmsg_adapter(
         graph,
         graph_identity=verification.lock.graph_identity,
         run_authority=run_authority,
+        llm_guard=llm_guard,
     )
 
 

@@ -19,6 +19,7 @@ from holoagent0_setup.atomic_io import (
 )
 from holoagent0_setup.contract import ContractError, ContractSet
 import holoagent0_setup.handover_evidence as evidence_module
+import holoagent0_setup.semantic_gate as semantic_gate_module
 import holoagent0_setup.source_gate as source_gate_module
 from holoagent0_setup.handover_evidence import (
     ASSET_FILE,
@@ -2436,41 +2437,55 @@ def test_cli_fails_if_a_forbidden_runtime_module_enters_the_query_path(
     assert json.loads((run_directory / RESULT_FILE).read_bytes())["status"] == "FAIL"
 
 
-def test_cli_allows_historical_openai_but_never_calls_llm_or_natural_parser_seams(
+def test_cli_rejects_transient_forbidden_import_restored_by_real_graph_boundary(
     monkeypatch, tmp_path, contract
 ):
-    cli, _paths, _run, _calls, _captured, _adapter, argv = _install_cli_fakes(
+    cli, paths, run_directory, _calls, _captured, _adapter, argv = _install_cli_fakes(
         monkeypatch, tmp_path, contract
     )
-    forbidden_calls = []
+    fsr_root = paths.repository_root / "fsr_vln"
+    graph_module = fsr_root / "memory/hmsg/graph/graph.py"
+    graph_module.parent.mkdir(parents=True)
+    graph_module.write_text(
+        "import sys\n"
+        "import rclpy.transient_probe\n"
+        "sys.modules.pop('rclpy.transient_probe', None)\n"
+        "sys.modules.pop('rclpy', None)\n"
+        "SOURCE = 'root'\n",
+        encoding="utf-8",
+    )
+    (fsr_root / "perception").mkdir()
+    environment = tmp_path / "import-environment"
+    (environment / "rclpy").mkdir(parents=True)
+    (environment / "rclpy/__init__.py").write_text("", encoding="utf-8")
+    (environment / "rclpy/transient_probe.py").write_text(
+        "PROBED = True\n", encoding="utf-8"
+    )
+    (environment / "omegaconf.py").write_text(
+        "class OmegaConf:\n    pass\n", encoding="utf-8"
+    )
+    monkeypatch.delitem(sys.modules, "omegaconf", raising=False)
+    monkeypatch.delitem(sys.modules, "rclpy", raising=False)
+    monkeypatch.delitem(sys.modules, "rclpy.transient_probe", raising=False)
+    monkeypatch.syspath_prepend(str(environment))
+    passing_environment = _pass_documents(paths)[ENVIRONMENT_FILE]
 
-    def forbidden(name):
-        def fail(*args, **kwargs):
-            forbidden_calls.append(name)
-            raise AssertionError(f"{name} must not be called")
+    def qualify_through_real_import_boundary(actual_paths):
+        semantic_gate_module.import_root_hmsg_runtime(actual_paths)
+        return passing_environment
 
-        return fail
+    monkeypatch.setattr(
+        cli, "qualify_environment", qualify_through_real_import_boundary
+    )
 
-    historical_openai = sys.modules.get("openai")
-    sys.modules["openai"] = SimpleNamespace()
-    for name in (
-        "create_llm_client",
-        "create_chat_completion",
-        "parse_hier_query",
-        "parse_hier_query_use_prompt_insentence_parse",
-        "parse_hier_query_use_prompt_insentence_parse_icra",
-        "parse_floor_room_object_gpt35",
-        "parse_floor_room_object_gpt40",
-    ):
-        monkeypatch.setattr(cli, name, forbidden(name), raising=False)
-    try:
-        assert cli.main(argv) == 0
-    finally:
-        if historical_openai is None:
-            sys.modules.pop("openai", None)
-        else:
-            sys.modules["openai"] = historical_openai
-    assert forbidden_calls == []
+    assert cli.main(argv) == 1
+    assert "rclpy" not in sys.modules
+    assert "rclpy.transient_probe" not in sys.modules
+    terminal = json.loads((run_directory / RESULT_FILE).read_bytes())
+    assert terminal["status"] == "FAIL"
+    assert terminal["first_blocking_reason"] == (
+        "FORBIDDEN_RUNTIME_MODULE: rclpy.transient_probe"
+    )
 
 
 @pytest.mark.parametrize("operation", ("import", "help"))

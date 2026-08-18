@@ -27,6 +27,7 @@ from .handover_evidence import (
 )
 from .semantic_gate import (
     EXPECTED_SEMANTIC,
+    FORBIDDEN_RUNTIME_MODULE_PREFIXES,
     STRUCTURED_QUERY_SHA256,
     GraphCounts,
     SemanticFixtureResult,
@@ -49,14 +50,7 @@ from .source_gate import (
 )
 
 
-FORBIDDEN_MODULE_PREFIXES = (
-    "rclpy",
-    "nav2",
-    "agentos",
-    "agentic_robot",
-    "unitree",
-    "unitree_sdk2py",
-)
+FORBIDDEN_MODULE_PREFIXES = FORBIDDEN_RUNTIME_MODULE_PREFIXES
 
 _ANTICIPATED_ERRORS = (
     SourceGateError,
@@ -256,6 +250,8 @@ def _utc_timestamp() -> str:
 def _stable_reason(error: BaseException) -> str:
     reason = getattr(error, "reason", None)
     if isinstance(reason, str) and reason:
+        if reason == "FORBIDDEN_RUNTIME_MODULE":
+            return str(error)
         return reason
     if isinstance(error, ContractError):
         return error.decision.code

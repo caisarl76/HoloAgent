@@ -856,6 +856,189 @@ def test_root_hmsg_runtime_restores_the_entire_module_cache(tmp_path, monkeypatc
     assert all(sys.modules[name] is module for name, module in before.items())
 
 
+def test_real_importer_adapter_guards_actual_llm_bindings_during_one_fixed_query(
+    tmp_path, monkeypatch
+):
+    paths = _portable_handover_paths(tmp_path)
+    fsr_root = paths.repository_root / "fsr_vln"
+    llm_utils = fsr_root / "memory/hmsg/utils/llm_utils.py"
+    llm_utils.parent.mkdir(parents=True)
+    seams = (
+        "create_llm_client",
+        "create_chat_completion",
+        "get_llm_model",
+        "parse_hier_query",
+        "parse_hier_query_use_prompt_insentence_parse",
+        "parse_hier_query_use_prompt_insentence_parse_icra",
+        "parse_floor_room_object_gpt35",
+        "parse_floor_room_object_gpt40",
+        "infer_floor_id_from_query",
+        "infer_room_type_from_object_list_chat",
+    )
+    llm_utils.write_text(
+        "CALLS = []\n"
+        "def _seam(name):\n"
+        "    def invoke(*args, **kwargs):\n"
+        "        CALLS.append(name)\n"
+        "        raise AssertionError(f'{name} must be bypassed')\n"
+        "    return invoke\n"
+        + "".join(f"{name} = _seam({name!r})\n" for name in seams)
+        + f"ORIGINALS = {{{', '.join(f'{name!r}: {name}' for name in seams)}}}\n",
+        encoding="utf-8",
+    )
+    graph_bound_seams = tuple(
+        name
+        for name in seams
+        if name
+        not in {
+            "infer_room_type_from_object_list_chat",
+            "parse_floor_room_object_gpt40",
+        }
+    )
+    graph_module = fsr_root / "memory/hmsg/graph/graph.py"
+    graph_module.write_text(
+        "from types import SimpleNamespace\n"
+        "from memory.hmsg.utils import llm_utils\n"
+        "from memory.hmsg.utils.llm_utils import (\n"
+        + "".join(f"    {name},\n" for name in graph_bound_seams)
+        + ")\n"
+        + f"ORIGINAL_BINDINGS = {{{', '.join(f'{name!r}: {name}' for name in graph_bound_seams)}}}\n"
+        "class _PointCloud:\n"
+        "    def get_center(self):\n"
+        "        return (-21.526786203133774, -0.27579107548158116, 15.671372634872082)\n"
+        "class Graph:\n"
+        "    def __init__(self, configuration):\n"
+        "        assert configuration['main']['use_gpt'] is False\n"
+        "        self.query_calls = []\n"
+        "        self.floors = [object()]\n"
+        "        self.rooms = [\n"
+        "            SimpleNamespace(floor_id='0', room_id='0_0', name='Pantry'),\n"
+        "            SimpleNamespace(floor_id='0', room_id='0_1', name='Office'),\n"
+        "            SimpleNamespace(floor_id='0', room_id='0_2', name='Hallway'),\n"
+        "        ]\n"
+        "        selected = SimpleNamespace(\n"
+        "            object_id='0_0_81', name='counter', pcd=_PointCloud())\n"
+        "        self.objects = [selected] + [object() for _ in range(496)]\n"
+        "    def load_graph(self, graph_path):\n"
+        "        self.graph_path = graph_path\n"
+        "    def set_room_names(self, *, room_names):\n"
+        "        assert room_names == ['Pantry', 'Office', 'Hallway']\n"
+        "    def query_hmsg_room(self, query, **kwargs):\n"
+        "        self.query_calls.append(('room', query, kwargs))\n"
+        "        return [0]\n"
+        "    def query_hmsg_object(self, query, **kwargs):\n"
+        "        self.query_calls.append(('object', query, kwargs))\n"
+        "        return ([0], [0], [0.9])\n",
+        encoding="utf-8",
+    )
+    environment = tmp_path / "environment"
+    environment.mkdir()
+    (environment / "omegaconf.py").write_text(
+        "class OmegaConf:\n"
+        "    @staticmethod\n"
+        "    def create(value):\n"
+        "        return value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delitem(sys.modules, "omegaconf", raising=False)
+    monkeypatch.syspath_prepend(str(environment))
+    monkeypatch.setattr(
+        semantic_gate_module,
+        "verify_asset_lock",
+        lambda actual_paths: _verified_lock(actual_paths),
+    )
+    historical_openai = sys.modules.get("openai")
+    sys.modules["openai"] = SimpleNamespace(HISTORICAL=True)
+    adapter = None
+    try:
+        adapter = load_real_hmsg_adapter(paths, tmp_path / "run")
+        result = evaluate_semantic_fixture(adapter, EXPECTED_SEMANTIC.query)
+        graph = adapter._graph
+        graph_globals = graph.__class__.__init__.__globals__
+        imported_llm_utils = graph_globals["llm_utils"]
+
+        assert result.query_text == EXPECTED_SEMANTIC.query.text
+        assert result.graph_identity == EXPECTED_SEMANTIC.graph_identity
+        assert result.room_id == EXPECTED_SEMANTIC.room_id
+        assert result.object_id == EXPECTED_SEMANTIC.object_id
+        assert result.position == EXPECTED_SEMANTIC.position
+        assert [entry[0] for entry in graph.query_calls] == ["room", "object"]
+        assert imported_llm_utils.CALLS == []
+        assert all(
+            graph_globals[name] is not graph_globals["ORIGINAL_BINDINGS"][name]
+            for name in graph_bound_seams
+        )
+        assert all(
+            getattr(imported_llm_utils, name) is not imported_llm_utils.ORIGINALS[name]
+            for name in seams
+        )
+        for name in graph_bound_seams:
+            with pytest.raises(
+                SemanticGateError, match=f"SEMANTIC_EXTERNAL_LLM_ATTEMPT: {name}"
+            ):
+                graph_globals[name]()
+        with pytest.raises(
+            SemanticGateError,
+            match="SEMANTIC_EXTERNAL_LLM_ATTEMPT: parse_floor_room_object_gpt40",
+        ):
+            imported_llm_utils.parse_floor_room_object_gpt40()
+        assert imported_llm_utils.CALLS == []
+        assert sys.modules["openai"].HISTORICAL is True
+        adapter.close()
+        adapter = None
+        assert all(
+            graph_globals[name] is graph_globals["ORIGINAL_BINDINGS"][name]
+            for name in graph_bound_seams
+        )
+        assert all(
+            getattr(imported_llm_utils, name) is imported_llm_utils.ORIGINALS[name]
+            for name in seams
+        )
+    finally:
+        if adapter is not None:
+            adapter.close()
+        if historical_openai is None:
+            sys.modules.pop("openai", None)
+        else:
+            sys.modules["openai"] = historical_openai
+
+
+def test_real_adapter_closes_run_authority_when_llm_guard_detects_tampering():
+    def seam(*_args, **_kwargs):
+        raise AssertionError("original seam must not run")
+
+    llm_utils = SimpleNamespace(
+        **{name: seam for name in semantic_gate_module._LLM_UTILS_SEAMS}
+    )
+    graph_module = SimpleNamespace(
+        **{name: seam for name in semantic_gate_module._GRAPH_LLM_SEAMS}
+    )
+    setattr(
+        graph_module,
+        semantic_gate_module._LLM_UTILS_MODULE_ATTRIBUTE,
+        llm_utils,
+    )
+    guard = semantic_gate_module._guard_external_llm_seams(graph_module)
+    closed = []
+    authority = SimpleNamespace(close=lambda: closed.append(True))
+    adapter = RealHMSGRetrievalAdapter(
+        SimpleNamespace(),
+        graph_identity=EXPECTED_SEMANTIC.graph_identity,
+        run_authority=authority,
+        llm_guard=guard,
+    )
+    graph_module.create_llm_client = seam
+
+    with pytest.raises(
+        SemanticGateError,
+        match="SEMANTIC_EXTERNAL_LLM_ATTEMPT: guarded seam binding changed: "
+        "create_llm_client",
+    ):
+        adapter.close()
+
+    assert closed == [True]
+
+
 def test_real_adapter_uses_verified_paths_configuration_and_room_mapping(
     tmp_path, monkeypatch
 ):
