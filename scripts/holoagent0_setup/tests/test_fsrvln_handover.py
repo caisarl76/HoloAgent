@@ -256,7 +256,9 @@ def test_acceptance_plan_clone_blocks_are_fail_closed_and_mode_normalizing():
             assert command in block
 
 
-def test_real_run_commands_keep_matplotlib_cache_outside_evidence_directory():
+def test_real_run_commands_keep_matplotlib_cache_outside_evidence_directory(
+    tmp_path: Path,
+):
     runbook = (REPOSITORY_ROOT / "docs/FSR_VLN_HOLOAGENT_HANDOVER.md").read_text(
         encoding="utf-8"
     )
@@ -282,6 +284,32 @@ def test_real_run_commands_keep_matplotlib_cache_outside_evidence_directory():
         assert 'MPLCONFIGDIR="$MPLCONFIG_ROOT"' in block
         assert 'MPLCONFIGDIR="$RUN_DIRECTORY/.matplotlib"' not in block
         assert 'MPLCONFIGDIR="$FSRVLN_RUN/.matplotlib"' not in block
+
+    runbook_block = runbook_blocks[0]
+    assert runbook_block.splitlines()[0] == "set -euo pipefail"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_mktemp = fake_bin / "mktemp"
+    fake_mktemp.write_text("#!/bin/sh\nexit 37\n", encoding="utf-8")
+    fake_mktemp.chmod(0o755)
+    marker = tmp_path / "python-called"
+    fake_python = fake_bin / "python"
+    fake_python.write_text('#!/bin/sh\n: > "$FAKE_PYTHON_MARKER"\n', encoding="utf-8")
+    fake_python.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["FAKE_PYTHON_MARKER"] = str(marker)
+
+    completed = subprocess.run(
+        ["bash", "-c", runbook_block],
+        check=False,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 37
+    assert not marker.exists()
 
 
 def _identity(path: Path) -> PathIdentity:

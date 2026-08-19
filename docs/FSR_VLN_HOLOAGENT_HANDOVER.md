@@ -136,6 +136,7 @@ must be an explicitly empty owner-controlled directory. From the detached
 checkout, run exactly this CLI with its three accepted flags:
 
 ```bash
+set -euo pipefail
 REPOSITORY_ROOT='<replace with the absolute detached checkout path>'
 DATA_ROOT='<replace with the absolute transferred data root>'
 RUN_DIRECTORY='<replace with a new absolute evidence directory>'
