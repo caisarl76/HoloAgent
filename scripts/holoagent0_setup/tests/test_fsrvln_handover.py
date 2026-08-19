@@ -213,6 +213,49 @@ def test_documentation_clone_and_ancestry_verification_is_fail_closed():
     assert fail_fast.stdout == ""
 
 
+def test_documentation_clone_normalizes_the_pinned_installer_mode():
+    document = (REPOSITORY_ROOT / "docs/FSR_VLN_HOLOAGENT_HANDOVER.md").read_text(
+        encoding="utf-8"
+    )
+    clone_block = document.split("```bash\n", 1)[1].split("\n```", 1)[0]
+
+    assert clone_block.index("checkout --detach") < clone_block.index("INSTALL_DRIVER=")
+    for command in (
+        'test -f "$INSTALL_DRIVER"',
+        'test ! -L "$INSTALL_DRIVER"',
+        'chmod 0644 -- "$INSTALL_DRIVER"',
+        'test "$(stat -c \'%a\' -- "$INSTALL_DRIVER")" = 644',
+    ):
+        assert command in clone_block
+
+
+def test_acceptance_plan_clone_blocks_are_fail_closed_and_mode_normalizing():
+    plan = (
+        REPOSITORY_ROOT
+        / "docs/superpowers/plans/2026-08-18-fsrvln-fixed-query-handover.md"
+    ).read_text(encoding="utf-8")
+    clone_blocks = tuple(
+        block
+        for block in re.findall(r"```bash\n(.*?)\n```", plan, flags=re.DOTALL)
+        if "git clone --no-recurse-submodules" in block
+    )
+
+    assert len(clone_blocks) == 3
+    for block in clone_blocks:
+        assert block.splitlines()[:2] == ["set -euo pipefail", "umask 0022"]
+        assert block.index("git clone --no-recurse-submodules") < block.index(
+            "checkout --detach"
+        )
+        assert block.index("checkout --detach") < block.index("INSTALL_DRIVER=")
+        for command in (
+            'test -f "$INSTALL_DRIVER"',
+            'test ! -L "$INSTALL_DRIVER"',
+            'chmod 0644 -- "$INSTALL_DRIVER"',
+            'test "$(stat -c \'%a\' -- "$INSTALL_DRIVER")" = 644',
+        ):
+            assert command in block
+
+
 def _identity(path: Path) -> PathIdentity:
     observed = path.stat()
     return PathIdentity(path, observed.st_dev, observed.st_ino, observed.st_mode)

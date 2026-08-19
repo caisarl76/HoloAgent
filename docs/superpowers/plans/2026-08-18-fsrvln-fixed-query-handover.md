@@ -794,6 +794,8 @@ Do not create repository symlinks. Do not proceed if transfer permission/license
 Replace the quoted instruction value below with the exact literal SHA captured in Step 2 before running the block.
 
 ```bash
+set -euo pipefail
+umask 0022
 IMPLEMENTATION_SHA='<paste the exact 40-character SHA printed in Step 2>'
 printf '%s\n' "$IMPLEMENTATION_SHA" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
 CLEAN_PARENT="$(mktemp -d /tmp/fsrvln-clean-clone.XXXXXX)"
@@ -804,6 +806,11 @@ FSRVLN_RUN="$(mktemp -d /tmp/fsrvln-handover-jihun.XXXXXX)"
 git clone --no-recurse-submodules --no-local \
   /home/jihun/work/HoloAgent "$CLEAN_REPOSITORY"
 git -C "$CLEAN_REPOSITORY" checkout --detach "$IMPLEMENTATION_SHA"
+INSTALL_DRIVER="$CLEAN_REPOSITORY/scripts/holoagent0_setup/openclaw_install_driver.sh"
+test -f "$INSTALL_DRIVER"
+test ! -L "$INSTALL_DRIVER"
+chmod 0644 -- "$INSTALL_DRIVER"
+test "$(stat -c '%a' -- "$INSTALL_DRIVER")" = 644
 test "$(git -C "$CLEAN_REPOSITORY" rev-parse HEAD)" = "$IMPLEMENTATION_SHA"
 git -C "$CLEAN_REPOSITORY" merge-base --is-ancestor \
   ca5ee3e2e9c5afe760fcec457549dc0a2c35c6e8 HEAD
@@ -867,6 +874,8 @@ Expected: the exact candidate is detached in a clean non-recursive clone, the co
 The incoming owner must replace all five quoted instruction values below. `IMPLEMENTATION_SHA` is the exact literal captured in Step 2, not the current tip of a branch. `REPOSITORY_SOURCE` is an authorized URL, Git bundle, or repository path that already contains that exact candidate; obtaining it must not change the frozen candidate.
 
 ```bash
+set -euo pipefail
+umask 0022
 IMPLEMENTATION_SHA='<paste the exact 40-character SHA printed in Step 2>'
 REPOSITORY_SOURCE='<authorized source containing the exact candidate>'
 REPOSITORY_URL='https://github.com/caisarl76/HoloAgent.git'
@@ -879,6 +888,11 @@ RUN_DIRECTORY="$(mktemp -d /tmp/fsrvln-handover-owner.XXXXXX)"
 
 git clone --no-recurse-submodules "$REPOSITORY_SOURCE" "$OWNER_REPOSITORY"
 git -C "$OWNER_REPOSITORY" checkout --detach "$IMPLEMENTATION_SHA"
+INSTALL_DRIVER="$OWNER_REPOSITORY/scripts/holoagent0_setup/openclaw_install_driver.sh"
+test -f "$INSTALL_DRIVER"
+test ! -L "$INSTALL_DRIVER"
+chmod 0644 -- "$INSTALL_DRIVER"
+test "$(stat -c '%a' -- "$INSTALL_DRIVER")" = 644
 test "$(git -C "$OWNER_REPOSITORY" rev-parse HEAD)" = "$IMPLEMENTATION_SHA"
 
 MPLCONFIGDIR="$RUN_DIRECTORY/.matplotlib" \
@@ -996,6 +1010,8 @@ Expected: the annotated tag points to the single docs-only release commit, and t
 - [ ] **Step 4: Test discovery by tag and detachment at the documented SHA**
 
 ```bash
+set -euo pipefail
+umask 0022
 TAG_PARENT="$(mktemp -d /tmp/fsrvln-tag-clone.XXXXXX)"
 git clone --no-recurse-submodules --branch holoagent0-fsrvln-handover-v1 \
   --single-branch \
@@ -1006,6 +1022,11 @@ DOCUMENTED_SHA="$(sed -n 's/^Accepted implementation commit: `\([0-9a-f]\{40\}\)
 printf '%s\n' "$DOCUMENTED_SHA" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
 git merge-base --is-ancestor "$DOCUMENTED_SHA" HEAD
 git checkout --detach "$DOCUMENTED_SHA"
+INSTALL_DRIVER="$PWD/scripts/holoagent0_setup/openclaw_install_driver.sh"
+test -f "$INSTALL_DRIVER"
+test ! -L "$INSTALL_DRIVER"
+chmod 0644 -- "$INSTALL_DRIVER"
+test "$(stat -c '%a' -- "$INSTALL_DRIVER")" = 644
 test "$(git rev-parse HEAD)" = "$DOCUMENTED_SHA"
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 PYTHONPATH=scripts/holoagent0_setup \

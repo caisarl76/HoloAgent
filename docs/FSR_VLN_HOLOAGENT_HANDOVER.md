@@ -40,12 +40,20 @@ git -C "$REPOSITORY_ROOT" fetch --no-recurse-submodules origin tag holoagent0-fs
 git -C "$REPOSITORY_ROOT" show --no-patch holoagent0-fsrvln-handover-v1
 git -C "$REPOSITORY_ROOT" merge-base --is-ancestor "$ACCEPTED_IMPLEMENTATION_COMMIT" holoagent0-fsrvln-handover-v1
 git -C "$REPOSITORY_ROOT" checkout --detach "$ACCEPTED_IMPLEMENTATION_COMMIT"
+INSTALL_DRIVER="$REPOSITORY_ROOT/scripts/holoagent0_setup/openclaw_install_driver.sh"
+test -f "$INSTALL_DRIVER"
+test ! -L "$INSTALL_DRIVER"
+chmod 0644 -- "$INSTALL_DRIVER"
+test "$(stat -c '%a' -- "$INSTALL_DRIVER")" = 644
 test "$(git -C "$REPOSITORY_ROOT" rev-parse --verify HEAD)" = "$ACCEPTED_IMPLEMENTATION_COMMIT"
 ```
 
 The final `rev-parse` value must equal the accepted implementation commit
 byte-for-byte. Do not continue from a branch tip, a different tag target, or a
-clone made with submodule recursion.
+clone made with submodule recursion. The explicit installer-mode normalization
+also closes Git materialization differences caused by the caller's umask or a
+parent-directory default ACL; the verifier still requires the reviewed file
+type, owner, and content digest.
 
 ## 2. Roots and Locked Assets
 
