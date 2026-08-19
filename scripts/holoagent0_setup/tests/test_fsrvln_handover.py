@@ -256,6 +256,34 @@ def test_acceptance_plan_clone_blocks_are_fail_closed_and_mode_normalizing():
             assert command in block
 
 
+def test_real_run_commands_keep_matplotlib_cache_outside_evidence_directory():
+    runbook = (REPOSITORY_ROOT / "docs/FSR_VLN_HOLOAGENT_HANDOVER.md").read_text(
+        encoding="utf-8"
+    )
+    plan = (
+        REPOSITORY_ROOT
+        / "docs/superpowers/plans/2026-08-18-fsrvln-fixed-query-handover.md"
+    ).read_text(encoding="utf-8")
+    runbook_blocks = tuple(
+        block
+        for block in re.findall(r"```bash\n(.*?)\n```", runbook, flags=re.DOTALL)
+        if "-m holoagent0_setup.fsrvln_handover" in block
+    )
+    plan_blocks = tuple(
+        block
+        for block in re.findall(r"```bash\n(.*?)\n```", plan, flags=re.DOTALL)
+        if "-m holoagent0_setup.fsrvln_handover" in block
+    )
+
+    assert len(runbook_blocks) == 1
+    assert len(plan_blocks) == 2
+    for block in (*runbook_blocks, *plan_blocks):
+        assert 'MPLCONFIG_ROOT="$(mktemp -d /tmp/fsrvln-matplotlib.' in block
+        assert 'MPLCONFIGDIR="$MPLCONFIG_ROOT"' in block
+        assert 'MPLCONFIGDIR="$RUN_DIRECTORY/.matplotlib"' not in block
+        assert 'MPLCONFIGDIR="$FSRVLN_RUN/.matplotlib"' not in block
+
+
 def _identity(path: Path) -> PathIdentity:
     observed = path.stat()
     return PathIdentity(path, observed.st_dev, observed.st_ino, observed.st_mode)

@@ -802,6 +802,7 @@ CLEAN_PARENT="$(mktemp -d /tmp/fsrvln-clean-clone.XXXXXX)"
 CLEAN_REPOSITORY="$CLEAN_PARENT/HoloAgent"
 FSRVLN_DATA=/mnt/data/jihun/HoloAgent
 FSRVLN_RUN="$(mktemp -d /tmp/fsrvln-handover-jihun.XXXXXX)"
+MPLCONFIG_ROOT="$(mktemp -d /tmp/fsrvln-matplotlib.XXXXXX)"
 
 git clone --no-recurse-submodules --no-local \
   /home/jihun/work/HoloAgent "$CLEAN_REPOSITORY"
@@ -821,7 +822,7 @@ PYTHONPATH="$CLEAN_REPOSITORY/scripts/holoagent0_setup" \
 /usr/bin/python3.10 "$CLEAN_REPOSITORY/scripts/holoagent0_setup/tests/conftest.py" \
   "$CLEAN_REPOSITORY/scripts/holoagent0_setup/test-manifest-v1.txt"
 
-MPLCONFIGDIR="$FSRVLN_RUN/.matplotlib" \
+MPLCONFIGDIR="$MPLCONFIG_ROOT" \
 PYTHONDONTWRITEBYTECODE=1 \
 PYTHONPATH="$CLEAN_REPOSITORY/scripts/holoagent0_setup" \
 /home/jihun/anaconda3/envs/fsrvln/bin/python -m holoagent0_setup.fsrvln_handover \
@@ -885,6 +886,7 @@ printf '%s\n' "$IMPLEMENTATION_SHA" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
 CLONE_PARENT="$(mktemp -d /tmp/fsrvln-owner-clone.XXXXXX)"
 OWNER_REPOSITORY="$CLONE_PARENT/HoloAgent"
 RUN_DIRECTORY="$(mktemp -d /tmp/fsrvln-handover-owner.XXXXXX)"
+MPLCONFIG_ROOT="$(mktemp -d /tmp/fsrvln-matplotlib.XXXXXX)"
 
 git clone --no-recurse-submodules "$REPOSITORY_SOURCE" "$OWNER_REPOSITORY"
 git -C "$OWNER_REPOSITORY" checkout --detach "$IMPLEMENTATION_SHA"
@@ -895,7 +897,7 @@ chmod 0644 -- "$INSTALL_DRIVER"
 test "$(stat -c '%a' -- "$INSTALL_DRIVER")" = 644
 test "$(git -C "$OWNER_REPOSITORY" rev-parse HEAD)" = "$IMPLEMENTATION_SHA"
 
-MPLCONFIGDIR="$RUN_DIRECTORY/.matplotlib" \
+MPLCONFIGDIR="$MPLCONFIG_ROOT" \
 PYTHONDONTWRITEBYTECODE=1 \
 PYTHONPATH="$OWNER_REPOSITORY/scripts/holoagent0_setup" \
 "$PYTHON" -m holoagent0_setup.fsrvln_handover \

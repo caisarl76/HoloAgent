@@ -139,6 +139,8 @@ checkout, run exactly this CLI with its three accepted flags:
 REPOSITORY_ROOT='<replace with the absolute detached checkout path>'
 DATA_ROOT='<replace with the absolute transferred data root>'
 RUN_DIRECTORY='<replace with a new absolute evidence directory>'
+MPLCONFIG_ROOT="$(mktemp -d /tmp/fsrvln-matplotlib.XXXXXX)"
+MPLCONFIGDIR="$MPLCONFIG_ROOT" \
 PYTHONPATH="$REPOSITORY_ROOT/scripts/holoagent0_setup" \
 python -m holoagent0_setup.fsrvln_handover \
   --repository-root "$REPOSITORY_ROOT" \

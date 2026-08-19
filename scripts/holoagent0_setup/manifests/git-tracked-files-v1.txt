@@ -2642,7 +2642,7 @@
 100644 01e8cd824bffe3ebb9712aa38c4db4972a514628	agentic_robot/tools/pocket2_toolbox/pocket2_rgbd_gen_pipeline/pcd_image_projection_parallel.py
 100644 f19f0730b8974f6eb164557934365b854476c461	agentic_robot/tools/pocket2_toolbox/pocket2_rgbd_gen_pipeline/pcd_image_projection_sequence.py
 100644 1874ac32593a1c454cef2a5b5bc7d2dc7e2ff31a	agentic_robot/tools/pocket2_toolbox/pocket2_rgbd_gen_pipeline/undisort_test_pipeline.py
-100644 8564491827da8b22be671989046f65aecf295a79	docs/FSR_VLN_HOLOAGENT_HANDOVER.md
+100644 0ac09071c1374ef477b86078013210f99e107371	docs/FSR_VLN_HOLOAGENT_HANDOVER.md
 100644 24dee582e5239d788468718cc19d744a5f45dad0	docs/assets/FSR_VLN_framework.png
 100644 07d2f2bb9559b93b22cfcfe0b579d261d1a8462a	docs/assets/demos/active_exploration.gif
 100644 ce5ebcc8077e9fa1a117e5135761f6831d4209b2	docs/assets/demos/humanoid_command.gif
@@ -2659,7 +2659,7 @@
 100644 d636e656af05dab9df62e4968b3a1a9e42a27fa0	docs/superpowers/plans/2026-08-05-holoagent0-mujoco-readiness.md
 100644 6ca9cea0f607a4427b392aba03339c1bd50d8b83	docs/superpowers/plans/2026-08-05-holoagent0-pc2-sensor-only.md
 100644 c9e3289c98a28b1a22e0d07695087262df1ce641	docs/superpowers/plans/2026-08-05-holoagent0-workstation-offline.md
-100644 b6a848f58f7ec60b05b4e78ab4202c77ffde5c35	docs/superpowers/plans/2026-08-18-fsrvln-fixed-query-handover.md
+100644 69bdfa63a8c701e5053944bbf8493461a716ef70	docs/superpowers/plans/2026-08-18-fsrvln-fixed-query-handover.md
 100644 01052889de515080db5729ce59265f3ec13338a5	docs/superpowers/specs/2026-07-22-holoagent-mujoco-first-design.md
 100644 c83d32211903bfaae5a429c83a09cb0446f8bbc8	docs/superpowers/specs/2026-07-29-holoagent0-workstation-pc2-setup-design.md
 100644 0a067158e482704fae57080fde904f4eb6c7bb1b	docs/superpowers/specs/2026-08-18-fsrvln-portable-workstation-handover-design.md
@@ -2988,7 +2988,7 @@
 100644 3379961b230d04663c63d0c8e45a5df4b4b470b0	scripts/holoagent0_setup/tests/test_coordinator.py
 100644 a8e206b6e2fbe05ee8bd5471e46f980e1fe292a0	scripts/holoagent0_setup/tests/test_cyclone_policy.py
 100644 c092969474260a506f34848b55081dfc6da0d0d1	scripts/holoagent0_setup/tests/test_evidence.py
-100644 745faf9b5c2dd2a37e819824778235ff0bebe246	scripts/holoagent0_setup/tests/test_fsrvln_handover.py
+100644 ab4837b99fa90c8c78930d73ebbac6083750cfb3	scripts/holoagent0_setup/tests/test_fsrvln_handover.py
 100644 bb4d282ee4d59789b5a0102b084ef4a0a167cc16	scripts/holoagent0_setup/tests/test_ledger.py
 100644 31774565e8c669c7ed875cdd6f8d8e85e7006c66	scripts/holoagent0_setup/tests/test_native_launchers.py
 100644 eeeed8ff98aba4fdf3f757935aeb5ad83784a0bf	scripts/holoagent0_setup/tests/test_offline_cli.py
