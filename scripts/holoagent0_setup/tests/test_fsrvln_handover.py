@@ -194,6 +194,10 @@ def test_documentation_clone_and_ancestry_verification_is_fail_closed():
     clone_block = document.split("```bash\n", 1)[1].split("\n```", 1)[0]
 
     assert clone_block.splitlines()[0] == "set -euo pipefail"
+    assert clone_block.splitlines()[1] == "umask 0022"
+    assert clone_block.index("umask 0022") < clone_block.index(
+        "git clone --no-recurse-submodules"
+    )
     assert clone_block.index("merge-base --is-ancestor") < clone_block.index(
         "checkout --detach"
     )
