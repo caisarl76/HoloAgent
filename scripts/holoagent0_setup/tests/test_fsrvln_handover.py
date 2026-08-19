@@ -668,6 +668,49 @@ def test_environment_normalizes_string_subclass_module_version(monkeypatch, tmp_
     assert type(torch_row["version"]) is str
 
 
+def test_module_version_normalizes_without_string_subclass_dispatch():
+    class StickyVersion(str):
+        def __str__(self):
+            return self
+
+    class RewritingVersion(str):
+        def __str__(self):
+            return "rewritten"
+
+    class RaisingVersion(str):
+        def __str__(self):
+            raise RuntimeError("subclass __str__ must not run")
+
+    for version in (
+        StickyVersion("2.4.1+cu118"),
+        RewritingVersion("2.4.1+cu118"),
+        RaisingVersion("2.4.1+cu118"),
+    ):
+        normalized = evidence_module._module_version(
+            "pytorch", SimpleNamespace(__version__=version)
+        )
+        assert normalized == "2.4.1+cu118"
+        assert type(normalized) is str
+
+
+def test_module_version_rejects_truthy_empty_and_nontext_values():
+    class TruthyEmptyVersion(str):
+        def __bool__(self):
+            return True
+
+    class StringableNontext:
+        def __str__(self):
+            return "fabricated"
+
+    for version in (TruthyEmptyVersion(""), StringableNontext()):
+        with pytest.raises(
+            ValueError, match="module __version__ must be nonempty text"
+        ):
+            evidence_module._module_version(
+                "pytorch", SimpleNamespace(__version__=version)
+            )
+
+
 def test_environment_rejects_cuda_availability_without_a_cuda_build(
     monkeypatch, tmp_path
 ):

@@ -209,9 +209,12 @@ def _module_version(display_name: str, module: object) -> str | None:
     else:
         direct = getattr(module, "__version__")
     if direct is not _MISSING:
-        if not isinstance(direct, str) or not direct:
+        if not isinstance(direct, str):
             raise ValueError("module __version__ must be nonempty text when exposed")
-        return str(direct)
+        normalized = str.__str__(direct)
+        if type(normalized) is not str or not normalized:
+            raise ValueError("module __version__ must be nonempty text when exposed")
+        return normalized
     for candidate in _DISTRIBUTION_CANDIDATES[display_name]:
         try:
             observed = metadata.version(candidate)
