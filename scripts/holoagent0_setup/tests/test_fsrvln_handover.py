@@ -641,6 +641,33 @@ def test_environment_version_fallback_cuda_and_shared_graph_origin(
     assert decision.ok, decision.errors
 
 
+def test_environment_normalizes_string_subclass_module_version(monkeypatch, tmp_path):
+    paths = _fake_paths(tmp_path)
+    _install_fake_runtime(monkeypatch, paths, cuda=False)
+
+    class RuntimeVersion(str):
+        pass
+
+    torch = _module("torch", origin="/opt/runtime/torch.py")
+    torch.__version__ = RuntimeVersion("2.4.1+cu118")
+    torch.version = SimpleNamespace(cuda=None)
+    torch.cuda = SimpleNamespace(is_available=lambda: False)
+    runtime_import = evidence_module.import_module
+    monkeypatch.setattr(
+        evidence_module,
+        "import_module",
+        lambda name: torch if name == "torch" else runtime_import(name),
+    )
+
+    document = qualify_environment(paths)
+
+    assert document["status"] == "PASS"
+    torch_row = document["imports"][0]
+    assert torch_row["status"] == "PASS"
+    assert torch_row["version"] == "2.4.1+cu118"
+    assert type(torch_row["version"]) is str
+
+
 def test_environment_rejects_cuda_availability_without_a_cuda_build(
     monkeypatch, tmp_path
 ):
